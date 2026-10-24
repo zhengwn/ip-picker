@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { version as appVersion } from '../package.json'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { Activity, ArrowDownToLine, ArrowRight, Check, ChevronDown, CircleAlert, Globe2, Info, LoaderCircle, Network, Play, RotateCcw, Settings2, ShieldCheck, Square, Star, X } from '@lucide/vue'
@@ -363,7 +364,7 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         </div>
       </div>
     </main>
-    <footer class="app-statusbar"><span>Cloudflare IPv4</span><span>{{ favoritesOpen ? '收藏保存在本机' : running ? `已耗时 ${elapsed}` : 'TCP / HTTPS 实测' }}</span><span class="statusbar-version">v0.1</span></footer>
+    <footer class="app-statusbar"><span>Cloudflare IPv4</span><span>{{ favoritesOpen ? '收藏保存在本机' : running ? `已耗时 ${elapsed}` : 'TCP / HTTPS 实测' }}</span><span class="statusbar-version">v{{ appVersion }}</span></footer>
 
     <dialog id="advanced-settings" ref="settingsDialog" class="settings-drawer" aria-labelledby="settings-title" @cancel.prevent="advancedOpen = false" @close="advancedOpen = false" @click="event => { if (event.target === settingsDialog) advancedOpen = false }">
       <div class="drawer-header"><div class="drawer-title-group"><span class="drawer-title-icon"><Settings2 :size="17" /></span><div><h2 id="settings-title">高级设置</h2><p>自动保存 · 下次测速生效</p></div></div><div class="drawer-header-actions"><button class="text-button" :disabled="locked" title="恢复默认参数，保留所选地区" @click="resetParameters"><RotateCcw :size="12" />恢复默认</button><button class="icon-button" autofocus aria-label="关闭高级设置" @click="advancedOpen = false"><X :size="18" /></button></div></div>

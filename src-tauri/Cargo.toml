@@ -1,6 +1,6 @@
 [package]
 name = "ip-picker"
-version = "0.1.0"
+version = "0.1.1"
 description = "Cloudflare regional IP quality picker"
 authors = ["IP Picker contributors"]
 edition = "2021"
