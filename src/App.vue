@@ -268,7 +268,9 @@ watch(config, () => {
   if (!initialized.value || !desktop || locked.value) return
   clearTimeout(saveTimer)
   const persist = async () => {
-    if (validation.value || locked.value) return
+    // A retest can start before this debounce fires. Saving its pending user
+    // settings is safe while measurements run and must not be silently dropped.
+    if (validation.value) return
     try { await invoke('save_config', { config: JSON.parse(JSON.stringify(config.value)) }) }
     catch (error) { notify(`设置保存失败：${errorText(error)}`, true) }
   }

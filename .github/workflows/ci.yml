@@ -38,6 +38,8 @@ jobs:
         run: npm ci
       - name: Build frontend and check types
         run: npm run build
+      - name: Test frontend regressions
+        run: npm run test:frontend
       - name: Check Rust formatting
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - name: Test Rust core

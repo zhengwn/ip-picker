@@ -135,6 +135,12 @@ impl RuntimeState {
             return Err("已有测试正在运行，请先停止并等待结束".into());
         }
         let mut next = self.saved.clone();
+        // Capture pending user settings before prepare_test replaces the source
+        // with the explicit targets. A targeted test can legitimately ignore an
+        // empty custom source, but that invalid source must not become active.
+        if config.validate().is_ok() {
+            next.config = config.clone();
+        }
         let (job, ips) = next.favorites.prepare_test(
             ScanRun {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1182,6 +1188,93 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn favorite_start_persists_pending_user_settings_without_target_source_changes() {
+        for source in ["cloudflare", "custom"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            let previous_run = run("previous-main");
+            let previous_history = serde_json::to_value(&previous_run).unwrap();
+            let mut inner = RuntimeState {
+                saved: SavedState {
+                    last_run: Some(previous_run),
+                    ..Default::default()
+                },
+                cancellation: None,
+            };
+            let config = ScanConfig {
+                max_tcp_ms: Some(231.0),
+                source: source.into(),
+                custom_ips: "104.20.0.0/24".into(),
+                ..ScanConfig::default()
+            };
+            let expected_config = serde_json::to_value(&config).unwrap();
+            let folder = inner.saved.favorites.folders[0].id.clone();
+            let (started, _) = inner
+                .begin_favorite_test(
+                    config,
+                    Some(&folder),
+                    None,
+                    Some("104.16.1.1"),
+                    None,
+                    CancellationToken::new(),
+                    &path,
+                )
+                .unwrap();
+            assert_eq!(started.job.run.config.source, "custom");
+            assert_eq!(started.job.run.config.custom_ips, "104.16.1.1");
+            assert_eq!(
+                serde_json::to_value(&inner.saved.config).unwrap(),
+                expected_config
+            );
+            let restored = storage::load(&path).unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored.config).unwrap(),
+                expected_config
+            );
+            assert_eq!(
+                serde_json::to_value(&restored.last_run.unwrap()).unwrap(),
+                previous_history
+            );
+        }
+    }
+
+    #[test]
+    fn targeted_test_with_an_empty_source_does_not_persist_invalid_active_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut inner = RuntimeState {
+            saved: SavedState::default(),
+            cancellation: None,
+        };
+        let previous_config = serde_json::to_value(&inner.saved.config).unwrap();
+        let config = ScanConfig {
+            source: "custom".into(),
+            custom_ips: String::new(),
+            max_tcp_ms: Some(231.0),
+            ..ScanConfig::default()
+        };
+        assert!(config.validate().is_err());
+        let folder = inner.saved.favorites.folders[0].id.clone();
+        let (started, _) = inner
+            .begin_favorite_test(
+                config,
+                Some(&folder),
+                None,
+                Some("104.16.1.1"),
+                None,
+                CancellationToken::new(),
+                &path,
+            )
+            .unwrap();
+        assert_eq!(started.job.run.config.max_tcp_ms, Some(231.0));
+        assert_eq!(started.job.run.config.custom_ips, "104.16.1.1");
+        assert_eq!(
+            serde_json::to_value(&storage::load(&path).unwrap().config).unwrap(),
+            previous_config
+        );
+    }
+
+    #[test]
     fn failed_manual_start_rolls_back_the_placeholder_and_cancellation_token() {
         let dir = tempfile::tempdir().unwrap();
         let blocking = dir.path().join("blocking");
@@ -1194,7 +1287,10 @@ mod lifecycle_tests {
         let original = serde_json::to_value(&inner.saved).unwrap();
         assert!(inner
             .begin_favorite_test(
-                ScanConfig::default(),
+                ScanConfig {
+                    max_tcp_ms: Some(231.0),
+                    ..ScanConfig::default()
+                },
                 Some(&folder),
                 None,
                 Some("104.16.1.1"),

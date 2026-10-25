@@ -9,7 +9,8 @@
     "typecheck": "vue-tsc --noEmit",
     "preview": "vite preview --host 127.0.0.1",
     "tauri": "tauri",
-    "test": "cargo test --manifest-path src-tauri/Cargo.toml"
+    "test": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:frontend": "node --test"
   },
   "dependencies": {
     "@lucide/vue": "^1.61.0",

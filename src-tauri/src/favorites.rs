@@ -338,6 +338,12 @@ impl FavoriteLibrary {
     /// Match by captured ID so edits/moves survive, deleted records stay
     /// deleted, and a same-IP record in another folder is never overwritten.
     pub fn apply_test_results(&mut self, job: &FavoriteTestJob) {
+        // Keep the full batch source on the job only. Each targeted snapshot
+        // needs just its own IP, and cloning the full list per entry would make
+        // both memory use and the persisted library grow quadratically.
+        let mut snapshot_config = job.run.config.clone();
+        snapshot_config.source = "custom".into();
+        snapshot_config.custom_ips = String::new();
         for favorite_id in &job.favorite_ids {
             let Some(entry) = self
                 .entries
@@ -362,7 +368,10 @@ impl FavoriteLibrary {
             entry.run_status = job.run.status.clone();
             entry.run_started_at = job.run.started_at.clone();
             entry.run_finished_at = job.run.finished_at.clone();
-            entry.config = job.run.config.clone();
+            entry.config = ScanConfig {
+                custom_ips: result.ip.clone(),
+                ..snapshot_config.clone()
+            };
             entry.result = result.clone();
             entry.targeted = true;
             entry.network_path = job.run.progress.network_path.clone();
@@ -704,6 +713,123 @@ mod tests {
             .all(|result| result.attempts == 0 && result.download_samples_mbps.is_empty()));
         assert_eq!(job.run.config.max_candidates, 1);
         assert_eq!(favorites.entries[0].run_id, "original-run");
+    }
+
+    #[test]
+    fn bulk_retest_snapshot_size_grows_linearly_even_when_every_tcp_probe_fails() {
+        fn completed_library_size(count: usize) -> usize {
+            let mut favorites = FavoriteLibrary::default();
+            let folder = favorites.folders[0].id.clone();
+            favorites
+                .save_snapshot(&folder, &sample_run(), "104.16.1.1", "")
+                .unwrap();
+            let template = favorites.entries.pop().unwrap();
+            favorites.entries = (0..count)
+                .map(|index| {
+                    let mut entry = template.clone();
+                    entry.id = format!("favorite-{index}");
+                    entry.result = IpResult::new(Ipv4Addr::new(
+                        104,
+                        16,
+                        (index / 256) as u8,
+                        (index % 256) as u8,
+                    ));
+                    entry
+                })
+                .collect();
+            let (mut job, ips) = favorites
+                .prepare_test(pending_run(), Some(&folder), None, None, None)
+                .unwrap();
+            assert_eq!(ips.len(), count);
+            assert_eq!(job.run.config.custom_ips.lines().count(), count);
+            job.run.status = "completed".into();
+            for result in &mut job.run.results {
+                result.exclusion_reason = Some("TCP 连接超时".into());
+            }
+            favorites.apply_test_results(&job);
+
+            let mut source_bytes = 0;
+            for entry in &favorites.entries {
+                assert!(entry.targeted);
+                assert_eq!(entry.config.source, "custom");
+                assert_eq!(entry.config.custom_ips, entry.result.ip);
+                assert_eq!(entry.result.attempts, 0);
+                assert!(entry.result.tcp_stability.is_none());
+                source_bytes += entry.config.custom_ips.len();
+            }
+            let ip_bytes: usize = job.run.results.iter().map(|result| result.ip.len()).sum();
+            assert_eq!(source_bytes, ip_bytes);
+            // The batch still retains the complete source once for its history.
+            assert_eq!(job.run.config.custom_ips.lines().count(), count);
+            serde_json::to_vec(&favorites).unwrap().len()
+        }
+
+        let smaller = completed_library_size(500);
+        let larger = completed_library_size(1000);
+        assert!(
+            larger < smaller * 3,
+            "library grew from {smaller} to {larger}"
+        );
+    }
+
+    #[test]
+    fn targeted_snapshots_keep_test_context_with_only_their_own_source_ip() {
+        let mut favorites = FavoriteLibrary::default();
+        let folder = favorites.folders[0].id.clone();
+        let other_folder = favorites.folders[1].id.clone();
+        let mut run = sample_run();
+        // A pre-existing multi-IP snapshot must remain readable and unchanged
+        // when the same address is retested in another folder.
+        run.config.source = "custom".into();
+        run.config.custom_ips = "104.16.1.1\n104.16.1.2".into();
+        favorites
+            .save_snapshot(&other_folder, &run, "104.16.1.1", "historical")
+            .unwrap();
+        let historical = serde_json::to_value(&favorites.entries[0]).unwrap();
+        for ip in ["104.16.1.1", "104.16.1.2"] {
+            run.results[0].ip = ip.into();
+            favorites.save_snapshot(&folder, &run, ip, "keep").unwrap();
+        }
+        let mut pending = pending_run();
+        pending.config.regions = vec!["HK".into()];
+        pending.config.max_tcp_ms = Some(175.0);
+        pending.config.download_rounds = 3;
+        pending.config.download_budget_enabled = true;
+        pending.config.download_budget_mi_b = 23;
+        pending.config.target_url = "https://example.com/download?bytes=1048576".into();
+        let (mut job, _) = favorites
+            .prepare_test(pending, Some(&folder), None, None, None)
+            .unwrap();
+        job.run.results[0].tcp_ms = 20.0;
+        job.run.results[0].region_code = "HK".into();
+        job.run.results[1].tcp_ms = 25.0;
+        job.run.results[1].region_code = "JP".into();
+        job.interrupt("cancelled after both IPs were attempted");
+        favorites.apply_test_results(&job);
+
+        for entry in &favorites.entries[1..] {
+            let mut expected_config = job.run.config.clone();
+            expected_config.custom_ips = entry.result.ip.clone();
+            assert_eq!(
+                serde_json::to_value(&entry.config).unwrap(),
+                serde_json::to_value(expected_config).unwrap()
+            );
+            entry.config.validate().unwrap();
+            assert!(entry.config.regions.iter().any(|region| region == "JP"));
+            assert_eq!(entry.run_status, "cancelled");
+            assert_eq!(entry.note, "keep");
+            assert_eq!(entry.network_path.as_ref().unwrap().interface_name, "en0");
+        }
+        assert_eq!(
+            serde_json::to_value(&favorites.entries[0]).unwrap(),
+            historical
+        );
+        let encoded = serde_json::to_vec(&favorites).unwrap();
+        let restored: FavoriteLibrary = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(favorites).unwrap()
+        );
     }
 
     #[test]

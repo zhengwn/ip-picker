@@ -389,38 +389,19 @@ async fn run_candidates(
         },
         &callback,
     );
-    let work: Vec<_> = download_candidates
-        .iter()
-        .map(|i| {
-            (
-                *i,
-                state.results[*i].clone(),
-                timings.get(i).cloned().unwrap_or_default(),
-            )
-        })
-        .collect();
-    let verifications = stream::iter(work.into_iter().map(|(index, item, samples)| {
-        let target = &target;
-        let config = &config;
-        let ip = ips[index];
-        async move {
-            let item = repeat_verification(item, samples, config.verification_attempts, || {
-                trace_probe(config, target, ip)
-            })
-            .await;
-            (index, item)
-        }
-    }))
-    .buffer_unordered(config.tcp_concurrency.min(16));
-    tokio::pin!(verifications);
-    while let Some((index, item)) = tokio::select! {
-        biased;
-        _ = cancellation.cancelled() => { return Ok(state.cancel(&config, &callback)); }
-        next = verifications.next() => next
-    } {
-        state.results[index] = item;
-        state.progress.completed += 1;
-        state.emit(&callback, false);
+    if !verify_candidates(
+        &mut state,
+        &download_candidates,
+        &ips,
+        &mut timings,
+        &config,
+        &cancellation,
+        &callback,
+        |ip| trace_probe(&config, &target, ip),
+    )
+    .await
+    {
+        return Ok(state.cancel(&config, &callback));
     }
 
     let verified_groups = download_groups
@@ -509,31 +490,17 @@ async fn run_candidates(
         state.progress.downloaded_bytes = used;
         match measured {
             Ok(sample) => {
-                let item = &mut state.results[index];
-                if let Some(colo) = sample.colo {
-                    observe_colo(item, &colo);
-                } else {
-                    // Some custom CF targets omit CF-Ray. Recheck the same host
-                    // and same candidate rather than reusing an unrelated trace.
-                    item.attempts += 1;
-                    let check = tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => { return Ok(state.cancel(&config, &callback)); }
-                        probe = trace_probe(&config, &target, ips[index]) => probe
-                    };
-                    match check {
-                        Ok(probe) => {
-                            item.success_count += 1;
-                            observe_colo(item, &probe.colo);
-                        }
-                        Err(reason) => {
-                            item.exclusion_reason = Some(format!("下载后的 POP 复核失败：{reason}"))
-                        }
-                    }
+                if !record_download(
+                    &mut state.results[index],
+                    sample,
+                    &config,
+                    &cancellation,
+                    || trace_probe(&config, &target, ips[index]),
+                )
+                .await
+                {
+                    return Ok(state.cancel(&config, &callback));
                 }
-                item.download_samples_mbps.push(sample.mbps);
-                item.download_mbps = median(&item.download_samples_mbps);
-                item.measurement_passed = item.has_complete_measurement(&config);
             }
             Err(reason) => state.results[index].exclusion_reason = Some(reason),
         }
@@ -793,35 +760,126 @@ struct TraceProbe {
     colo: String,
 }
 
-async fn repeat_verification<F, Fut>(
-    mut item: IpResult,
-    mut samples: Vec<f64>,
-    required_attempts: usize,
-    mut probe: F,
-) -> IpResult
+/// Keep one request per active candidate in flight. Every completed request is
+/// applied before starting its successor, so cancellation cannot discard an
+/// earlier success that was held in a candidate-local clone.
+async fn verify_candidates<F, Fut>(
+    state: &mut State,
+    candidates: &[usize],
+    ips: &[Ipv4Addr],
+    timings: &mut BTreeMap<usize, Vec<f64>>,
+    config: &ScanConfig,
+    cancellation: &CancellationToken,
+    callback: &UpdateCallback,
+    probe: F,
+) -> bool
 where
-    F: FnMut() -> Fut,
+    F: Fn(Ipv4Addr) -> Fut,
     Fut: std::future::Future<Output = Result<TraceProbe, String>>,
 {
-    // One failed service check or cross-region POP observation already excludes
-    // this candidate. Preserve the work actually done and free this slot instead
-    // of spending the remaining requests on a known rejection.
-    while item.attempts < required_attempts && item.exclusion_reason.is_none() {
+    let pending: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|index| {
+            let item = &state.results[*index];
+            item.attempts < config.verification_attempts && item.exclusion_reason.is_none()
+        })
+        .collect();
+    state.progress.completed += candidates.len() - pending.len();
+    let mut pending = pending.into_iter();
+    let mut requests = stream::FuturesUnordered::new();
+    for _ in 0..config.tcp_concurrency.min(16) {
+        if let Some(index) = pending.next() {
+            requests.push(verification_request(index, ips[index], &probe));
+        }
+    }
+    while let Some((index, outcome)) = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => { return false; }
+        next = requests.next() => next
+    } {
+        let item = &mut state.results[index];
         item.attempts += 1;
-        match probe().await {
+        let samples = timings.entry(index).or_default();
+        match outcome {
             Ok(probe) => {
                 item.success_count += 1;
                 samples.push(probe.https_ms);
-                observe_colo(&mut item, &probe.colo);
+                observe_colo(item, &probe.colo);
             }
             Err(reason) => {
                 item.exclusion_reason = Some(format!("HTTPS 复测失败：{reason}"));
             }
         }
+        item.https_ms = median(samples);
+        item.jitter_ms = spread(samples);
+        // One failed service check or cross-region POP observation excludes this
+        // candidate immediately; other candidates can use its released slot.
+        if item.attempts < config.verification_attempts && item.exclusion_reason.is_none() {
+            requests.push(verification_request(index, ips[index], &probe));
+        } else {
+            state.progress.completed += 1;
+            if let Some(index) = pending.next() {
+                requests.push(verification_request(index, ips[index], &probe));
+            }
+        }
+        state.emit(callback, false);
     }
-    item.https_ms = median(&samples);
-    item.jitter_ms = spread(&samples);
-    item
+    true
+}
+
+async fn verification_request<F, Fut>(
+    index: usize,
+    ip: Ipv4Addr,
+    probe: &F,
+) -> (usize, Result<TraceProbe, String>)
+where
+    F: Fn(Ipv4Addr) -> Fut,
+    Fut: std::future::Future<Output = Result<TraceProbe, String>>,
+{
+    (index, probe(ip).await)
+}
+
+async fn record_download<F, Fut>(
+    item: &mut IpResult,
+    sample: DownloadProbe,
+    config: &ScanConfig,
+    cancellation: &CancellationToken,
+    probe: F,
+) -> bool
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<TraceProbe, String>>,
+{
+    // The download has finished even if its additional POP check is cancelled.
+    item.download_samples_mbps.push(sample.mbps);
+    item.download_mbps = median(&item.download_samples_mbps);
+    item.measurement_passed = false;
+    if let Some(colo) = sample.colo {
+        observe_colo(item, &colo);
+    } else {
+        // This explicit incomplete reason also gates a saved final-round sample
+        // when cancellation happens before the same-host POP check completes.
+        item.exclusion_reason = Some("下载后的 POP 复核未完成".into());
+        let check = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => { return false; }
+            outcome = probe() => outcome
+        };
+        item.attempts += 1;
+        match check {
+            Ok(probe) => {
+                item.success_count += 1;
+                item.exclusion_reason = None;
+                observe_colo(item, &probe.colo);
+            }
+            Err(reason) => {
+                item.exclusion_reason = Some(format!("下载后的 POP 复核失败：{reason}"));
+            }
+        }
+    }
+    item.measurement_passed = item.has_complete_measurement(config);
+    true
 }
 
 async fn trace_probe(
@@ -1513,6 +1571,47 @@ mod tests {
         result
     }
 
+    fn verification_state(rows: Vec<IpResult>) -> State {
+        State {
+            progress: ScanProgress::default(),
+            results: rows,
+            last_event: Instant::now(),
+        }
+    }
+
+    async fn verify_row<F, Fut>(
+        row: IpResult,
+        samples: Vec<f64>,
+        required_attempts: usize,
+        probe: F,
+    ) -> IpResult
+    where
+        F: Fn(Ipv4Addr) -> Fut,
+        Fut: std::future::Future<Output = Result<TraceProbe, String>>,
+    {
+        let ips = vec![row.ip.parse().unwrap()];
+        let mut state = verification_state(vec![row]);
+        let config = ScanConfig {
+            verification_attempts: required_attempts,
+            ..Default::default()
+        };
+        assert!(
+            verify_candidates(
+                &mut state,
+                &[0],
+                &ips,
+                &mut BTreeMap::from([(0, samples)]),
+                &config,
+                &CancellationToken::new(),
+                &(Arc::new(|_| {}) as UpdateCallback),
+                probe,
+            )
+            .await
+        );
+        assert_eq!(state.progress.completed, 1);
+        state.results.remove(0)
+    }
+
     #[test]
     fn targeted_candidates_are_deduplicated_in_original_order_without_sampling() {
         let ips = unique_targeted_ips(vec![
@@ -1677,13 +1776,13 @@ mod tests {
         row.attempts = 1;
         row.success_count = 1;
         observe_colo(&mut row, "HKG");
-        let mut calls = 0;
-        let verified = repeat_verification(row, vec![70.0], 5, || {
-            calls += 1;
+        let calls = std::cell::Cell::new(0);
+        let verified = verify_row(row, vec![70.0], 5, |_| {
+            calls.set(calls.get() + 1);
             std::future::ready(Err("连接失败".into()))
         })
         .await;
-        assert_eq!(calls, 1, "excluded IP continued service verification");
+        assert_eq!(calls.get(), 1, "excluded IP continued service verification");
         assert_eq!(verified.attempts, 2);
         assert_eq!(verified.success_count, 1);
         assert_eq!(verified.https_ms, 70.0);
@@ -1700,21 +1799,255 @@ mod tests {
             row.attempts = 1;
             row.success_count = 1;
             observe_colo(&mut row, initial);
-            let mut calls = 0;
-            let verified = repeat_verification(row, vec![70.0], 5, || {
-                calls += 1;
+            let calls = std::cell::Cell::new(0);
+            let verified = verify_row(row, vec![70.0], 5, |_| {
+                calls.set(calls.get() + 1);
                 std::future::ready(Ok(TraceProbe {
                     https_ms: 60.0,
                     colo: response.into(),
                 }))
             })
             .await;
-            assert_eq!(calls, expected_calls);
+            assert_eq!(calls.get(), expected_calls);
             assert_eq!(verified.attempts, 1 + expected_calls);
             assert_eq!(verified.success_count, verified.attempts);
             assert_eq!(verified.exclusion_reason.is_some(), excluded);
             assert_eq!(verified.observed_colos, vec![initial, response]);
         }
+    }
+
+    #[tokio::test]
+    async fn cancelling_service_verification_keeps_completed_observations() {
+        let config = ScanConfig {
+            regions: vec!["US".into()],
+            ..Default::default()
+        };
+        let ip = Ipv4Addr::new(192, 0, 2, 1);
+        let mut row = IpResult::new(ip);
+        row.attempts = 1;
+        row.success_count = 1;
+        row.https_ms = 70.0;
+        observe_colo(&mut row, "SJC");
+        let mut state = verification_state(vec![row]);
+        let cancellation = CancellationToken::new();
+        let calls = std::cell::Cell::new(0);
+        let callback: UpdateCallback = Arc::new(|_| {});
+        let finished = verify_candidates(
+            &mut state,
+            &[0],
+            &[ip],
+            &mut BTreeMap::from([(0, vec![70.0])]),
+            &config,
+            &cancellation,
+            &callback,
+            |_| {
+                let call = calls.get() + 1;
+                calls.set(call);
+                let cancellation = cancellation.clone();
+                async move {
+                    if call == 3 {
+                        cancellation.cancel();
+                        return std::future::pending().await;
+                    }
+                    Ok(TraceProbe {
+                        https_ms: if call == 1 { 20.0 } else { 30.0 },
+                        colo: "LAX".into(),
+                    })
+                }
+            },
+        )
+        .await;
+        assert!(!finished);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(state.progress.completed, 0);
+        let outcome = state.cancel(&config, &callback);
+        let saved = &outcome.results[0];
+        assert!(outcome.cancelled);
+        assert_eq!(saved.attempts, 3, "cancelled request was counted");
+        assert_eq!(saved.success_count, 3, "completed successes were discarded");
+        assert_eq!(saved.https_ms, 30.0);
+        assert_eq!(saved.jitter_ms, 50.0);
+        assert_eq!(saved.observed_colos, vec!["SJC", "LAX"]);
+        assert!(!saved.measurement_passed);
+        assert!(!saved.eligible);
+    }
+
+    #[tokio::test]
+    async fn service_verification_keeps_per_ip_serial_order_and_bounds_concurrency() {
+        use std::cell::{Cell, RefCell};
+        let config = ScanConfig {
+            tcp_concurrency: 256,
+            ..Default::default()
+        };
+        let ips: Vec<_> = (1..=20)
+            .map(|last| Ipv4Addr::new(192, 0, 2, last))
+            .collect();
+        let rows = ips
+            .iter()
+            .map(|ip| {
+                let mut row = IpResult::new(*ip);
+                row.attempts = 1;
+                row.success_count = 1;
+                observe_colo(&mut row, "HKG");
+                row
+            })
+            .collect();
+        let mut state = verification_state(rows);
+        let active_ips = RefCell::new(HashSet::new());
+        let maximum = Cell::new(0);
+        let calls = Cell::new(0);
+        assert!(
+            verify_candidates(
+                &mut state,
+                &(0..ips.len()).collect::<Vec<_>>(),
+                &ips,
+                &mut (0..ips.len()).map(|i| (i, vec![70.0])).collect(),
+                &config,
+                &CancellationToken::new(),
+                &(Arc::new(|_| {}) as UpdateCallback),
+                |ip| {
+                    let active_ips = &active_ips;
+                    let maximum = &maximum;
+                    let calls = &calls;
+                    async move {
+                        assert!(
+                            active_ips.borrow_mut().insert(ip),
+                            "overlapping requests for one IP"
+                        );
+                        maximum.set(maximum.get().max(active_ips.borrow().len()));
+                        calls.set(calls.get() + 1);
+                        tokio::task::yield_now().await;
+                        active_ips.borrow_mut().remove(&ip);
+                        Ok(TraceProbe {
+                            https_ms: 60.0,
+                            colo: "HKG".into(),
+                        })
+                    }
+                },
+            )
+            .await
+        );
+        assert_eq!(maximum.get(), 16);
+        assert_eq!(calls.get(), 20 * (config.verification_attempts - 1));
+        assert_eq!(state.progress.completed, 20);
+        assert!(state
+            .results
+            .iter()
+            .all(|row| row.attempts == 5 && row.success_count == 5));
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_pop_recheck_keeps_samples_without_counting_a_failure() {
+        let config = ScanConfig::default();
+        for prior_rounds in 0..config.download_rounds {
+            let mut row = measured("192.0.2.1", "HK", 70.0, 10.0);
+            row.download_samples_mbps.truncate(prior_rounds);
+            let cancellation = CancellationToken::new();
+            assert!(
+                !record_download(
+                    &mut row,
+                    DownloadProbe {
+                        mbps: 30.0,
+                        colo: None
+                    },
+                    &config,
+                    &cancellation,
+                    || async {
+                        cancellation.cancel();
+                        std::future::pending().await
+                    },
+                )
+                .await
+            );
+            let state = verification_state(vec![row]);
+            let outcome = state.cancel(&config, &(Arc::new(|_| {}) as UpdateCallback));
+            let saved = &outcome.results[0];
+            assert_eq!(saved.attempts, 5);
+            assert_eq!(saved.success_count, 5);
+            assert_eq!(saved.download_samples_mbps.len(), prior_rounds + 1);
+            assert_eq!(saved.download_samples_mbps.last(), Some(&30.0));
+            assert_eq!(
+                saved.download_mbps,
+                if prior_rounds == 0 { 30.0 } else { 20.0 }
+            );
+            assert_eq!(
+                saved.exclusion_reason.as_deref(),
+                Some("下载后的 POP 复核未完成")
+            );
+            assert!(!saved.has_complete_measurement(&config));
+            assert!(
+                !saved.measurement_passed,
+                "final-round cancellation passed measurement"
+            );
+            assert!(!saved.eligible);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_pop_recheck_records_success_failure_and_drift() {
+        let config = ScanConfig::default();
+        for response in [Ok("HKG"), Ok("NRT"), Err("TLS 验证失败")] {
+            let mut row = measured("192.0.2.1", "HK", 70.0, 10.0);
+            row.download_samples_mbps.truncate(1);
+            assert!(
+                record_download(
+                    &mut row,
+                    DownloadProbe {
+                        mbps: 30.0,
+                        colo: None
+                    },
+                    &config,
+                    &CancellationToken::new(),
+                    || std::future::ready(
+                        response
+                            .map(|colo| TraceProbe {
+                                https_ms: 60.0,
+                                colo: colo.into()
+                            })
+                            .map_err(str::to_string)
+                    ),
+                )
+                .await
+            );
+            assert_eq!(row.attempts, 6);
+            assert_eq!(row.success_count, if response.is_ok() { 6 } else { 5 });
+            assert_eq!(row.download_samples_mbps, vec![10.0, 30.0]);
+            assert_eq!(row.download_mbps, 20.0);
+            rank_results(std::slice::from_mut(&mut row), &config, true);
+            let passed = response == Ok("HKG");
+            assert_eq!(row.measurement_passed, passed);
+            assert_eq!(row.eligible, passed);
+            assert_eq!(row.exclusion_reason.is_none(), passed);
+        }
+    }
+
+    #[tokio::test]
+    async fn download_with_cf_ray_needs_no_additional_trace_request() {
+        let config = ScanConfig::default();
+        let mut row = measured("192.0.2.1", "HK", 70.0, 10.0);
+        row.download_samples_mbps.truncate(1);
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            record_download(
+                &mut row,
+                DownloadProbe {
+                    mbps: 30.0,
+                    colo: Some("HKG".into())
+                },
+                &config,
+                &CancellationToken::new(),
+                || {
+                    calls.set(calls.get() + 1);
+                    std::future::ready(Err("unnecessary trace request".into()))
+                },
+            )
+            .await
+        );
+        assert_eq!(calls.get(), 0);
+        assert_eq!(row.attempts, 5);
+        assert_eq!(row.success_count, 5);
+        assert_eq!(row.download_samples_mbps, vec![10.0, 30.0]);
+        assert!(row.measurement_passed);
     }
 
     #[test]
