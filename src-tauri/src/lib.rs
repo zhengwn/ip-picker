@@ -1,12 +1,16 @@
 pub mod engine;
 mod favorites;
+mod instance;
 pub mod model;
 pub mod network;
 pub mod stability;
 mod storage;
 
 use crate::{
-    engine::{run_scan, run_targeted_scan, EngineOutcome, EngineUpdate, UpdateCallback},
+    engine::{
+        prepare_scan, run_prepared_scan, run_targeted_scan, EngineOutcome, EngineUpdate,
+        PreparedScan, UpdateCallback,
+    },
     favorites::{FavoriteLibrary, FavoriteTestJob, FavoriteTestStart},
     model::{ScanConfig, ScanProgress, ScanRun},
     storage::SavedState,
@@ -54,6 +58,31 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
+    fn begin_scan(
+        &mut self,
+        config: ScanConfig,
+        token: CancellationToken,
+        path: &std::path::Path,
+    ) -> Result<(ScanRun, PreparedScan), String> {
+        if self.has_active_measurement() {
+            return Err("已有测试正在运行，请先停止并等待结束".into());
+        }
+        // Parse every custom entry and sample once before replacing history.
+        let prepared = prepare_scan(config.clone())?;
+        let run = ScanRun {
+            id: uuid::Uuid::new_v4().to_string(),
+            status: "running".into(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            finished_at: None,
+            config,
+            progress: ScanProgress::default(),
+            results: Vec::new(),
+            error: None,
+        };
+        self.begin(run.clone(), token, path)?;
+        Ok((run, prepared))
+    }
+
     fn has_active_measurement(&self) -> bool {
         self.cancellation.is_some()
             || self
@@ -559,22 +588,11 @@ async fn start_scan(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanRun, String> {
-    config.validate()?;
     let cancellation = CancellationToken::new();
-    let run = ScanRun {
-        id: uuid::Uuid::new_v4().to_string(),
-        status: "running".into(),
-        started_at: chrono::Utc::now().to_rfc3339(),
-        finished_at: None,
-        config: config.clone(),
-        progress: ScanProgress::default(),
-        results: Vec::new(),
-        error: None,
-    };
-    {
+    let (run, prepared) = {
         let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
-        inner.begin(run.clone(), cancellation.clone(), &state.storage_path)?;
-    }
+        inner.begin_scan(config, cancellation.clone(), &state.storage_path)?
+    };
     let owned_state = state.inner().clone();
     let run_id = run.id.clone();
     tauri::async_runtime::spawn(async move {
@@ -596,8 +614,8 @@ async fn start_scan(
                 let _ = callback_app.emit("scan-update", snapshot);
             }
         });
-        let outcome = run_scan(config, cancellation.clone(), callback).await;
-        // run_scan drops its callback sender. Drain the last queued snapshot
+        let outcome = run_prepared_scan(prepared, cancellation.clone(), callback).await;
+        // The scan drops its callback sender. Drain the last queued snapshot
         // before publishing the authoritative completed/cancelled result.
         let _ = forwarder.await;
         if let Ok(mut inner) = owned_state.inner.lock() {
@@ -689,11 +707,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
-            let path = app.path().app_data_dir()?.join("state.json");
-            let saved = storage::load(&path).unwrap_or_else(|error| SavedState {
-                warning: Some(error),
-                ..SavedState::default()
-            });
+            let data_dir = app.path().app_data_dir()?;
+            // Acquire before reading or recovering state; a second process must
+            // never even load a snapshot that it could later write back.
+            let guard = instance::InstanceGuard::acquire(&data_dir)?;
+            let path = data_dir.join("state.json");
+            let saved = storage::load_for_startup(&path)?;
+            app.manage(guard);
             app.manage(AppState {
                 inner: Arc::new(Mutex::new(RuntimeState {
                     saved,
@@ -704,11 +724,14 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                let state = window.state::<AppState>();
-                if let Ok(mut inner) = state.inner.lock() {
-                    let _ = inner.interrupt_for_shutdown(&state.storage_path);
-                };
+            // The frontend may prevent CloseRequested while it saves pending
+            // parameters. Only cancel tasks and save once closing is committed.
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(state) = window.try_state::<AppState>() {
+                    if let Ok(mut inner) = state.inner.lock() {
+                        let _ = inner.interrupt_for_shutdown(&state.storage_path);
+                    };
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1052,6 +1075,97 @@ mod lifecycle_tests {
             .is_err());
         assert_eq!(inner.saved.last_run.unwrap().id, "old");
         assert!(inner.cancellation.is_none());
+    }
+
+    #[test]
+    fn invalid_candidate_sources_preserve_previous_history_and_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut previous = run("previous-successful-run");
+        previous
+            .results
+            .push(model::IpResult::new("104.16.1.1".parse().unwrap()));
+        let mut inner = RuntimeState {
+            saved: SavedState {
+                last_run: Some(previous),
+                ..SavedState::default()
+            },
+            cancellation: None,
+        };
+        storage::save(&path, &inner.saved).unwrap();
+        let original_file = std::fs::read(&path).unwrap();
+        let original_state = serde_json::to_value(&inner.saved).unwrap();
+        for custom_ips in [
+            "999.16.1.1".to_string(),
+            "104.16.1.1/33".to_string(),
+            "# comments only".to_string(),
+            ", ;".to_string(),
+            "104.16.1.1\n".repeat(20_001),
+        ] {
+            let config = ScanConfig {
+                source: "custom".into(),
+                custom_ips,
+                ..ScanConfig::default()
+            };
+            // These inputs used to pass the command's preliminary validation.
+            assert!(config.validate().is_ok());
+            assert!(inner
+                .begin_scan(config, CancellationToken::new(), &path)
+                .is_err());
+            assert_eq!(serde_json::to_value(&inner.saved).unwrap(), original_state);
+            assert_eq!(std::fs::read(&path).unwrap(), original_file);
+            assert!(!inner.has_active_measurement());
+        }
+    }
+
+    #[test]
+    fn prepared_scan_start_preserves_history_when_persistence_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut inner = RuntimeState {
+            saved: SavedState {
+                last_run: Some(run("old")),
+                ..SavedState::default()
+            },
+            cancellation: None,
+        };
+        storage::save(&path, &inner.saved).unwrap();
+        let original_file = std::fs::read(&path).unwrap();
+        let original_state = serde_json::to_value(&inner.saved).unwrap();
+        let config = ScanConfig {
+            source: "custom".into(),
+            custom_ips: "104.16.1.1".into(),
+            ..ScanConfig::default()
+        };
+        assert!(inner
+            .begin_scan(config, CancellationToken::new(), &path.join("blocked"))
+            .is_err());
+        assert_eq!(serde_json::to_value(&inner.saved).unwrap(), original_state);
+        assert_eq!(std::fs::read(&path).unwrap(), original_file);
+        assert!(!inner.has_active_measurement());
+    }
+
+    #[test]
+    fn closing_recovered_state_keeps_the_original_corrupt_file_in_its_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let original = b"{\"favorites\": {\"entries\": [recoverable data";
+        std::fs::write(&path, original).unwrap();
+        let saved = storage::load_for_startup(&path).unwrap();
+        assert!(saved.warning.is_some());
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| entry != &path)
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let mut inner = RuntimeState {
+            saved,
+            cancellation: None,
+        };
+        inner.interrupt_for_shutdown(&path).unwrap();
+        assert!(storage::load(&path).is_ok());
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), original);
     }
 
     #[test]

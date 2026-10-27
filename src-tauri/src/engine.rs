@@ -57,6 +57,14 @@ pub struct EngineOutcome {
 
 pub type UpdateCallback = Arc<dyn Fn(EngineUpdate) + Send + Sync>;
 
+/// Validated configuration and its already sampled candidates. Keep both fields
+/// private so execution cannot receive an unprepared or mismatched candidate set.
+#[derive(Debug)]
+pub(crate) struct PreparedScan {
+    config: ScanConfig,
+    ips: Vec<Ipv4Addr>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScanScope {
     Regional,
@@ -145,8 +153,24 @@ pub async fn run_scan(
     cancellation: CancellationToken,
     callback: UpdateCallback,
 ) -> Result<EngineOutcome, String> {
+    run_prepared_scan(prepare_scan(config)?, cancellation, callback).await
+}
+
+/// Finish all fallible input preparation before replacing a saved scan. This
+/// performs no network measurements and samples random candidates only once.
+pub(crate) fn prepare_scan(config: ScanConfig) -> Result<PreparedScan, String> {
     config.validate()?;
     let ips = sample_candidates(&config)?;
+    Ok(PreparedScan { config, ips })
+}
+
+/// Execute exactly the candidates that were accepted before the scan was saved.
+pub(crate) async fn run_prepared_scan(
+    prepared: PreparedScan,
+    cancellation: CancellationToken,
+    callback: UpdateCallback,
+) -> Result<EngineOutcome, String> {
+    let PreparedScan { config, ips } = prepared;
     run_candidates(config, ips, ScanScope::Regional, cancellation, callback).await
 }
 
@@ -1610,6 +1634,89 @@ mod tests {
         );
         assert_eq!(state.progress.completed, 1);
         state.results.remove(0)
+    }
+
+    #[test]
+    fn preparing_a_scan_rejects_invalid_configuration_and_custom_sources() {
+        let invalid_config = ScanConfig {
+            max_candidates: 0,
+            ..Default::default()
+        };
+        assert!(prepare_scan(invalid_config).is_err());
+        for input in ["192.0.2.1\nnot-an-ip", "# comments only\n  # no addresses"] {
+            assert!(
+                prepare_scan(custom(input, 1)).is_err(),
+                "accepted invalid custom source: {input}"
+            );
+        }
+        let too_many_entries = "192.0.2.1\n".repeat(20001);
+        assert!(prepare_scan(custom(&too_many_entries, 1))
+            .unwrap_err()
+            .contains("20000"));
+    }
+
+    #[tokio::test]
+    async fn prepared_custom_scan_runs_the_same_candidates_in_the_same_order() {
+        let prepared =
+            prepare_scan(custom("192.0.2.3\n192.0.2.1\n192.0.2.3\n192.0.2.2", 3)).unwrap();
+        let expected = ["192.0.2.3", "192.0.2.1", "192.0.2.2"];
+        assert_eq!(
+            prepared
+                .ips
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let outcome = run_prepared_scan(prepared, cancellation, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert!(outcome.cancelled);
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|item| item.ip.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(outcome.results.iter().all(|item| {
+            item.tcp_ms == 0.0
+                && item.attempts == 0
+                && item.tcp_stability.is_none()
+                && item.download_samples_mbps.is_empty()
+        }));
+    }
+
+    #[tokio::test]
+    async fn prepared_builtin_scan_keeps_its_random_sample_without_resampling() {
+        let prepared = prepare_scan(ScanConfig {
+            max_candidates: 64,
+            ..Default::default()
+        })
+        .unwrap();
+        let expected: Vec<_> = prepared.ips.iter().map(ToString::to_string).collect();
+        assert_eq!(expected.len(), 64);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let outcome = run_prepared_scan(prepared, cancellation, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert!(outcome.cancelled);
+        assert_eq!(
+            outcome
+                .results
+                .iter()
+                .map(|item| &item.ip)
+                .collect::<Vec<_>>(),
+            expected.iter().collect::<Vec<_>>()
+        );
+        assert!(outcome
+            .results
+            .iter()
+            .all(|item| item.tcp_ms == 0.0 && item.attempts == 0));
     }
 
     #[test]

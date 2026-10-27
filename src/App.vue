@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { version as appVersion } from '../package.json'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { getCurrentWindow, type CloseRequestedEvent } from '@tauri-apps/api/window'
 import { Activity, ArrowDownToLine, ArrowRight, Check, ChevronDown, CircleAlert, Globe2, Info, LoaderCircle, Network, Play, RotateCcw, Settings2, ShieldCheck, Square, Star, X } from '@lucide/vue'
 import { defaultConfig, selectableRegions, type IpResult, type SavedState, type ScanConfig, type ScanRun } from './types'
 import { normalizeActiveConfig, precisionPolicyDescription, stabilityMetricLabel, stageProgressText, validateConfig } from './ui-state'
@@ -15,6 +16,7 @@ import FavoritesPanel from './components/FavoritesPanel.vue'
 import { acceptsFavoriteLibrary, defaultFavoriteLibrary, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from './favorites'
 
 const desktop = isTauri()
+const appWindow = desktop ? getCurrentWindow() : null
 const appShell = ref<HTMLElement | null>(null)
 useDismissibleDetails(appShell, '.scan-progress-disclosure, .favorite-job-details, .favorite-test-settings')
 const config = ref<ScanConfig>(defaultConfig())
@@ -37,6 +39,10 @@ const loading = ref(desktop)
 const starting = ref(false)
 const stopping = ref(false)
 const advancedOpen = ref(false)
+const finishingSettings = ref(false)
+const windowClosing = ref(false)
+const savingConfig = ref(false)
+const configSaveError = ref('')
 const settingsDialog = ref<HTMLDialogElement | null>(null)
 const settingsTrigger = ref<HTMLButtonElement | null>(null)
 const settingsBody = ref<HTMLElement | null>(null)
@@ -87,15 +93,21 @@ let unlisten: UnlistenFn | undefined
 let unlistenStorage: UnlistenFn | undefined
 let unlistenFavoriteTest: UnlistenFn | undefined
 let unlistenFavorites: UnlistenFn | undefined
+let unlistenClose: UnlistenFn | undefined
 let disposed = false
 let clock: ReturnType<typeof setInterval> | undefined
 let saveTimer: ReturnType<typeof setTimeout> | undefined
 let toastTimer: ReturnType<typeof setTimeout> | undefined
 let previousRunIdForStart: string | undefined
+// Invalid drafts never replace the most recent valid settings awaiting a save.
+let pendingConfig: ScanConfig | null = null
+let configSavePromise: Promise<void> | undefined
+let drainConfigSaves = false
+let configSaveDue = false
 
 const running = computed(() => run.value?.status === 'running')
 const scanPhaseTitle = computed(() => run.value ? stageProgressText(run.value).title : '')
-const locked = computed(() => loading.value || starting.value || running.value || favoriteTesting.value || stopping.value)
+const locked = computed(() => loading.value || starting.value || running.value || favoriteTesting.value || stopping.value || finishingSettings.value || windowClosing.value)
 const dirty = computed(() => !!run.value && JSON.stringify(config.value) !== JSON.stringify(run.value.config))
 const validationIssue = computed(() => validateConfig(config.value))
 const validation = computed(() => validationIssue.value?.message ?? '')
@@ -126,6 +138,66 @@ function notify(text: string, error = false) {
   clearTimeout(toastTimer)
   toast.value = { text, error }
   toastTimer = setTimeout(() => { toast.value = null }, error ? 6500 : 4000)
+}
+function flushConfig(): Promise<void> {
+  clearTimeout(saveTimer)
+  return persistConfig(true)
+}
+function persistConfig(flush = false): Promise<void> {
+  if (flush) drainConfigSaves = true
+  else configSaveDue = true
+  if (configSavePromise) return configSavePromise
+  if (!desktop || !pendingConfig) {
+    drainConfigSaves = false
+    configSaveDue = false
+    return Promise.resolve()
+  }
+  savingConfig.value = true
+  configSavePromise = (async () => {
+    while (pendingConfig && !disposed && (drainConfigSaves || configSaveDue)) {
+      const snapshot: ScanConfig = pendingConfig
+      configSaveDue = false
+      await invoke('save_config', { config: snapshot })
+      // Edits made while this write was in flight need their own subsequent save.
+      if (pendingConfig === snapshot) pendingConfig = null
+      configSaveError.value = ''
+    }
+  })().catch(error => {
+    configSaveError.value = `设置保存失败：${errorText(error)}`
+    if (!disposed) notify(configSaveError.value, true)
+    throw error
+  }).finally(() => {
+    savingConfig.value = false
+    configSavePromise = undefined
+    drainConfigSaves = false
+    configSaveDue = false
+  })
+  return configSavePromise
+}
+function closeSettings() {
+  if (!finishingSettings.value && !windowClosing.value) advancedOpen.value = false
+}
+async function finishSettings() {
+  if (finishingSettings.value || windowClosing.value || validation.value) return
+  finishingSettings.value = true
+  try {
+    await flushConfig()
+    advancedOpen.value = false
+  } catch { /* Keep the drawer and pending settings available for a retry. */ }
+  finally { finishingSettings.value = false }
+}
+async function requestWindowClose(event: CloseRequestedEvent) {
+  event.preventDefault()
+  if (windowClosing.value) return
+  windowClosing.value = true
+  try {
+    await flushConfig()
+    // destroy follows Tauri's normal close-handler path without requesting close again.
+    await appWindow?.destroy()
+  } catch (error) {
+    if (!configSaveError.value) notify(`关闭窗口失败：${errorText(error)}`, true)
+    windowClosing.value = false
+  }
 }
 function toggleRegion(code: string) {
   if (locked.value) return
@@ -267,14 +339,9 @@ watch(config, () => {
   previousBudgetEnabled = config.value.downloadBudgetEnabled
   if (!initialized.value || !desktop || locked.value) return
   clearTimeout(saveTimer)
-  const persist = async () => {
-    // A retest can start before this debounce fires. Saving its pending user
-    // settings is safe while measurements run and must not be silently dropped.
-    if (validation.value) return
-    try { await invoke('save_config', { config: JSON.parse(JSON.stringify(config.value)) }) }
-    catch (error) { notify(`设置保存失败：${errorText(error)}`, true) }
-  }
-  if (budgetChanged) void persist()
+  if (!validation.value) pendingConfig = JSON.parse(JSON.stringify(config.value))
+  const persist = () => { void persistConfig().catch(() => {}) }
+  if (budgetChanged) persist()
   else saveTimer = setTimeout(persist, 500)
 }, { deep: true, flush: 'sync' })
 
@@ -282,6 +349,9 @@ onMounted(async () => {
   clock = setInterval(() => { now.value = Date.now() }, 1000)
   if (!desktop) { initialized.value = true; return }
   try {
+    const stopClose = await appWindow!.onCloseRequested(requestWindowClose)
+    if (disposed) { stopClose(); return }
+    unlistenClose = stopClose
     const stopUpdates = await listen<ScanRun>('scan-update', event => receiveRun(event.payload))
     if (disposed) { stopUpdates(); return }
     unlisten = stopUpdates
@@ -311,7 +381,7 @@ onMounted(async () => {
   } catch (error) { pageError.value = `初始化失败：${errorText(error)}` }
   finally { initialized.value = true; loading.value = false }
 })
-onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unlistenFavoriteTest?.(); unlistenFavorites?.(); clearInterval(clock); clearTimeout(saveTimer); clearTimeout(toastTimer) })
+onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unlistenFavoriteTest?.(); unlistenFavorites?.(); unlistenClose?.(); clearInterval(clock); clearTimeout(saveTimer); clearTimeout(toastTimer) })
 </script>
 
 <template>
@@ -328,7 +398,7 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
     <main>
 
 
-      <div v-show="favoritesOpen" id="favorites-library" ref="favoritesPanel" tabindex="-1" class="favorites-view"><FavoritesPanel :library="favorites" :desktop="desktop" :loading="loading" :config="config" :test-job="favoriteTest" :scan-busy="!!running || starting || stopping" @change="updateFavorites" @test-started="onFavoriteTestStarted" @notify="notify" /></div>
+      <div v-show="favoritesOpen" id="favorites-library" ref="favoritesPanel" tabindex="-1" class="favorites-view"><FavoritesPanel :library="favorites" :desktop="desktop" :loading="loading" :config="config" :test-job="favoriteTest" :scan-busy="!!running || starting || stopping || windowClosing" @change="updateFavorites" @test-started="onFavoriteTestStarted" @notify="notify" /></div>
 
       <div v-show="!favoritesOpen" class="scan-view">
         <div class="scan-controls">
@@ -361,15 +431,15 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
           </div>
         </div>
         <div class="results-column">
-          <AllResultsPanel v-if="run" :key="run.id" :run="run" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteTesting || favoritePending" @favorite="openFavorite" @notify="notify" />
+          <AllResultsPanel v-if="run" :key="run.id" :run="run" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteTesting || favoritePending || windowClosing" @favorite="openFavorite" @notify="notify" />
           <section v-else class="initial-empty" aria-labelledby="welcome-title"><Network :size="32" :stroke-width="1.2" /><h1 id="welcome-title">开始一次地区优选</h1><p>选择目标地区并开始测速，完成后在这里查看、筛选和收藏 IP。</p><span class="small muted">TCP 连通性 → 稳定性复测 → 服务验证 → 下载测速</span></section>
         </div>
       </div>
     </main>
     <footer class="app-statusbar"><span>Cloudflare IPv4</span><span>{{ favoritesOpen ? '收藏保存在本机' : running ? `已耗时 ${elapsed}` : 'TCP / HTTPS 实测' }}</span><span class="statusbar-version">v{{ appVersion }}</span></footer>
 
-    <dialog id="advanced-settings" ref="settingsDialog" class="settings-drawer" aria-labelledby="settings-title" @cancel.prevent="advancedOpen = false" @close="advancedOpen = false" @click="event => { if (event.target === settingsDialog) advancedOpen = false }">
-      <div class="drawer-header"><div class="drawer-title-group"><span class="drawer-title-icon"><Settings2 :size="17" /></span><div><h2 id="settings-title">高级设置</h2><p>自动保存 · 下次测速生效</p></div></div><div class="drawer-header-actions"><button class="text-button" :disabled="locked" title="恢复默认参数，保留所选地区" @click="resetParameters"><RotateCcw :size="12" />恢复默认</button><button class="icon-button" autofocus aria-label="关闭高级设置" @click="advancedOpen = false"><X :size="18" /></button></div></div>
+    <dialog id="advanced-settings" ref="settingsDialog" class="settings-drawer" aria-labelledby="settings-title" @cancel.prevent="closeSettings" @close="advancedOpen = false" @click="event => { if (event.target === settingsDialog) closeSettings() }">
+      <div class="drawer-header"><div class="drawer-title-group"><span class="drawer-title-icon"><Settings2 :size="17" /></span><div><h2 id="settings-title">高级设置</h2><p>自动保存 · 下次测速生效</p></div></div><div class="drawer-header-actions"><button class="text-button" :disabled="locked" title="恢复默认参数，保留所选地区" @click="resetParameters"><RotateCcw :size="12" />恢复默认</button><button class="icon-button" autofocus aria-label="关闭高级设置" :disabled="finishingSettings || windowClosing" @click="closeSettings"><X :size="18" /></button></div></div>
       <nav class="settings-tabs" role="tablist" aria-label="设置分类" @keydown="onSettingsTabKey"><button v-for="section in settingsSections" :id="`settings-tab-${section.id}`" :key="section.id" role="tab" :class="{ selected: settingsSection === section.id }" :aria-selected="settingsSection === section.id" :aria-controls="`settings-panel-${section.id}`" :tabindex="settingsSection === section.id ? 0 : -1" @click="settingsSection = section.id"><component :is="section.icon" :size="14" />{{ section.label }}</button></nav>
       <div ref="settingsBody" class="drawer-body">
         <section v-show="settingsSection === 'target'" id="settings-panel-target" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-target">
@@ -424,11 +494,12 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         </section>
       </div>
       <div v-if="toast" class="drawer-notice" :class="{ error: toast.error }" role="status"><CircleAlert v-if="toast.error" :size="14" /><Check v-else :size="14" /><span>{{ toast.text }}</span></div>
-      <div class="drawer-footer"><span id="settings-validation" class="drawer-save-status" role="status" :class="{ invalid: validation }"><CircleAlert v-if="validation" :size="13" /><LoaderCircle v-else-if="locked" :size="13" /><Check v-else :size="13" /><span>{{ validation || (locked ? '测试期间参数不可修改' : '有效参数自动保存到本机') }}</span></span><button class="button primary" @click="advancedOpen = false">完成<Check :size="14" /></button></div>
+      <div class="drawer-footer"><span id="settings-validation" class="drawer-save-status" role="status" :class="{ invalid: validation || configSaveError }"><CircleAlert v-if="validation || configSaveError" :size="13" /><LoaderCircle v-else-if="savingConfig || locked" :size="13" /><Check v-else :size="13" /><span>{{ validation || configSaveError || (savingConfig ? '正在保存设置…' : windowClosing ? '正在关闭窗口…' : locked ? '测试期间参数不可修改' : '有效参数自动保存；无效修改不会覆盖上次有效设置') }}</span></span><button class="button primary" :disabled="finishingSettings || windowClosing || !!validation" @click="finishSettings">{{ finishingSettings ? '保存中…' : '完成' }}<Check :size="14" /></button></div>
     </dialog>
     <FavoriteSaveDialog v-if="favoriteTarget && run && favoriteResult" :open="true" :library="favorites" :run="run" :result="favoriteResult" :desktop="desktop" @saved="updateFavorites" @change="updateFavorites" @close="closeFavorite" @notify="notify" />
     <div class="feedback-stack">
-      <div v-if="pageError || storageWarning" class="global-notices">
+      <div v-if="pageError || storageWarning || configSaveError" class="global-notices">
+      <div v-if="configSaveError" class="banner error-banner" role="alert"><CircleAlert :size="16" /><span>{{ configSaveError }}</span><button class="icon-button" aria-label="关闭设置保存提示" @click="configSaveError = ''"><X :size="14" /></button></div>
       <div v-if="pageError" class="banner error-banner" role="alert"><CircleAlert :size="16" /><span>{{ pageError }}</span><button class="icon-button" aria-label="关闭错误提示" @click="pageError = ''"><X :size="14" /></button></div>
       <div v-if="storageWarning" class="banner warning-banner" role="status"><CircleAlert :size="16" /><span>{{ storageWarning }}</span><button class="icon-button" aria-label="关闭存储提示" @click="storageWarning = ''"><X :size="14" /></button></div>
       </div>

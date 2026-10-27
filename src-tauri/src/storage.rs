@@ -46,6 +46,45 @@ fn preserve_legacy_budget(config: Option<&mut serde_json::Value>) {
     }
 }
 
+/// Recover only after preserving the original bytes in a unique sibling file.
+/// A failed backup must stop startup: continuing with defaults would let a
+/// later save or window close overwrite the only copy of the user's data.
+pub fn load_for_startup(path: &Path) -> Result<SavedState, String> {
+    let error = match load(path) {
+        Ok(saved) => return Ok(saved),
+        Err(error) => error,
+    };
+    let preserve_error =
+        |detail| format!("{error}；无法备份原始设置，已停止启动以保留原文件：{detail}");
+    let bytes = fs::read(path).map_err(|e| preserve_error(e.to_string()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| preserve_error("文件路径缺少目录".into()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| preserve_error("文件路径缺少名称".into()))?;
+    let mut backup = tempfile::Builder::new()
+        .prefix(&format!("{}.recovery-", name.to_string_lossy()))
+        .suffix(".bak")
+        .tempfile_in(parent)
+        .map_err(|e| preserve_error(e.to_string()))?;
+    backup
+        .write_all(&bytes)
+        .and_then(|_| backup.flush())
+        .and_then(|_| backup.as_file().sync_all())
+        .map_err(|e| preserve_error(e.to_string()))?;
+    let (_, backup_path) = backup
+        .keep()
+        .map_err(|e| preserve_error(e.error.to_string()))?;
+    Ok(SavedState {
+        warning: Some(format!(
+            "{error}；原始设置已备份至 {}，本次使用默认设置",
+            backup_path.display()
+        )),
+        ..SavedState::default()
+    })
+}
+
 pub fn load(path: &Path) -> Result<SavedState, String> {
     if !path.exists() {
         return Ok(SavedState::default());
@@ -218,6 +257,116 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery_backups(path: &Path) -> Vec<std::path::PathBuf> {
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|entry| {
+                entry
+                    .extension()
+                    .is_some_and(|extension| extension == "bak")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn startup_load_keeps_valid_state_and_missing_file_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let missing = load_for_startup(&path).unwrap();
+        assert!(missing.warning.is_none());
+        assert!(!path.exists());
+
+        let mut saved = SavedState::default();
+        saved.config.regions = vec!["JP".into()];
+        save(&path, &saved).unwrap();
+        let original = fs::read(&path).unwrap();
+        let loaded = load_for_startup(&path).unwrap();
+        assert_eq!(loaded.config.regions, ["JP"]);
+        assert!(loaded.warning.is_none());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(recovery_backups(&path).is_empty());
+    }
+
+    #[test]
+    fn startup_preserves_corrupt_json_before_defaults_can_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let original = b"{\"favorites\":\"recoverable data\",\xff";
+        fs::write(&path, original).unwrap();
+
+        let recovered = load_for_startup(&path).unwrap();
+        let backups = recovery_backups(&path);
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), original);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(recovered
+            .warning
+            .as_ref()
+            .unwrap()
+            .contains(backups[0].to_str().unwrap()));
+        assert!(recovered.favorites.entries.is_empty());
+
+        // This is the same save that closing a default-state window performs.
+        save(&path, &recovered).unwrap();
+        assert!(load(&path).is_ok());
+        assert_eq!(fs::read(&backups[0]).unwrap(), original);
+    }
+
+    #[test]
+    fn startup_preserves_valid_json_with_invalid_state_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut json = serde_json::to_value(SavedState::default()).unwrap();
+        json["favorites"]["entries"] = serde_json::json!({ "savedIp": "104.16.1.1" });
+        let original = serde_json::to_vec_pretty(&json).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(load(&path).is_err());
+
+        let recovered = load_for_startup(&path).unwrap();
+        let backups = recovery_backups(&path);
+        assert_eq!(backups.len(), 1);
+        assert_eq!(fs::read(&backups[0]).unwrap(), original);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(recovered.warning.unwrap().contains("已备份至"));
+    }
+
+    #[test]
+    fn repeated_startup_recovery_never_overwrites_an_existing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, b"first invalid state").unwrap();
+        let first = load_for_startup(&path).unwrap();
+        let first_backup = recovery_backups(&path).pop().unwrap();
+        fs::write(&path, b"second invalid state").unwrap();
+        let second = load_for_startup(&path).unwrap();
+        let backups = recovery_backups(&path);
+        assert_eq!(backups.len(), 2);
+        assert_ne!(first.warning, second.warning);
+        assert_eq!(fs::read(&first_backup).unwrap(), b"first invalid state");
+        let second_backup = backups
+            .iter()
+            .find(|backup| **backup != first_backup)
+            .unwrap();
+        assert_eq!(fs::read(second_backup).unwrap(), b"second invalid state");
+    }
+
+    #[test]
+    fn startup_backup_failure_returns_error_and_keeps_original_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // This valid filename leaves no room for the unique backup suffix on
+        // macOS or Windows. It reliably fails without depending on permissions.
+        let path = dir.path().join("s".repeat(250));
+        let original = b"invalid state that must not be overwritten";
+        fs::write(&path, original).unwrap();
+
+        let error = load_for_startup(&path).unwrap_err();
+        assert!(error.contains("无法备份原始设置"));
+        assert!(error.contains("已停止启动"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     fn legacy_run() -> ScanRun {
         let mut low = crate::model::IpResult::new("104.16.1.1".parse().unwrap());
