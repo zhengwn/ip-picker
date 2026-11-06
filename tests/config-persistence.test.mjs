@@ -1,79 +1,7 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
 import { setImmediate } from 'node:timers/promises'
 import test from 'node:test'
-import { parse, compileScript } from '@vue/compiler-sfc'
-import { build } from 'esbuild'
-
-// Exercise App.vue's real watcher and lifecycle without mounting the UI or IPC.
-const appPath = fileURLToPath(new URL('../src/App.vue', import.meta.url))
-const { descriptor } = parse(await readFile(appPath, 'utf8'), { filename: appPath })
-const script = compileScript(descriptor, { id: 'config-persistence-test', genDefaultAs: 'App' })
-const compiled = await build({
-  stdin: {
-    contents: `${script.content}
-      import { createRenderer } from 'vue'
-      import { setInvokeHandler } from '@tauri-apps/api/core'
-      import { setWindowFixture } from '@tauri-apps/api/window'
-      export { defaultConfig }
-      export function mountConfigApp(invoke, windowFixture) {
-        setInvokeHandler(invoke)
-        setWindowFixture(windowFixture)
-        let state
-        const component = {
-          ...App,
-          setup(props, context) { state = App.setup(props, context); return state },
-          render() { return null },
-        }
-        const renderer = createRenderer({
-          insert() {}, remove() {}, createElement() { return {} },
-          createText() { return {} }, createComment() { return {} },
-          setText() {}, setElementText() {}, parentNode() { return null },
-          nextSibling() { return null }, patchProp() {},
-        })
-        const mounted = renderer.createApp(component)
-        mounted.mount({})
-        return { state, unmount() { mounted.unmount() } }
-      }`,
-    loader: 'ts',
-    resolveDir: fileURLToPath(new URL('../src', import.meta.url)),
-  },
-  bundle: true,
-  write: false,
-  platform: 'node',
-  format: 'esm',
-  plugins: [{
-    name: 'desktop-and-view-fixtures',
-    setup(builder) {
-      builder.onResolve({ filter: /\.vue$|@tauri-apps\/api\/(core|event|window)$|@lucide\/vue|^\.\/popovers$/ },
-        args => ({ path: args.path, namespace: 'fixture' }))
-      builder.onLoad({ filter: /.*/, namespace: 'fixture' }, args => ({
-        contents: args.path.endsWith('/core')
-          ? 'let handler; export const setInvokeHandler = value => { handler = value }; export const isTauri = () => true; export const invoke = (...args) => handler(...args);'
-          : args.path.endsWith('/event')
-            ? 'export const listen = async () => () => {};'
-            : args.path.endsWith('/window')
-              ? 'let fixture; export const setWindowFixture = value => { fixture = value }; export const getCurrentWindow = () => fixture;'
-            : args.path === '@lucide/vue'
-              ? [...script.content.matchAll(/import \{ ([^}]+) \} from '@lucide\/vue'/g)]
-                .flatMap(match => match[1].split(',').map(name => `export const ${name.trim()} = {};`)).join('\n')
-              : args.path === './popovers'
-                ? 'export const dismissPopovers = () => {}; export const useDismissibleDetails = () => {};'
-                : 'export default {};',
-      }))
-    },
-  }],
-})
-const compiledDirectory = await mkdtemp(join(tmpdir(), 'ip-picker-config-test-'))
-const compiledPath = join(compiledDirectory, 'App.config-test.mjs')
-let mountConfigApp, defaultConfig
-try {
-  await writeFile(compiledPath, compiled.outputFiles[0].text)
-  ;({ mountConfigApp, defaultConfig } = await import(pathToFileURL(compiledPath).href))
-} finally { await rm(compiledDirectory, { recursive: true, force: true }) }
+import { App, defaultConfig, mountComponent, setInvokeHandler, setWindowFixture } from './support/component-fixture.mjs'
 
 function deferred() {
   let resolve, reject
@@ -102,16 +30,19 @@ async function fixture(context, options = {}) {
     })()
     return { event, completion }
   }
-  const app = mountConfigApp(async (command, args) => {
+  setWindowFixture(windowFixture)
+  setInvokeHandler(async (command, args) => {
     if (command === 'load_state') return { config: defaultConfig(), favorites: { revision: 0, folders: [], entries: [] } }
     if (command === 'get_scan' || command === 'get_favorite_test') return null
+    if (command === 'start_scan' && options.start) return options.start(args.config)
     if (command === 'save_config') {
       const snapshot = structuredClone(args.config)
       saves.push(snapshot)
       return options.save?.(snapshot, saves.length)
     }
     throw new Error(`Unexpected command: ${command}`)
-  }, windowFixture)
+  })
+  const app = mountComponent(App)
   context.after(() => app.unmount())
   await setImmediate()
   assert.equal(app.state.initialized.value, true)
@@ -283,4 +214,43 @@ test('closing with only an invalid draft leaves the previously saved settings in
   await requestClose().completion
   assert.equal(saves.length, 0)
   assert.equal(windowState.destroyed, 1)
+})
+
+test('a native field error keeps settings open but does not retry an invalid draft on close', async context => {
+  const issue = { field: 'targetUrl', message: '测速地址有误' }
+  const { state, saves, requestClose, windowState } = await fixture(context, { save: () => { throw issue } })
+  state.advancedOpen.value = true
+  state.config.value.targetUrl = 'https://example.com/download'
+  await state.finishSettings()
+  assert.equal(state.advancedOpen.value, true)
+  assert.deepEqual(state.validationIssue.value, issue)
+  assert.equal(state.configSaveError.value, '')
+
+  await requestClose().completion
+  assert.equal(windowState.destroyed, 1)
+  assert.equal(saves.length, 1)
+})
+
+test('a late native rejection does not block a newer settings draft from being saved on close', async context => {
+  const write = deferred()
+  const { state, saves, requestClose, windowState } = await fixture(context, { save: (_, attempt) => attempt === 1 ? write.promise : undefined })
+  state.config.value.maxTcpMs = 231
+  context.mock.timers.tick(500)
+  state.config.value.maxTcpMs = 232
+  const closing = requestClose()
+  write.reject({ field: 'maxTcpMs', message: '已被更新的草稿' })
+  await closing.completion
+  assert.deepEqual(saves.map(config => config.maxTcpMs), [231, 232])
+  assert.equal(state.validationIssue.value, null)
+  assert.equal(windowState.destroyed, 1)
+})
+
+test('starting a scan displays a native validation issue on the field and editing clears it', async context => {
+  const issue = { field: 'targetUrl', message: '测速地址有误' }
+  const { state } = await fixture(context, { start: () => { throw issue } })
+  await state.startScan()
+  assert.deepEqual(state.validationIssue.value, issue)
+  assert.equal(state.pageError.value, '')
+  state.config.value.targetUrl = 'https://example.com/download'
+  assert.equal(state.validationIssue.value, null)
 })

@@ -1,12 +1,138 @@
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::net::Ipv4Addr;
 
 #[path = "engine/pop.rs"]
 pub(crate) mod pop;
 
 /// One randomly sampled host from every /24 in the built-in Cloudflare ranges.
 pub const CLOUDFLARE_CANDIDATE_COUNT: usize = 5956;
+const MAX_CUSTOM_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CUSTOM_SOURCE_ENTRIES: usize = 20_000;
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ConfigValidationError {
+    pub(crate) field: &'static str,
+    pub(crate) message: String,
+}
+
+impl ConfigValidationError {
+    fn new(field: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            field,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum ScanCommandError {
+    InvalidConfig(ConfigValidationError),
+    Message(String),
+}
+
+impl ScanCommandError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::InvalidConfig(issue) => issue.message,
+            Self::Message(message) => message,
+        }
+    }
+}
+
+impl From<ConfigValidationError> for ScanCommandError {
+    fn from(issue: ConfigValidationError) -> Self {
+        Self::InvalidConfig(issue)
+    }
+}
+
+impl From<String> for ScanCommandError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<&str> for ScanCommandError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.into())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CustomCandidates {
+    pub(crate) explicit: Vec<Ipv4Addr>,
+    pub(crate) networks: Vec<Ipv4Net>,
+}
+
+fn validate_custom_source_size(input: &str) -> Result<(), ConfigValidationError> {
+    if input.len() > MAX_CUSTOM_SOURCE_BYTES {
+        return Err(ConfigValidationError::new(
+            "customIps",
+            "自定义列表不能超过 2 MiB",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_custom_candidates(
+    input: &str,
+) -> Result<CustomCandidates, ConfigValidationError> {
+    validate_custom_source_size(input)?;
+    let mut explicit = Vec::new();
+    let mut networks = Vec::new();
+    let mut seen_networks = HashSet::new();
+    let mut count = 0;
+    for (line_number, line) in input.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("");
+        for token in line
+            .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+            .filter(|s| !s.is_empty())
+        {
+            count += 1;
+            if count > MAX_CUSTOM_SOURCE_ENTRIES {
+                return Err(ConfigValidationError::new(
+                    "customIps",
+                    "自定义列表最多接受 20000 个 IP / 网段条目",
+                ));
+            }
+            if token.contains('/') {
+                let net = token
+                    .parse::<Ipv4Net>()
+                    .map_err(|_| {
+                        ConfigValidationError::new(
+                            "customIps",
+                            format!("第 {} 行不是有效 IPv4 CIDR：{token}", line_number + 1),
+                        )
+                    })?
+                    .trunc();
+                if seen_networks.insert(net) {
+                    networks.push(net);
+                }
+            } else {
+                let ip = token.parse::<Ipv4Addr>().map_err(|_| {
+                    ConfigValidationError::new(
+                        "customIps",
+                        format!(
+                            "第 {} 行不是有效 IPv4：{token}（第一版暂不支持 IPv6）",
+                            line_number + 1
+                        ),
+                    )
+                })?;
+                explicit.push(ip);
+            }
+        }
+    }
+    if count == 0 {
+        return Err(ConfigValidationError::new(
+            "customIps",
+            "候选列表为空，请输入 IPv4 或 CIDR",
+        ));
+    }
+    Ok(CustomCandidates { explicit, networks })
+}
 
 /// All throughput values use decimal megabits per second (Mbps).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,119 +215,187 @@ impl Default for ScanConfig {
 
 impl ScanConfig {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_candidates()
+            .map(|_| ())
+            .map_err(|issue| issue.message)
+    }
+
+    pub(crate) fn validate_with_candidates(
+        &self,
+    ) -> Result<Option<CustomCandidates>, ConfigValidationError> {
+        use ConfigValidationError as Invalid;
+
         if !self.stability_first {
-            return Err("新测试须先完成 TCP 稳定性筛选，再选择每区前 10 个进入下载测速".into());
+            return Err(Invalid::new(
+                "stabilityFirst",
+                "新测试须先完成 TCP 稳定性筛选，再选择每区前 10 个进入下载测速",
+            ));
         }
         if self.tcp_latency_screening {
-            return Err("新测试不使用单次 TCP 延迟淘汰，请使用连续 TCP 稳定性统计规则".into());
+            return Err(Invalid::new(
+                "tcpLatencyScreening",
+                "新测试不使用单次 TCP 延迟淘汰，请使用连续 TCP 稳定性统计规则",
+            ));
         }
         if self.regions.is_empty() || self.regions.len() > 32 {
-            return Err("请选择 1 至 32 个目标国家／地区".into());
+            return Err(Invalid::new("regions", "请选择 1 至 32 个目标国家／地区"));
         }
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for region in &self.regions {
             if region.len() != 2 || !region.bytes().all(|b| b.is_ascii_uppercase()) {
-                return Err(format!("地区代码必须是大写的两位代码：{region}"));
+                return Err(Invalid::new(
+                    "regions",
+                    format!("地区代码必须是大写的两位代码：{region}"),
+                ));
             }
             if !seen.insert(region) {
-                return Err(format!("地区重复：{region}"));
+                return Err(Invalid::new("regions", format!("地区重复：{region}")));
             }
         }
         if !(1..=10).contains(&self.ips_per_region) {
-            return Err("每区保留数量须为 1 至 10".into());
+            return Err(Invalid::new("ipsPerRegion", "每区保留数量须为 1 至 10"));
         }
         if !matches!(self.preference.as_str(), "daily" | "download") {
-            return Err("未知推荐偏好".into());
+            return Err(Invalid::new("preference", "未知推荐偏好"));
         }
         if !self.min_download_mbps.is_finite() || !(0.0..=10000.0).contains(&self.min_download_mbps)
         {
-            return Err("最低下载速度须为 0 至 10000 Mbps".into());
+            return Err(Invalid::new(
+                "minDownloadMbps",
+                "最低下载速度须为 0 至 10000 Mbps",
+            ));
         }
         if !(1..=10000).contains(&self.max_candidates) {
-            return Err("抽样数量须为 1 至 10000".into());
+            return Err(Invalid::new("maxCandidates", "抽样数量须为 1 至 10000"));
         }
         if !(1..=256).contains(&self.tcp_concurrency) {
-            return Err("TCP 并发须为 1 至 256".into());
+            return Err(Invalid::new("tcpConcurrency", "TCP 并发须为 1 至 256"));
         }
         if !self
             .max_tcp_ms
             .is_some_and(|limit| limit.is_finite() && (1.0..=30000.0).contains(&limit))
         {
-            return Err("请设置 1 至 30000 毫秒的 TCP 延迟上限".into());
+            return Err(Invalid::new(
+                "maxTcpMs",
+                "请设置 1 至 30000 毫秒的 TCP 延迟上限",
+            ));
         }
         if !self
             .stability_attempts
             .is_some_and(|count| (10..=1000).contains(&count))
         {
-            return Err("TCP 稳定性探测次数须为 10 至 1000".into());
+            return Err(Invalid::new(
+                "stabilityAttempts",
+                "TCP 稳定性探测次数须为 10 至 1000",
+            ));
         }
         if !(50..=5000).contains(&self.stability_interval_ms) {
-            return Err("TCP 稳定性探测间隔须为 50 至 5000 毫秒".into());
+            return Err(Invalid::new(
+                "stabilityIntervalMs",
+                "TCP 稳定性探测间隔须为 50 至 5000 毫秒",
+            ));
         }
         if !self.max_stability_failure_percent.is_finite()
             || !(0.0..=100.0).contains(&self.max_stability_failure_percent)
         {
-            return Err("TCP 稳定性连接失败率上限须为 0 至 100%".into());
+            return Err(Invalid::new(
+                "maxStabilityFailurePercent",
+                "TCP 稳定性连接失败率上限须为 0 至 100%",
+            ));
         }
         if !["average", "p95", "max"].contains(&self.stability_latency_metric.as_str()) {
-            return Err("TCP 稳定性延迟规则须为 average、p95 或 max".into());
+            return Err(Invalid::new(
+                "stabilityLatencyMetric",
+                "TCP 稳定性延迟规则须为 average、p95 或 max",
+            ));
         }
-        if !(100..=30000).contains(&self.connect_timeout_ms)
-            || !(100..=60000).contains(&self.request_timeout_ms)
-        {
-            return Err("连接超时须为 100 至 30000 毫秒，请求超时须为 100 至 60000 毫秒".into());
+        if !(100..=30000).contains(&self.connect_timeout_ms) {
+            return Err(Invalid::new(
+                "connectTimeoutMs",
+                "连接超时须为 100 至 30000 毫秒",
+            ));
+        }
+        if !(100..=60000).contains(&self.request_timeout_ms) {
+            return Err(Invalid::new(
+                "requestTimeoutMs",
+                "请求超时须为 100 至 60000 毫秒",
+            ));
         }
         if !matches!(self.precision_mode.as_str(), "adaptive" | "limited") {
-            return Err("未知精测模式".into());
+            return Err(Invalid::new("precisionMode", "未知精测模式"));
         }
         if !self
             .regional_candidate_limit
             .is_some_and(|limit| (self.ips_per_region..=10000).contains(&limit))
         {
-            return Err("每区按初筛延迟保留的候选上限须不少于结果数量，且不超过 10000".into());
+            return Err(Invalid::new(
+                "regionalCandidateLimit",
+                "每区按初筛延迟保留的候选上限须不少于结果数量，且不超过 10000",
+            ));
         }
         if self.precision_mode == "limited"
             && (self.candidates_per_region < self.ips_per_region
                 || self.candidates_per_region > 10000)
         {
-            return Err("手动精测上限须不少于保留数量，且不超过 10000".into());
+            return Err(Invalid::new(
+                "candidatesPerRegion",
+                "手动精测上限须不少于保留数量，且不超过 10000",
+            ));
         }
         if !(2..=10).contains(&self.verification_attempts) {
-            return Err("HTTPS 验证次数须为 2 至 10".into());
+            return Err(Invalid::new(
+                "verificationAttempts",
+                "HTTPS 验证次数须为 2 至 10",
+            ));
         }
         if !(2..=5).contains(&self.download_rounds) {
-            return Err("下载复测须为 2 至 5 轮".into());
+            return Err(Invalid::new("downloadRounds", "下载复测须为 2 至 5 轮"));
         }
         if !(1..=15).contains(&self.download_seconds) {
-            return Err("每轮下载时长须为 1 至 15 秒".into());
+            return Err(Invalid::new(
+                "downloadSeconds",
+                "每轮下载时长须为 1 至 15 秒",
+            ));
         }
         if self.download_budget_enabled && !(1..=4096).contains(&self.download_budget_mi_b) {
-            return Err("下载数据预算须为 1 至 4096 MiB".into());
+            return Err(Invalid::new(
+                "downloadBudgetMiB",
+                "下载数据预算须为 1 至 4096 MiB",
+            ));
         }
         if !matches!(self.source.as_str(), "cloudflare" | "custom") {
-            return Err("未知候选来源".into());
+            return Err(Invalid::new("source", "未知候选来源"));
         }
-        if self.custom_ips.len() > 2 * 1024 * 1024 {
-            return Err("自定义列表不能超过 2 MiB".into());
-        }
-        if self.source == "custom" && self.custom_ips.trim().is_empty() {
-            return Err("请输入或导入 IPv4 / CIDR 列表".into());
-        }
-        let url =
-            url::Url::parse(&self.target_url).map_err(|_| "下载地址不是有效 URL".to_string())?;
+        let candidates = if self.source == "custom" {
+            Some(parse_custom_candidates(&self.custom_ips)?)
+        } else {
+            validate_custom_source_size(&self.custom_ips)?;
+            None
+        };
+        let url = url::Url::parse(&self.target_url)
+            .map_err(|_| Invalid::new("targetUrl", "下载地址不是有效 URL"))?;
         if url.scheme() != "https" {
-            return Err("测速地址必须使用 HTTPS，以保留 TLS 证书验证".into());
+            return Err(Invalid::new(
+                "targetUrl",
+                "测速地址必须使用 HTTPS，以保留 TLS 证书验证",
+            ));
         }
         if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-            return Err("测速地址不能包含用户名、密码或 URL 片段".into());
+            return Err(Invalid::new(
+                "targetUrl",
+                "测速地址不能包含用户名、密码或 URL 片段",
+            ));
         }
         if !matches!(url.host(), Some(url::Host::Domain(_))) {
-            return Err("测速地址须使用域名，以正确保留 TLS SNI 和证书校验".into());
+            return Err(Invalid::new(
+                "targetUrl",
+                "测速地址须使用域名，以正确保留 TLS SNI 和证书校验",
+            ));
         }
         if url.port_or_known_default() == Some(0) {
-            return Err("测速端口不能为 0".into());
+            return Err(Invalid::new("targetUrl", "测速端口不能为 0"));
         }
-        Ok(())
+        Ok(candidates)
     }
 
     pub fn download_budget_bytes(&self) -> Option<u64> {
@@ -278,6 +472,34 @@ impl Default for ScanProgress {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExclusionCode {
+    TcpConnect,
+    TcpLatency,
+    HttpsTimeout,
+    HttpsFailure,
+    PopUnknown,
+    RegionMismatch,
+    RegionalAdmission,
+    StabilityEarly,
+    StabilityIncomplete,
+    StabilityAllFailed,
+    StabilityFailureRate,
+    StabilityLatency,
+    DownloadShortlist,
+    DownloadBudget,
+    DownloadFailure,
+    DownloadIncomplete,
+    PopRecheckIncomplete,
+    PopRecheckFailure,
+    PopDrift,
+    Cancelled,
+    SpeedTarget,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IpResult {
@@ -303,6 +525,8 @@ pub struct IpResult {
     pub eligible: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclusion_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusion_code: Option<ExclusionCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
 }
@@ -326,7 +550,28 @@ impl IpResult {
             measurement_passed: false,
             eligible: false,
             exclusion_reason: None,
+            exclusion_code: None,
             role: Some("candidate".into()),
+        }
+    }
+
+    pub(crate) fn exclude(&mut self, code: ExclusionCode, reason: impl Into<String>) {
+        self.exclusion_code = Some(code);
+        self.exclusion_reason = Some(reason.into());
+    }
+
+    pub(crate) fn clear_exclusion(&mut self) {
+        self.exclusion_code = None;
+        self.exclusion_reason = None;
+    }
+
+    pub(crate) fn is_excluded(&self) -> bool {
+        self.exclusion_code.is_some() || self.exclusion_reason.is_some()
+    }
+
+    pub(crate) fn mark_cancelled(&mut self, config: &ScanConfig) {
+        if !self.is_excluded() && self.download_samples_mbps.len() < config.download_rounds {
+            self.exclude(ExclusionCode::Cancelled, "测试已停止，验证或下载复测未完成");
         }
     }
 
@@ -365,12 +610,15 @@ impl IpResult {
                 pop::location(colo).is_some_and(|(region, _)| region == self.region_code)
             })
             && config.regions.contains(&self.region_code)
-            && (self.exclusion_reason.is_none() || self.has_only_speed_target_exclusion())
+            && (!self.is_excluded() || self.has_only_speed_target_exclusion())
     }
 
-    /// Match the exact legacy speed-filter format, never a substring in another
-    /// network/TLS failure. Keep this parser shared by storage and the engine.
+    /// Legacy records need the exact speed-filter format. A matching substring
+    /// in a network or TLS failure is never sufficient.
     pub fn has_only_speed_target_exclusion(&self) -> bool {
+        if let Some(code) = self.exclusion_code {
+            return code == ExclusionCode::SpeedTarget;
+        }
         let Some(reason) = self.exclusion_reason.as_deref() else {
             return false;
         };
@@ -392,9 +640,22 @@ impl IpResult {
     }
 
     pub fn stability_exclusion(&self, config: &ScanConfig) -> Option<String> {
+        self.stability_exclusion_details(config)
+            .map(|(_, reason)| reason)
+    }
+
+    pub(crate) fn stability_exclusion_details(
+        &self,
+        config: &ScanConfig,
+    ) -> Option<(ExclusionCode, String)> {
+        use ExclusionCode::*;
+
         let requested = config.stability_attempts?;
         let Some(stats) = self.tcp_stability.as_ref() else {
-            return Some(format!("TCP 稳定性探测未完成：0 / {requested}"));
+            return Some((
+                StabilityIncomplete,
+                format!("TCP 稳定性探测未完成：0 / {requested}"),
+            ));
         };
         if !stats.completed
             || stats.requested != requested
@@ -432,12 +693,12 @@ impl IpResult {
                     })
                 };
                 if let Some(reason) = rejection {
-                    return Some(reason);
+                    return Some((StabilityEarly, reason));
                 }
             }
-            return Some(format!(
-                "TCP 稳定性探测未完成：{} / {requested}",
-                stats.attempted
+            return Some((
+                StabilityIncomplete,
+                format!("TCP 稳定性探测未完成：{} / {requested}", stats.attempted),
             ));
         }
         let succeeded = stats
@@ -453,20 +714,26 @@ impl IpResult {
                 .flatten()
                 .any(|ms| !ms.is_finite() || *ms < 0.0)
         {
-            return Some("TCP 稳定性统计不完整，不能参与推荐".into());
+            return Some((
+                StabilityIncomplete,
+                "TCP 稳定性统计不完整，不能参与推荐".into(),
+            ));
         }
         if succeeded == 0 {
-            return Some("TCP 稳定性探测全部连接失败".into());
+            return Some((StabilityAllFailed, "TCP 稳定性探测全部连接失败".into()));
         }
         if config.stability_first {
             if let Some(reason) = crate::stability::failure_count_exclusion(&stats.probes_ms) {
-                return Some(format!("TCP 稳定性{reason}"));
+                return Some((StabilityEarly, format!("TCP 稳定性{reason}")));
             }
         }
         let selected =
             crate::stability::latency_metric_ms(&stats.probes_ms, &config.stability_latency_metric);
         let Some(selected) = selected else {
-            return Some("TCP 稳定性延迟统计不完整，不能参与推荐".into());
+            return Some((
+                StabilityIncomplete,
+                "TCP 稳定性延迟统计不完整，不能参与推荐".into(),
+            ));
         };
         if !config.accepts_tcp_ms(selected) {
             let label = match config.stability_latency_metric.as_str() {
@@ -474,9 +741,12 @@ impl IpResult {
                 "max" => "最大",
                 _ => "P95",
             };
-            return Some(format!(
-                "TCP 稳定性{label}耗时 {selected} ms，超过上限 {} ms",
-                config.max_tcp_ms.unwrap_or(stats.delay_limit_ms)
+            return Some((
+                StabilityLatency,
+                format!(
+                    "TCP 稳定性{label}耗时 {selected} ms，超过上限 {} ms",
+                    config.max_tcp_ms.unwrap_or(stats.delay_limit_ms)
+                ),
             ));
         }
         let stored_selected = match config.stability_latency_metric.as_str() {
@@ -488,7 +758,10 @@ impl IpResult {
             value.is_finite()
                 && (value - selected).abs() <= f64::EPSILON * selected.abs().max(1.0) * 8.0
         }) {
-            return Some("TCP 稳定性所选统计与原始样本不一致，不能参与推荐".into());
+            return Some((
+                StabilityIncomplete,
+                "TCP 稳定性所选统计与原始样本不一致，不能参与推荐".into(),
+            ));
         }
         if [
             stats.average_ms,
@@ -503,13 +776,19 @@ impl IpResult {
                 .failure_percent
                 .is_some_and(|value| value.is_finite() && (0.0..=100.0).contains(&value))
         {
-            return Some("TCP 稳定性耗时统计不完整，不能参与推荐".into());
+            return Some((
+                StabilityIncomplete,
+                "TCP 稳定性耗时统计不完整，不能参与推荐".into(),
+            ));
         }
         let failure_percent = stats.failed as f64 * 100.0 / requested as f64;
         if failure_percent > config.max_stability_failure_percent {
-            return Some(format!(
-                "TCP 稳定性连接失败率 {failure_percent}%，超过上限 {}%",
-                config.max_stability_failure_percent
+            return Some((
+                StabilityFailureRate,
+                format!(
+                    "TCP 稳定性连接失败率 {failure_percent}%，超过上限 {}%",
+                    config.max_stability_failure_percent
+                ),
             ));
         }
         None
@@ -600,6 +879,57 @@ mod tests {
     fn defaults_are_valid() {
         ScanConfig::default().validate().unwrap();
         assert!(!ScanConfig::default().download_budget_enabled);
+    }
+
+    #[test]
+    fn settings_validation_matches_the_shared_boundary_cases() {
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            patch: serde_json::Map<String, serde_json::Value>,
+            field: Option<String>,
+        }
+
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../../tests/fixtures/config-validation.json"))
+                .unwrap();
+        for case in cases {
+            let mut value = serde_json::to_value(ScanConfig::default()).unwrap();
+            value.as_object_mut().unwrap().extend(case.patch);
+            let config: ScanConfig = serde_json::from_value(value).unwrap();
+            let issue = config.validate_with_candidates().err();
+            assert_eq!(
+                issue.as_ref().map(|issue| issue.field),
+                case.field.as_deref(),
+                "{}: {issue:?}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn custom_list_limits_count_utf8_bytes_and_entries_including_duplicates() {
+        let mut config = ScanConfig {
+            source: "custom".into(),
+            custom_ips: "192.0.2.1\n#".into(),
+            ..Default::default()
+        };
+        let remaining = MAX_CUSTOM_SOURCE_BYTES - config.custom_ips.len();
+        config.custom_ips.push_str(&"中".repeat(remaining / 3));
+        config.custom_ips.push_str(&" ".repeat(remaining % 3));
+        assert_eq!(config.custom_ips.len(), MAX_CUSTOM_SOURCE_BYTES);
+        assert!(config.validate().is_ok());
+        config.custom_ips.push('é');
+        let issue = config.validate_with_candidates().unwrap_err();
+        assert_eq!(issue.field, "customIps");
+        assert!(issue.message.contains("2 MiB"));
+
+        config.custom_ips = "192.0.2.1\n".repeat(MAX_CUSTOM_SOURCE_ENTRIES);
+        assert!(config.validate().is_ok());
+        config.custom_ips.push_str("192.0.2.1");
+        let issue = config.validate_with_candidates().unwrap_err();
+        assert_eq!(issue.field, "customIps");
+        assert!(issue.message.contains("20000"));
     }
 
     #[test]
@@ -1081,5 +1411,29 @@ mod tests {
                 "accepted {reason}"
             );
         }
+    }
+
+    #[test]
+    fn exclusion_code_roundtrips_and_takes_precedence_over_the_message() {
+        let mut result = IpResult::new(std::net::Ipv4Addr::LOCALHOST);
+        let legacy_reason = "下载 8.40 Mbps，低于日常优选目标 20.00 Mbps";
+        result.exclusion_reason = Some(legacy_reason.into());
+        let legacy_json = serde_json::to_value(&result).unwrap();
+        assert!(legacy_json.get("exclusionCode").is_none());
+        assert!(serde_json::from_value::<IpResult>(legacy_json)
+            .unwrap()
+            .has_only_speed_target_exclusion());
+
+        result.exclude(ExclusionCode::HttpsFailure, legacy_reason);
+        let mut current_json = serde_json::to_value(&result).unwrap();
+        assert_eq!(current_json["exclusionCode"], "httpsFailure");
+        assert!(!serde_json::from_value::<IpResult>(current_json.clone())
+            .unwrap()
+            .has_only_speed_target_exclusion());
+
+        current_json["exclusionCode"] = "futureFailure".into();
+        let restored: IpResult = serde_json::from_value(current_json).unwrap();
+        assert_eq!(restored.exclusion_code, Some(ExclusionCode::Unknown));
+        assert!(restored.is_excluded());
     }
 }

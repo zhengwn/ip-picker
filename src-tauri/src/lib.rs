@@ -1,3 +1,5 @@
+#[cfg(feature = "desktop-smoke")]
+mod desktop_smoke;
 pub mod engine;
 mod favorites;
 mod instance;
@@ -8,13 +10,16 @@ mod storage;
 
 use crate::{
     engine::{
-        prepare_scan, run_prepared_scan, run_targeted_scan, EngineOutcome, EngineUpdate,
-        PreparedScan, UpdateCallback,
+        prepare_scan, run_targeted_scan, EngineOutcome, EngineUpdate, PreparedScan, UpdateCallback,
     },
     favorites::{FavoriteLibrary, FavoriteTestJob, FavoriteTestStart},
-    model::{ScanConfig, ScanProgress, ScanRun},
+    model::{ScanCommandError, ScanConfig, ScanProgress, ScanRun},
     storage::SavedState,
 };
+#[cfg(feature = "desktop-smoke")]
+use desktop_smoke::run_prepared_scan;
+#[cfg(not(feature = "desktop-smoke"))]
+use engine::run_prepared_scan;
 use std::{
     net::Ipv4Addr,
     path::PathBuf,
@@ -63,7 +68,7 @@ impl RuntimeState {
         config: ScanConfig,
         token: CancellationToken,
         path: &std::path::Path,
-    ) -> Result<(ScanRun, PreparedScan), String> {
+    ) -> Result<(ScanRun, PreparedScan), ScanCommandError> {
         if self.has_active_measurement() {
             return Err("已有测试正在运行，请先停止并等待结束".into());
         }
@@ -245,6 +250,7 @@ impl RuntimeState {
                 run.progress.message = "关闭应用时测试中断".into();
                 for result in &mut run.results {
                     result.role = Some("candidate".into());
+                    result.mark_cancelled(&run.config);
                 }
             }
         }
@@ -288,6 +294,9 @@ fn finish_run(run: &mut ScanRun, outcome: Result<EngineOutcome, String>, cancell
     if run.status != "completed" {
         for result in &mut run.results {
             result.role = Some("candidate".into());
+            if run.status == "cancelled" {
+                result.mark_cancelled(&run.config);
+            }
         }
         run.progress.message = if run.status == "cancelled" {
             "测试已停止，保留已完成数据"
@@ -348,15 +357,15 @@ fn get_favorite_test(state: State<'_, AppState>) -> Result<Option<FavoriteTestJo
 }
 
 #[tauri::command]
-fn save_config(config: ScanConfig, state: State<'_, AppState>) -> Result<(), String> {
-    config.validate()?;
+fn save_config(config: ScanConfig, state: State<'_, AppState>) -> Result<(), ScanCommandError> {
+    config.validate_with_candidates()?;
     let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
     let old = inner.saved.clone();
     inner.saved.config = config;
     inner.saved.warning = None;
     if let Err(error) = storage::save(&state.storage_path, &inner.saved) {
         inner.saved = old;
-        return Err(error);
+        return Err(error.into());
     }
     Ok(())
 }
@@ -474,30 +483,6 @@ fn delete_favorite(
 }
 
 #[tauri::command]
-fn delete_favorites_for_ip(
-    ip: String,
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<FavoriteLibrary, String> {
-    let favorites = state
-        .inner
-        .lock()
-        .map_err(|_| "应用状态不可用")?
-        .update_favorites(&state.storage_path, |saved, favorites| {
-            if saved
-                .favorite_test
-                .as_ref()
-                .is_some_and(|job| job.run.status == "running")
-            {
-                return Err("收藏复测正在进行，请结束后取消收藏".into());
-            }
-            favorites.delete_ip(&ip)
-        })?;
-    let _ = app.emit("favorites-update", favorites.clone());
-    Ok(favorites)
-}
-
-#[tauri::command]
 async fn start_favorite_test(
     config: ScanConfig,
     folder_id: Option<String>,
@@ -587,7 +572,7 @@ async fn start_scan(
     config: ScanConfig,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<ScanRun, String> {
+) -> Result<ScanRun, ScanCommandError> {
     let cancellation = CancellationToken::new();
     let (run, prepared) = {
         let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
@@ -651,6 +636,9 @@ async fn start_scan(
                 if current.status != "completed" {
                     for result in &mut current.results {
                         result.role = Some("candidate".into());
+                        if current.status == "cancelled" {
+                            result.mark_cancelled(&current.config);
+                        }
                     }
                     current.progress.message = if current.status == "cancelled" {
                         "测试已停止，保留已完成数据"
@@ -704,10 +692,16 @@ fn copy_text(text: String, app: tauri::AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_clipboard_manager::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_clipboard_manager::init());
+    let context = tauri::generate_context!();
+    #[cfg(feature = "desktop-smoke")]
+    let (builder, context) = desktop_smoke::configure(builder, context);
+    builder
         .setup(|app| {
+            #[cfg(not(feature = "desktop-smoke"))]
             let data_dir = app.path().app_data_dir()?;
+            #[cfg(feature = "desktop-smoke")]
+            let data_dir = desktop_smoke::data_dir()?;
             // Acquire before reading or recovering state; a second process must
             // never even load a snapshot that it could later write back.
             let guard = instance::InstanceGuard::acquire(&data_dir)?;
@@ -750,10 +744,9 @@ pub fn run() {
             save_favorite,
             update_favorite,
             delete_favorite,
-            delete_favorites_for_ip,
             copy_text
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("IP Picker 启动失败");
 }
 
@@ -866,13 +859,9 @@ mod lifecycle_tests {
             .unwrap();
         assert_eq!(snapshot.revision, 46);
         let snapshot = inner
-            .update_favorites(&path, |_, favorites| favorites.delete_ip(ip))
-            .unwrap();
-        assert_eq!(snapshot.revision, 47);
-        let snapshot = inner
             .update_favorites(&path, |_, favorites| favorites.delete_folder(&folder))
             .unwrap();
-        assert_eq!(snapshot.revision, 48);
+        assert_eq!(snapshot.revision, 47);
         let persisted = storage::load(&path).unwrap().favorites;
         assert_eq!(
             serde_json::to_value(persisted).unwrap(),
@@ -882,8 +871,8 @@ mod lifecycle_tests {
         inner
             .begin(run("other-main"), CancellationToken::new(), &path)
             .unwrap();
-        assert_eq!(inner.saved.favorites.revision, 48);
-        assert_eq!(storage::load(&path).unwrap().favorites.revision, 48);
+        assert_eq!(inner.saved.favorites.revision, 47);
+        assert_eq!(storage::load(&path).unwrap().favorites.revision, 47);
     }
 
     #[test]
@@ -1107,11 +1096,14 @@ mod lifecycle_tests {
                 custom_ips,
                 ..ScanConfig::default()
             };
-            // These inputs used to pass the command's preliminary validation.
-            assert!(config.validate().is_ok());
-            assert!(inner
+            let validation = config.validate_with_candidates().unwrap_err();
+            let startup_error = inner
                 .begin_scan(config, CancellationToken::new(), &path)
-                .is_err());
+                .unwrap_err();
+            assert_eq!(
+                serde_json::to_value(startup_error).unwrap(),
+                serde_json::json!({ "field": "customIps", "message": validation.message }),
+            );
             assert_eq!(serde_json::to_value(&inner.saved).unwrap(), original_state);
             assert_eq!(std::fs::read(&path).unwrap(), original_file);
             assert!(!inner.has_active_measurement());

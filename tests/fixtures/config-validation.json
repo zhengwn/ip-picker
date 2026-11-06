@@ -1,0 +1,20 @@
+[
+  { "name": "default settings", "patch": {}, "field": null },
+  { "name": "mixed custom list with comments", "patch": { "source": "custom", "customIps": "# comment\r\n192.0.2.1, 198.51.100.0/24; 203.0.113.0/31 # comment\n192.0.2.2/32" }, "field": null },
+  { "name": "inactive custom list is not parsed", "patch": { "source": "cloudflare", "customIps": "not an address" }, "field": null },
+  { "name": "IPv4 with a leading zero", "patch": { "source": "custom", "customIps": "192.0.02.1" }, "field": "customIps" },
+  { "name": "malformed IPv4 on the second line", "patch": { "source": "custom", "customIps": "192.0.2.1\n198.51.100.256" }, "field": "customIps" },
+  { "name": "out-of-range CIDR prefix", "patch": { "source": "custom", "customIps": "192.0.2.1/33" }, "field": "customIps" },
+  { "name": "comment-only list", "patch": { "source": "custom", "customIps": "# sample\n ; , # comment" }, "field": "customIps" },
+  { "name": "HTTPS URL with an encoded hash", "patch": { "targetUrl": "https://example.com/file%23part?download=1" }, "field": null },
+  { "name": "empty URL fragment", "patch": { "targetUrl": "https://example.com/file#" }, "field": "targetUrl" },
+  { "name": "IP literal target", "patch": { "targetUrl": "https://192.0.2.1/file" }, "field": "targetUrl" },
+  { "name": "zero target port", "patch": { "targetUrl": "https://example.com:0/file" }, "field": "targetUrl" },
+  { "name": "duplicate regions", "patch": { "regions": ["HK", "HK"] }, "field": "regions" },
+  { "name": "request timeout below minimum", "patch": { "requestTimeoutMs": 99 }, "field": "requestTimeoutMs" },
+  { "name": "connect timeout above maximum", "patch": { "connectTimeoutMs": 30001 }, "field": "connectTimeoutMs" },
+  { "name": "disabled download budget", "patch": { "downloadBudgetEnabled": false, "downloadBudgetMiB": 0 }, "field": null },
+  { "name": "enabled download budget", "patch": { "downloadBudgetEnabled": true, "downloadBudgetMiB": 0 }, "field": "downloadBudgetMiB" },
+  { "name": "unknown candidate source", "patch": { "source": "other" }, "field": "source" },
+  { "name": "unknown recommendation preference", "patch": { "preference": "other" }, "field": "preference" }
+]

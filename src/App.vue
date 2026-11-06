@@ -6,7 +6,9 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { getCurrentWindow, type CloseRequestedEvent } from '@tauri-apps/api/window'
 import { Activity, ArrowDownToLine, ArrowRight, Check, ChevronDown, CircleAlert, Globe2, Info, LoaderCircle, Network, Play, RotateCcw, Settings2, ShieldCheck, Square, Star, X } from '@lucide/vue'
 import { defaultConfig, selectableRegions, type IpResult, type SavedState, type ScanConfig, type ScanRun } from './types'
-import { normalizeActiveConfig, precisionPolicyDescription, stabilityMetricLabel, stageProgressText, validateConfig } from './ui-state'
+import { commandValidationIssue, normalizeActiveConfig, precisionPolicyDescription, stabilityMetricLabel, stageProgressText, validateConfig, type ValidationIssue } from './ui-state'
+import { estimateScan, formatDownloadedMiB } from './scan-estimate'
+import { MAX_CUSTOM_IP_BYTES } from './custom-ips'
 import SelectControl from './components/SelectControl.vue'
 import { dismissPopovers, useDismissibleDetails } from './popovers'
 import ScanProgressPanel from './components/ScanProgressPanel.vue'
@@ -31,7 +33,6 @@ const scanToggle = ref<HTMLButtonElement | null>(null)
 const favoriteTarget = ref<{ runId: string; ip: string } | null>(null)
 const favoriteResult = computed(() => run.value?.id === favoriteTarget.value?.runId
   ? run.value?.results.find(result => result.ip === favoriteTarget.value?.ip) ?? null : null)
-const favoritePending = ref(false)
 const savedIps = computed(() => new Set(favorites.value.entries.map(entry => entry.result.ip)))
 let favoriteTrigger: HTMLElement | null = null
 const initialized = ref(false)
@@ -43,6 +44,7 @@ const finishingSettings = ref(false)
 const windowClosing = ref(false)
 const savingConfig = ref(false)
 const configSaveError = ref('')
+const nativeValidationIssue = ref<ValidationIssue | null>(null)
 const settingsDialog = ref<HTMLDialogElement | null>(null)
 const settingsTrigger = ref<HTMLButtonElement | null>(null)
 const settingsBody = ref<HTMLElement | null>(null)
@@ -106,11 +108,16 @@ let drainConfigSaves = false
 let configSaveDue = false
 
 const running = computed(() => run.value?.status === 'running')
+const measurementActive = computed(() => starting.value || running.value || favoriteTesting.value)
 const scanPhaseTitle = computed(() => run.value ? stageProgressText(run.value).title : '')
 const locked = computed(() => loading.value || starting.value || running.value || favoriteTesting.value || stopping.value || finishingSettings.value || windowClosing.value)
 const dirty = computed(() => !!run.value && JSON.stringify(config.value) !== JSON.stringify(run.value.config))
-const validationIssue = computed(() => validateConfig(config.value))
+const validationIssue = computed(() => validateConfig(config.value) ?? nativeValidationIssue.value)
 const validation = computed(() => validationIssue.value?.message ?? '')
+const scanEstimate = computed(() => loading.value || measurementActive.value || validationIssue.value
+  ? null : estimateScan(config.value))
+const scanDownloaded = computed(() => formatDownloadedMiB(run.value?.progress.downloadedBytes ?? 0))
+const favoriteDownloaded = computed(() => formatDownloadedMiB(favoriteTest.value?.run.progress.downloadedBytes ?? 0))
 const elapsed = computed(() => {
   if (!run.value) return ''
   const end = run.value.finishedAt ? new Date(run.value.finishedAt).getTime() : now.value
@@ -122,7 +129,8 @@ function fieldId(field: keyof ScanConfig) { return field === 'regions' ? 'region
 function fieldInvalid(field: keyof ScanConfig) { return validationIssue.value?.field === field || undefined }
 function fieldDescription(field: keyof ScanConfig, helpId?: string) { return [fieldInvalid(field) ? (advancedOpen.value ? 'settings-validation' : 'config-validation') : '', helpId ?? ''].filter(Boolean).join(' ') || undefined }
 async function focusSetting(field: keyof ScanConfig) {
-  if (!['regions', 'downloadBudgetEnabled', 'downloadBudgetMiB'].includes(field)) { settingsSection.value = sectionForField(field); advancedOpen.value = true }
+  if (['regions', 'downloadBudgetEnabled', 'downloadBudgetMiB'].includes(field)) advancedOpen.value = false
+  else { settingsSection.value = sectionForField(field); advancedOpen.value = true }
   await nextTick()
   const target = document.getElementById(fieldId(field))
   if (!target) return
@@ -134,6 +142,14 @@ async function focusSetting(field: keyof ScanConfig) {
   focusTarget?.focus({ preventScroll: true })
 }
 function errorText(error: unknown) { return error instanceof Error ? error.message : String(error) }
+function receiveConfigRejection(error: unknown, snapshot: ScanConfig): boolean {
+  const issue = commandValidationIssue(error)
+  if (!issue) return false
+  const rejected = JSON.stringify(snapshot)
+  if (pendingConfig && JSON.stringify(pendingConfig) === rejected) pendingConfig = null
+  if (!disposed && JSON.stringify(config.value) === rejected) nativeValidationIssue.value = issue
+  return true
+}
 function notify(text: string, error = false) {
   clearTimeout(toastTimer)
   toast.value = { text, error }
@@ -157,7 +173,13 @@ function persistConfig(flush = false): Promise<void> {
     while (pendingConfig && !disposed && (drainConfigSaves || configSaveDue)) {
       const snapshot: ScanConfig = pendingConfig
       configSaveDue = false
-      await invoke('save_config', { config: snapshot })
+      try {
+        await invoke('save_config', { config: snapshot })
+      } catch (error) {
+        // A rejected draft should neither overwrite saved settings nor block
+        // window close. Storage errors still keep the pending write for retry.
+        if (!receiveConfigRejection(error, snapshot)) throw error
+      }
       // Edits made while this write was in flight need their own subsequent save.
       if (pendingConfig === snapshot) pendingConfig = null
       configSaveError.value = ''
@@ -182,7 +204,7 @@ async function finishSettings() {
   finishingSettings.value = true
   try {
     await flushConfig()
-    advancedOpen.value = false
+    if (!validation.value) advancedOpen.value = false
   } catch { /* Keep the drawer and pending settings available for a retry. */ }
   finally { finishingSettings.value = false }
 }
@@ -213,7 +235,7 @@ async function importIps(event: Event) {
   const file = input.files?.[0]
   if (!file) return
   try {
-    if (file.size > 2 * 1024 * 1024) throw new Error('列表文件不能超过 2 MiB')
+    if (file.size > MAX_CUSTOM_IP_BYTES) throw new Error('列表文件不能超过 2 MiB')
     config.value.customIps = await file.text()
     config.value.source = 'custom'
     notify(`已载入 ${file.name}，开始前可检查 IP 列表`)
@@ -236,12 +258,13 @@ function receiveRun(next: ScanRun, allowNewerSnapshot = false) {
 }
 async function startScan() {
   if (!desktop || locked.value || validation.value) return
+  const snapshot: ScanConfig = JSON.parse(JSON.stringify(config.value))
   starting.value = true
   previousRunIdForStart = run.value?.id
   pageError.value = ''
   advancedOpen.value = false
   try {
-    const next = await invoke<ScanRun>('start_scan', { config: JSON.parse(JSON.stringify(config.value)) })
+    const next = await invoke<ScanRun>('start_scan', { config: snapshot })
     if (run.value?.id !== next.id) run.value = next
     await nextTick()
     if (progressPanel.value) {
@@ -250,7 +273,9 @@ async function startScan() {
     }
     const latest = await invoke<ScanRun | null>('get_scan')
     if (latest?.id === next.id) receiveRun(latest)
-  } catch (error) { pageError.value = errorText(error) }
+  } catch (error) {
+    if (!receiveConfigRejection(error, snapshot)) pageError.value = errorText(error)
+  }
   finally { starting.value = false }
 }
 async function stopScan() {
@@ -296,17 +321,8 @@ function onFavoriteTestStarted(start: FavoriteTestStart) {
   receiveFavoriteTest(start.job)
   if (finishedBeforeResponse) void refreshFavorites()
 }
-async function openFavorite(result: IpResult, event: MouseEvent) {
-  if (!desktop || loading.value || favoriteTesting.value || favoritePending.value || !run.value) return
-  if (savedIps.value.has(result.ip)) {
-    favoritePending.value = true
-    try {
-      updateFavorites(await invoke<FavoriteLibrary>('delete_favorites_for_ip', { ip: result.ip }))
-      notify(`已取消 ${result.ip} 的收藏`)
-    } catch (error) { notify(`取消收藏失败：${errorText(error)}`, true) }
-    finally { favoritePending.value = false }
-    return
-  }
+function openFavorite(result: IpResult, event: MouseEvent) {
+  if (!desktop || loading.value || favoriteTesting.value || windowClosing.value || favoriteTarget.value || !run.value) return
   favoriteTrigger = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
   favoriteTarget.value = { runId: run.value.id, ip: result.ip }
 }
@@ -335,6 +351,7 @@ watch(() => config.value.downloadBudgetEnabled, enabled => {
 
 let previousBudgetEnabled = config.value.downloadBudgetEnabled
 watch(config, () => {
+  nativeValidationIssue.value = null
   const budgetChanged = config.value.downloadBudgetEnabled !== previousBudgetEnabled
   previousBudgetEnabled = config.value.downloadBudgetEnabled
   if (!initialized.value || !desktop || locked.value) return
@@ -392,7 +409,11 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         <button ref="scanToggle" class="nav-item" :class="{ active: !favoritesOpen }" :aria-current="!favoritesOpen ? 'page' : undefined" @click="showFavorites(false)"><Activity :size="15" />地区优选</button>
         <button ref="favoritesToggle" class="nav-item" :class="{ active: favoritesOpen }" :aria-current="favoritesOpen ? 'page' : undefined" aria-controls="favorites-library" @click="showFavorites(true)"><Star :size="15" />收藏夹<span v-if="favorites.entries.length" class="favorites-count">{{ favorites.entries.length }}</span></button>
       </nav>
-      <div class="header-actions"><span class="local-indicator"><span class="status-dot" :class="{ active: running || favoriteTesting }" />{{ !desktop ? '界面预览' : favoriteTesting ? '收藏复测中' : running ? '正在测速' : '就绪' }}</span><button v-if="running && favoritesOpen" class="button stop-button header-stop" :disabled="stopping" @click="stopScan"><Square :size="12" />{{ stopping ? '正在停止…' : '停止测速' }}</button></div>
+      <div class="header-actions">
+        <span class="local-indicator"><span class="status-dot" :class="{ active: running || favoriteTesting }" />{{ !desktop ? '界面预览' : favoriteTesting ? '收藏复测中' : running ? '正在测速' : '就绪' }}</span>
+        <span v-if="running && favoritesOpen" class="downloaded-total">累计下载 {{ scanDownloaded }}</span>
+        <button v-if="running && favoritesOpen" class="button stop-button header-stop" :disabled="stopping" @click="stopScan"><Square :size="12" />{{ stopping ? '正在停止…' : '停止测速' }}</button>
+      </div>
     </header>
 
     <main>
@@ -412,26 +433,43 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
             <div class="configuration-actions workspace-actions">
               <button ref="settingsTrigger" class="button advanced-trigger workspace-secondary-action" :aria-expanded="advancedOpen" aria-controls="advanced-settings" @click="advancedOpen = true"><Settings2 :size="14" />高级设置</button>
               <button v-if="running" class="button stop-button start-button workspace-primary-action" :disabled="stopping" @click="stopScan"><LoaderCircle v-if="stopping" :size="14" class="spinning" /><Square v-else :size="12" />{{ stopping ? '正在停止…' : '停止测速' }}</button>
-              <button v-else class="button primary start-button workspace-primary-action" :disabled="!desktop || locked || !!validation" @click="startScan"><LoaderCircle v-if="starting || loading" :size="14" class="spinning" /><Play v-else :size="12" fill="currentColor" />{{ scanActionLabel }}</button>
+              <button v-else class="button primary start-button workspace-primary-action" :disabled="!desktop || locked || !!validation" :aria-describedby="scanEstimate ? 'scan-estimate scan-estimate-detail scan-budget-state' : undefined" @click="startScan"><LoaderCircle v-if="starting || loading" :size="14" class="spinning" /><Play v-else :size="12" fill="currentColor" />{{ scanActionLabel }}</button>
             </div>
           </div>
-          <div class="configuration-secondary">
+          <div class="configuration-secondary" :class="{ 'has-scan-estimate': scanEstimate }">
             <span class="target-summary" :title="config.targetUrl"><Globe2 :size="13" /><span>{{ targetHost }}</span></span><span class="config-divider" /><span class="config-meta">抽样 {{ Number(config.maxCandidates).toLocaleString('zh-CN') }}</span><span class="config-meta">TCP {{ stabilityMetricLabel(config.stabilityLatencyMetric) }} ≤ {{ config.maxTcpMs }} ms</span>
-            <div class="budget-settings" aria-label="下载流量预算"><label class="check-field budget-toggle"><input id="setting-downloadBudgetEnabled" v-model="config.downloadBudgetEnabled" type="checkbox" :disabled="locked" aria-label="限制下载流量预算" aria-describedby="budget-help" /><span>限制下载流量</span></label><label v-if="config.downloadBudgetEnabled" class="budget-amount"><input id="setting-downloadBudgetMiB" v-model.number="config.downloadBudgetMiB" type="number" min="1" max="4096" step="10" :disabled="locked" :aria-invalid="fieldInvalid('downloadBudgetMiB')" :aria-describedby="fieldDescription('downloadBudgetMiB', 'budget-help')" aria-label="全局下载数据预算（MiB）" /><span>MiB</span></label><span id="budget-help" class="visually-hidden">所有下载共用预算，不含协议开销；关闭时不限制下载流量。</span></div>
+            <div class="configuration-plan">
+              <template v-if="scanEstimate">
+                <span id="scan-estimate" class="scan-estimate" :title="scanEstimate.detail">
+                  <span>满额参考 {{ scanEstimate.duration }}</span><span aria-hidden="true">·</span><span>下载正文 {{ scanEstimate.download }}</span>
+                </span>
+                <span id="scan-estimate-detail" class="visually-hidden">{{ scanEstimate.detail }}</span>
+                <span id="scan-budget-state" class="visually-hidden">{{ config.downloadBudgetEnabled ? `预算已启用，${config.downloadBudgetMiB} MiB` : '预算未启用' }}</span>
+              </template>
+              <div class="budget-settings" aria-label="下载流量预算">
+                <label class="check-field budget-toggle"><input id="setting-downloadBudgetEnabled" v-model="config.downloadBudgetEnabled" type="checkbox" :disabled="locked" aria-label="限制下载流量预算" aria-describedby="budget-help" /><span>{{ config.downloadBudgetEnabled ? '预算已启用' : '预算未启用' }}</span></label>
+                <label v-if="config.downloadBudgetEnabled" class="budget-amount"><input id="setting-downloadBudgetMiB" v-model.number="config.downloadBudgetMiB" type="number" min="1" max="4096" step="10" :disabled="locked" :aria-invalid="fieldInvalid('downloadBudgetMiB')" :aria-describedby="fieldDescription('downloadBudgetMiB', 'budget-help')" aria-label="全局下载数据预算（MiB）" /><span>MiB</span></label>
+                <span id="budget-help" class="visually-hidden">所有下载共用预算，不含协议开销；关闭时不限制下载流量。</span>
+              </div>
+            </div>
           </div>
         </section>
 
-          <div class="scan-status-slot" :class="{ 'is-error': !!validationIssue || run?.status === 'failed', 'is-warning': dirty && !running && !validationIssue, 'is-active': running }">
-            <div v-if="validationIssue" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span id="config-validation" :title="validation">{{ validation }}</span><button class="text-button" @click="focusSetting(validationIssue.field)">定位问题<ArrowRight :size="12" /></button></div>
+          <div class="scan-status-slot" :class="{ 'is-error': !measurementActive && (!!validationIssue || run?.status === 'failed'), 'is-warning': !measurementActive && dirty && !validationIssue, 'is-active': measurementActive }">
+            <details v-if="run && running" ref="progressPanel" class="scan-progress-disclosure" aria-label="测速进度" tabindex="-1">
+              <summary><LoaderCircle :size="12" class="spinning" /><span>{{ scanPhaseTitle }}</span><span class="muted">{{ elapsed }}</span><span class="downloaded-total">累计下载 {{ scanDownloaded }}</span><span class="scan-progress-label">查看进度<ChevronDown :size="12" /></span></summary>
+              <div class="scan-progress-popover"><ScanProgressPanel :run="run" :elapsed="elapsed" /></div>
+            </details>
+            <div v-else-if="favoriteTesting" class="scan-status-content"><LoaderCircle :size="12" class="spinning" /><span role="status">收藏复测进行中，结束后可开始优选。</span><strong class="downloaded-total">累计下载 {{ favoriteDownloaded }}</strong></div>
+            <div v-else-if="validationIssue" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span id="config-validation" :title="validation">{{ validation }}</span><button class="text-button" @click="focusSetting(validationIssue.field)">定位问题<ArrowRight :size="12" /></button></div>
+            <div v-else-if="starting" class="scan-status-content" role="status"><LoaderCircle :size="12" class="spinning" /><span>正在启动测速…</span></div>
             <div v-else-if="run?.status === 'failed'" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span :title="run.error || run.progress.message">{{ run.error || run.progress.message || '测试未完成，请检查网络和测速地址。' }}</span></div>
-            <details v-else-if="run && (running || starting)" ref="progressPanel" class="scan-progress-disclosure" aria-label="测速进度" tabindex="-1"><summary><LoaderCircle :size="12" class="spinning" /><span>{{ scanPhaseTitle }}</span><span class="muted">{{ elapsed }}</span><span class="scan-progress-label">查看进度<ChevronDown :size="12" /></span></summary><div class="scan-progress-popover"><ScanProgressPanel :run="run" :elapsed="elapsed" /></div></details>
-            <div v-else-if="favoriteTesting" class="scan-status-content" role="status"><LoaderCircle :size="12" class="spinning" /><span>收藏复测进行中，结束后可开始优选。</span></div>
             <div v-else-if="dirty && run" class="scan-status-content" role="status"><Info :size="13" /><span>参数已修改，以下仍为上次测速结果。</span><button class="text-button" :disabled="locked" @click="config = normalizeActiveConfig(JSON.parse(JSON.stringify(run.config)))">沿用上次参数</button></div>
             <span v-else class="scan-idle-note">{{ run ? '本次结果保留测速时的参数与记录' : '选择目标地区后开始测速' }}</span>
           </div>
         </div>
         <div class="results-column">
-          <AllResultsPanel v-if="run" :key="run.id" :run="run" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteTesting || favoritePending || windowClosing" @favorite="openFavorite" @notify="notify" />
+          <AllResultsPanel v-if="run" :key="run.id" :run="run" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteTesting || windowClosing" @favorite="openFavorite" @notify="notify" />
           <section v-else class="initial-empty" aria-labelledby="welcome-title"><Network :size="32" :stroke-width="1.2" /><h1 id="welcome-title">开始一次地区优选</h1><p>选择目标地区并开始测速，完成后在这里查看、筛选和收藏 IP。</p><span class="small muted">TCP 连通性 → 稳定性复测 → 服务验证 → 下载测速</span></section>
         </div>
       </div>
@@ -447,7 +485,7 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
           <div class="settings-grid">
             <label class="field"><span>候选来源</span><SelectControl><select v-model="config.source" id="setting-source" :aria-invalid="fieldInvalid('source')" :aria-describedby="fieldDescription('source')" :disabled="locked"><option value="cloudflare">内置 Cloudflare IPv4 网段</option><option value="custom">自定义 IPv4 / CIDR</option></select></SelectControl></label>
             <label class="field span-two"><span>HTTPS 下载测速地址</span><input v-model.trim="config.targetUrl" id="setting-targetUrl" :aria-invalid="fieldInvalid('targetUrl')" :aria-describedby="fieldDescription('targetUrl', 'target-help')" type="url" :disabled="locked" spellcheck="false" placeholder="https://speed.cloudflare.com/__down?bytes=25000000" /></label>
-            <div v-if="config.source === 'custom'" class="field full-width"><div class="section-line"><label for="custom-ips" class="muted small">IPv4 / CIDR 列表 · 每行一个，支持 # 注释</label><button class="button" :disabled="locked" @click="fileInput?.click()"><ArrowDownToLine :size="12" />载入 TXT 文件</button></div><textarea id="custom-ips" v-model="config.customIps" :aria-invalid="fieldInvalid('customIps')" :aria-describedby="fieldDescription('customIps')" rows="4" :disabled="locked" spellcheck="false" placeholder="104.16.0.0/24&#10;172.64.0.1" /><input ref="fileInput" class="hidden-file" type="file" accept=".txt,.list,text/plain" tabindex="-1" aria-hidden="true" @change="importIps" /></div>
+            <div v-if="config.source === 'custom' || validationIssue?.field === 'customIps'" class="field full-width"><div class="section-line"><label for="custom-ips" class="muted small">IPv4 / CIDR 列表 · 每行一个，支持 # 注释</label><button class="button" :disabled="locked" @click="fileInput?.click()"><ArrowDownToLine :size="12" />载入 TXT 文件</button></div><textarea id="custom-ips" v-model="config.customIps" :aria-invalid="fieldInvalid('customIps')" :aria-describedby="fieldDescription('customIps')" rows="4" :disabled="locked" spellcheck="false" placeholder="104.16.0.0/24&#10;172.64.0.1" /><input ref="fileInput" class="hidden-file" type="file" accept=".txt,.list,text/plain" tabindex="-1" aria-hidden="true" @change="importIps" /></div>
           </div>
 
           <div class="settings-inline-note"><ShieldCheck :size="14" /><span>连接指定 IP，保留域名与 TLS 证书验证。</span></div>
@@ -494,7 +532,11 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         </section>
       </div>
       <div v-if="toast" class="drawer-notice" :class="{ error: toast.error }" role="status"><CircleAlert v-if="toast.error" :size="14" /><Check v-else :size="14" /><span>{{ toast.text }}</span></div>
-      <div class="drawer-footer"><span id="settings-validation" class="drawer-save-status" role="status" :class="{ invalid: validation || configSaveError }"><CircleAlert v-if="validation || configSaveError" :size="13" /><LoaderCircle v-else-if="savingConfig || locked" :size="13" /><Check v-else :size="13" /><span>{{ validation || configSaveError || (savingConfig ? '正在保存设置…' : windowClosing ? '正在关闭窗口…' : locked ? '测试期间参数不可修改' : '有效参数自动保存；无效修改不会覆盖上次有效设置') }}</span></span><button class="button primary" :disabled="finishingSettings || windowClosing || !!validation" @click="finishSettings">{{ finishingSettings ? '保存中…' : '完成' }}<Check :size="14" /></button></div>
+      <div class="drawer-footer">
+        <span id="settings-validation" class="drawer-save-status" role="status" :class="{ invalid: validation || configSaveError }"><CircleAlert v-if="validation || configSaveError" :size="13" /><LoaderCircle v-else-if="savingConfig || locked" :size="13" /><Check v-else :size="13" /><span>{{ validation || configSaveError || (savingConfig ? '正在保存设置…' : windowClosing ? '正在关闭窗口…' : locked ? '测试期间参数不可修改' : '有效参数自动保存；无效修改不会覆盖上次有效设置') }}</span></span>
+        <button v-if="validationIssue" class="text-button drawer-locate" :disabled="locked" @click="focusSetting(validationIssue.field)">定位问题<ArrowRight :size="12" /></button>
+        <button class="button primary" :disabled="finishingSettings || windowClosing || !!validation" @click="finishSettings">{{ finishingSettings ? '保存中…' : '完成' }}<Check :size="14" /></button>
+      </div>
     </dialog>
     <FavoriteSaveDialog v-if="favoriteTarget && run && favoriteResult" :open="true" :library="favorites" :run="run" :result="favoriteResult" :desktop="desktop" @saved="updateFavorites" @change="updateFavorites" @close="closeFavorite" @notify="notify" />
     <div class="feedback-stack">

@@ -165,7 +165,20 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
     saved.config.tcp_latency_screening = false;
     saved.config.stability_first = true;
     if let Some(run) = saved.last_run.as_mut() {
+        let interrupted = run.status == "running";
+        if interrupted {
+            run.status = "cancelled".into();
+            run.progress.stage = "cancelled".into();
+            run.progress.stability_batch = None;
+            run.progress.precision_batch = None;
+            run.progress.message = "上次关闭应用时测试中断，已保留已完成数据".into();
+            run.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        }
         for result in &mut run.results {
+            if interrupted {
+                result.role = Some("candidate".into());
+                result.mark_cancelled(&run.config);
+            }
             // Legacy records lack measurementPassed. Recover only formerly
             // eligible rows or the exact old speed-only filter, with the full
             // verification evidence still present. Hard failures never recover.
@@ -177,23 +190,18 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
                 result.eligible = false;
                 result.role = Some("candidate".into());
             }
-            if let Some(reason) = result.stability_exclusion(&run.config) {
+            if let Some((code, reason)) = result.stability_exclusion_details(&run.config) {
                 result.eligible = false;
                 result.role = Some("candidate".into());
-                if result.exclusion_reason.is_none() || result.has_only_speed_target_exclusion() {
-                    result.exclusion_reason = Some(reason);
+                if !result.is_excluded() || result.has_only_speed_target_exclusion() {
+                    if run.config.stability_first || result.exclusion_code.is_some() {
+                        result.exclude(code, reason);
+                    } else {
+                        // Legacy early rejection could be based on latency or a
+                        // failure-rate threshold rather than the current rule.
+                        result.exclusion_reason = Some(reason);
+                    }
                 }
-            }
-        }
-        if run.status == "running" {
-            run.status = "cancelled".into();
-            run.progress.stage = "cancelled".into();
-            run.progress.stability_batch = None;
-            run.progress.precision_batch = None;
-            run.progress.message = "上次关闭应用时测试中断，已保留已完成数据".into();
-            run.finished_at = Some(chrono::Utc::now().to_rfc3339());
-            for result in &mut run.results {
-                result.role = Some("candidate".into());
             }
         }
     }
@@ -673,6 +681,10 @@ mod tests {
         assert_eq!(job.run.status, "cancelled");
         assert!(job.run.config.regions.iter().any(|region| region == "GB"));
         assert_eq!(loaded.favorites.entries[0].result.tcp_ms, 42.0);
+        assert_eq!(
+            loaded.favorites.entries[0].result.exclusion_code,
+            Some(crate::model::ExclusionCode::Cancelled)
+        );
         assert_eq!(loaded.favorites.entries[0].run_status, "cancelled");
         assert!(loaded.favorites.entries[0].targeted);
         assert_eq!(loaded.favorites.entries[0].note, "keep note");

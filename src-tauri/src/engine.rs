@@ -3,7 +3,8 @@
 //! checks the connected peer. Results describe the current network and target.
 
 use crate::model::{
-    compare_ip_results_with_metric, pop, IpResult, ScanConfig, ScanProgress, StabilityBatch,
+    compare_ip_results_with_metric, parse_custom_candidates, pop, CustomCandidates, ExclusionCode,
+    IpResult, ScanCommandError, ScanConfig, ScanProgress, StabilityBatch,
 };
 use futures_util::{stream, StreamExt};
 use ipnet::Ipv4Net;
@@ -126,11 +127,7 @@ impl State {
 
     fn cancel(mut self, config: &ScanConfig, callback: &UpdateCallback) -> EngineOutcome {
         for item in &mut self.results {
-            if item.exclusion_reason.is_none()
-                && item.download_samples_mbps.len() < config.download_rounds
-            {
-                item.exclusion_reason = Some("测试已停止，验证或下载复测未完成".into());
-            }
+            item.mark_cancelled(config);
         }
         rank_results(&mut self.results, config, false);
         self.progress.stage = "cancelled".into();
@@ -153,14 +150,17 @@ pub async fn run_scan(
     cancellation: CancellationToken,
     callback: UpdateCallback,
 ) -> Result<EngineOutcome, String> {
-    run_prepared_scan(prepare_scan(config)?, cancellation, callback).await
+    let prepared = prepare_scan(config).map_err(ScanCommandError::into_message)?;
+    run_prepared_scan(prepared, cancellation, callback).await
 }
 
 /// Finish all fallible input preparation before replacing a saved scan. This
 /// performs no network measurements and samples random candidates only once.
-pub(crate) fn prepare_scan(config: ScanConfig) -> Result<PreparedScan, String> {
-    config.validate()?;
-    let ips = sample_candidates(&config)?;
+pub(crate) fn prepare_scan(config: ScanConfig) -> Result<PreparedScan, ScanCommandError> {
+    let ips = match config.validate_with_candidates()? {
+        Some(candidates) => sample_custom_candidates(candidates, config.max_candidates)?,
+        None => sample_cloudflare(config.max_candidates)?,
+    };
     Ok(PreparedScan { config, ips })
 }
 
@@ -250,7 +250,7 @@ async fn run_candidates(
     } {
         match outcome {
             Ok(ms) => apply_tcp_measurement(&mut state.results[index], ms, &config),
-            Err(reason) => state.results[index].exclusion_reason = Some(reason),
+            Err(reason) => state.results[index].exclude(ExclusionCode::TcpConnect, reason),
         }
         state.progress.completed += 1;
         state.emit(&callback, false);
@@ -292,17 +292,20 @@ async fn run_candidates(
                     .entry(item.region_code.clone())
                     .or_default() += 1;
                 if item.region_code == "UNKNOWN" {
-                    item.exclusion_reason = Some(format!(
-                        "POP {} 尚无地区映射，保留观测但不推测归属",
-                        item.colo
-                    ));
+                    item.exclude(
+                        ExclusionCode::PopUnknown,
+                        format!("POP {} 尚无地区映射，保留观测但不推测归属", item.colo),
+                    );
                 } else if scope == ScanScope::Regional
                     && !config.regions.contains(&item.region_code)
                 {
-                    item.exclusion_reason = Some("实际响应地区不在本次选择范围".into());
+                    item.exclude(
+                        ExclusionCode::RegionMismatch,
+                        "实际响应地区不在本次选择范围",
+                    );
                 }
             }
-            Err(reason) => item.exclusion_reason = Some(reason),
+            Err(failure) => item.exclude(failure.code, failure.message),
         }
         state.progress.completed += 1;
         state.emit(&callback, false);
@@ -314,11 +317,14 @@ async fn run_candidates(
     let groups = choose_stability_candidates(&state.results, &config, scope);
     let selected: HashSet<usize> = groups.values().flatten().copied().collect();
     for (index, item) in state.results.iter_mut().enumerate() {
-        if item.exclusion_reason.is_none() && !selected.contains(&index) {
-            item.exclusion_reason = Some(format!(
-                "按初筛 TCP 延迟排序，未进入本地区前 {} 名精测候选（未精测）",
-                regional_precision_limit(&config)
-            ));
+        if !item.is_excluded() && !selected.contains(&index) {
+            item.exclude(
+                ExclusionCode::RegionalAdmission,
+                format!(
+                    "按初筛 TCP 延迟排序，未进入本地区前 {} 名精测候选（未精测）",
+                    regional_precision_limit(&config)
+                ),
+            );
         }
     }
     // Finish the whole bounded regional pool before choosing any downloads.
@@ -383,8 +389,8 @@ async fn run_candidates(
         return Ok(state.cancel(&config, &callback));
     }
     for index in &stability_candidates {
-        if let Some(reason) = state.results[*index].stability_exclusion(&config) {
-            state.results[*index].exclusion_reason = Some(reason);
+        if let Some((code, reason)) = state.results[*index].stability_exclusion_details(&config) {
+            state.results[*index].exclude(code, reason);
         }
     }
 
@@ -433,7 +439,7 @@ async fn run_candidates(
         .map(|(region, entries)| {
             let entries = entries
                 .into_iter()
-                .filter(|index| state.results[*index].exclusion_reason.is_none())
+                .filter(|index| !state.results[*index].is_excluded())
                 .collect();
             (region, entries)
         })
@@ -460,17 +466,20 @@ async fn run_candidates(
             state.progress.downloaded_bytes = used;
             return Ok(state.cancel(&config, &callback));
         }
-        if state.results[index].exclusion_reason.is_some() {
+        if state.results[index].is_excluded() {
             state.progress.completed += 1;
             continue;
         }
         let slots_left = schedule[slot..]
             .iter()
-            .filter(|i| state.results[**i].exclusion_reason.is_none())
+            .filter(|i| !state.results[**i].is_excluded())
             .count() as u64;
         let allowance = total_budget.map(|total| download_allowance(total, used, slots_left));
         if allowance.is_some_and(|bytes| bytes < MIN_SAMPLE_BYTES) {
-            state.results[index].exclusion_reason = Some("下载预算不足，未完成必要复测".into());
+            state.results[index].exclude(
+                ExclusionCode::DownloadBudget,
+                "下载预算不足，未完成必要复测",
+            );
             state.progress.completed += 1;
             state.emit(&callback, false);
             continue;
@@ -526,7 +535,7 @@ async fn run_candidates(
                     return Ok(state.cancel(&config, &callback));
                 }
             }
-            Err(reason) => state.results[index].exclusion_reason = Some(reason),
+            Err(failure) => state.results[index].exclude(failure.code, failure.message),
         }
         state.progress.completed += 1;
         state.emit(&callback, false);
@@ -536,10 +545,11 @@ async fn run_candidates(
         return Ok(state.cancel(&config, &callback));
     }
     for item in &mut state.results {
-        if item.exclusion_reason.is_none()
-            && item.download_samples_mbps.len() < config.download_rounds
-        {
-            item.exclusion_reason = Some("未完成必要的下载复测轮次".into());
+        if !item.is_excluded() && item.download_samples_mbps.len() < config.download_rounds {
+            item.exclude(
+                ExclusionCode::DownloadIncomplete,
+                "未完成必要的下载复测轮次",
+            );
         }
     }
     rank_results(&mut state.results, &config, true);
@@ -621,7 +631,7 @@ fn apply_stability_snapshot(
         .map(|batch| format!("第 {} 批 · ", batch.number))
         .unwrap_or_default();
     state.progress.message = if let Some(reason) = &snapshot.early_rejection {
-        state.results[index].exclusion_reason = Some(reason.clone());
+        state.results[index].exclude(ExclusionCode::StabilityEarly, reason.clone());
         format!(
             "{prefix}提前淘汰 {} · 已测 {} / {}：{reason}",
             state.results[index].ip, snapshot.attempted, snapshot.requested
@@ -707,8 +717,10 @@ fn apply_tcp_measurement(result: &mut IpResult, milliseconds: f64, config: &Scan
             result.measurement_passed = false;
             result.eligible = false;
             result.role = Some("candidate".into());
-            result.exclusion_reason =
-                Some(format!("TCP 延迟 {milliseconds} ms，超过上限 {limit} ms"));
+            result.exclude(
+                ExclusionCode::TcpLatency,
+                format!("TCP 延迟 {milliseconds} ms，超过上限 {limit} ms"),
+            );
         }
     }
 }
@@ -717,7 +729,7 @@ fn pop_discovery_candidates(results: &[IpResult], ips: &[Ipv4Addr]) -> Vec<(usiz
     results
         .iter()
         .enumerate()
-        .filter(|(_, result)| result.exclusion_reason.is_none())
+        .filter(|(_, result)| !result.is_excluded())
         .map(|(index, _)| (index, ips[index]))
         .collect()
 }
@@ -757,23 +769,51 @@ fn client_builder_for_ip(
         .user_agent(concat!("IP-Picker/", env!("CARGO_PKG_VERSION"))))
 }
 
-fn validate_response(response: &Response, ip: Ipv4Addr) -> Result<(), String> {
+#[derive(Debug)]
+struct ProbeError {
+    code: ExclusionCode,
+    message: String,
+}
+
+impl ProbeError {
+    fn new(code: ExclusionCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+fn validate_response(response: &Response, ip: Ipv4Addr) -> Result<(), ProbeError> {
     match response.remote_addr() {
         Some(peer) if peer.ip() == IpAddr::V4(ip) => {}
-        Some(peer) => return Err(format!("连接对端发生变化（{peer}），已拒绝使用该测量")),
-        None => return Err("无法确认实际连接的候选 IP".into()),
+        Some(peer) => {
+            return Err(ProbeError::new(
+                ExclusionCode::PopDrift,
+                format!("连接对端发生变化（{peer}），已拒绝使用该测量"),
+            ));
+        }
+        None => {
+            return Err(ProbeError::new(
+                ExclusionCode::PopDrift,
+                "无法确认实际连接的候选 IP",
+            ));
+        }
     }
     let status = response.status();
     if status.is_redirection() {
-        return Err(format!(
-            "HTTP {} 重定向已拒绝，防止测速跳转至其他 IP",
-            status.as_u16()
+        return Err(ProbeError::new(
+            ExclusionCode::HttpsFailure,
+            format!(
+                "HTTP {} 重定向已拒绝，防止测速跳转至其他 IP",
+                status.as_u16()
+            ),
         ));
     }
     if !status.is_success() {
-        return Err(format!(
-            "HTTPS 响应状态不符合预期：HTTP {}",
-            status.as_u16()
+        return Err(ProbeError::new(
+            ExclusionCode::HttpsFailure,
+            format!("HTTPS 响应状态不符合预期：HTTP {}", status.as_u16()),
         ));
     }
     Ok(())
@@ -799,14 +839,14 @@ async fn verify_candidates<F, Fut>(
 ) -> bool
 where
     F: Fn(Ipv4Addr) -> Fut,
-    Fut: std::future::Future<Output = Result<TraceProbe, String>>,
+    Fut: std::future::Future<Output = Result<TraceProbe, ProbeError>>,
 {
     let pending: Vec<_> = candidates
         .iter()
         .copied()
         .filter(|index| {
             let item = &state.results[*index];
-            item.attempts < config.verification_attempts && item.exclusion_reason.is_none()
+            item.attempts < config.verification_attempts && !item.is_excluded()
         })
         .collect();
     state.progress.completed += candidates.len() - pending.len();
@@ -831,15 +871,15 @@ where
                 samples.push(probe.https_ms);
                 observe_colo(item, &probe.colo);
             }
-            Err(reason) => {
-                item.exclusion_reason = Some(format!("HTTPS 复测失败：{reason}"));
+            Err(failure) => {
+                item.exclude(failure.code, format!("HTTPS 复测失败：{}", failure.message));
             }
         }
         item.https_ms = median(samples);
         item.jitter_ms = spread(samples);
         // One failed service check or cross-region POP observation excludes this
         // candidate immediately; other candidates can use its released slot.
-        if item.attempts < config.verification_attempts && item.exclusion_reason.is_none() {
+        if item.attempts < config.verification_attempts && !item.is_excluded() {
             requests.push(verification_request(index, ips[index], &probe));
         } else {
             state.progress.completed += 1;
@@ -856,10 +896,10 @@ async fn verification_request<F, Fut>(
     index: usize,
     ip: Ipv4Addr,
     probe: &F,
-) -> (usize, Result<TraceProbe, String>)
+) -> (usize, Result<TraceProbe, ProbeError>)
 where
     F: Fn(Ipv4Addr) -> Fut,
-    Fut: std::future::Future<Output = Result<TraceProbe, String>>,
+    Fut: std::future::Future<Output = Result<TraceProbe, ProbeError>>,
 {
     (index, probe(ip).await)
 }
@@ -873,7 +913,7 @@ async fn record_download<F, Fut>(
 ) -> bool
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<TraceProbe, String>>,
+    Fut: std::future::Future<Output = Result<TraceProbe, ProbeError>>,
 {
     // The download has finished even if its additional POP check is cancelled.
     item.download_samples_mbps.push(sample.mbps);
@@ -884,7 +924,10 @@ where
     } else {
         // This explicit incomplete reason also gates a saved final-round sample
         // when cancellation happens before the same-host POP check completes.
-        item.exclusion_reason = Some("下载后的 POP 复核未完成".into());
+        item.exclude(
+            ExclusionCode::PopRecheckIncomplete,
+            "下载后的 POP 复核未完成",
+        );
         let check = tokio::select! {
             biased;
             _ = cancellation.cancelled() => { return false; }
@@ -894,11 +937,14 @@ where
         match check {
             Ok(probe) => {
                 item.success_count += 1;
-                item.exclusion_reason = None;
+                item.clear_exclusion();
                 observe_colo(item, &probe.colo);
             }
-            Err(reason) => {
-                item.exclusion_reason = Some(format!("下载后的 POP 复核失败：{reason}"));
+            Err(failure) => {
+                item.exclude(
+                    ExclusionCode::PopRecheckFailure,
+                    format!("下载后的 POP 复核失败：{}", failure.message),
+                );
             }
         }
     }
@@ -910,7 +956,7 @@ async fn trace_probe(
     config: &ScanConfig,
     target: &Url,
     ip: Ipv4Addr,
-) -> Result<TraceProbe, String> {
+) -> Result<TraceProbe, ProbeError> {
     let mut trace_url = target.clone();
     trace_url.set_path("/cdn-cgi/trace");
     trace_url.set_query(None);
@@ -919,7 +965,8 @@ async fn trace_probe(
         target,
         ip,
         Duration::from_millis(config.request_timeout_ms),
-    )?;
+    )
+    .map_err(|message| ProbeError::new(ExclusionCode::HttpsFailure, message))?;
     let started = Instant::now();
     let mut response = client
         .get(trace_url)
@@ -932,27 +979,37 @@ async fn trace_probe(
     let https_ms = started.elapsed().as_secs_f64() * 1000.0;
     validate_response(&response, ip)?;
     if response.content_length().unwrap_or(0) > MAX_TRACE_BYTES as u64 {
-        return Err("trace 响应过大，目标可能不是 Cloudflare trace 端点".into());
+        return Err(ProbeError::new(
+            ExclusionCode::HttpsFailure,
+            "trace 响应过大，目标可能不是 Cloudflare trace 端点",
+        ));
     }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(request_error)? {
         if bytes.len() + chunk.len() > MAX_TRACE_BYTES {
-            return Err("trace 响应超过 16 KiB 限制".into());
+            return Err(ProbeError::new(
+                ExclusionCode::HttpsFailure,
+                "trace 响应超过 16 KiB 限制",
+            ));
         }
         bytes.extend_from_slice(&chunk);
     }
-    let body = std::str::from_utf8(&bytes).map_err(|_| "trace 响应不是有效文本")?;
+    let body = std::str::from_utf8(&bytes)
+        .map_err(|_| ProbeError::new(ExclusionCode::HttpsFailure, "trace 响应不是有效文本"))?;
     let colo = parse_trace(body, target)?;
     Ok(TraceProbe { https_ms, colo })
 }
 
-fn parse_trace(body: &str, target: &Url) -> Result<String, String> {
+fn parse_trace(body: &str, target: &Url) -> Result<String, ProbeError> {
     let mut colo = None;
     let mut host = None;
     for line in body.lines() {
         if let Some(value) = line.strip_prefix("colo=") {
             if colo.is_some() {
-                return Err("trace 含有重复 colo 字段".into());
+                return Err(ProbeError::new(
+                    ExclusionCode::PopUnknown,
+                    "trace 含有重复 colo 字段",
+                ));
             }
             colo = Some(value.trim());
         }
@@ -962,8 +1019,15 @@ fn parse_trace(body: &str, target: &Url) -> Result<String, String> {
     }
     let colo = colo
         .filter(|c| c.len() == 3 && c.bytes().all(|b| b.is_ascii_uppercase()))
-        .ok_or("未获得有效的 Cloudflare POP 标识（colo）")?;
-    let expected = target.host_str().ok_or("测速地址缺少域名")?;
+        .ok_or_else(|| {
+            ProbeError::new(
+                ExclusionCode::PopUnknown,
+                "未获得有效的 Cloudflare POP 标识（colo）",
+            )
+        })?;
+    let expected = target
+        .host_str()
+        .ok_or_else(|| ProbeError::new(ExclusionCode::HttpsFailure, "测速地址缺少域名"))?;
     let expected_port = target.port().map(|p| format!("{expected}:{p}"));
     if !host.is_some_and(|h| {
         h.eq_ignore_ascii_case(expected)
@@ -971,14 +1035,17 @@ fn parse_trace(body: &str, target: &Url) -> Result<String, String> {
                 .as_deref()
                 .is_some_and(|p| h.eq_ignore_ascii_case(p))
     }) {
-        return Err("trace 未确认测速目标域名，响应内容不符合预期".into());
+        return Err(ProbeError::new(
+            ExclusionCode::HttpsFailure,
+            "trace 未确认测速目标域名，响应内容不符合预期",
+        ));
     }
     Ok(colo.to_string())
 }
 
-fn request_error(error: reqwest::Error) -> String {
+fn request_error(error: reqwest::Error) -> ProbeError {
     if error.is_timeout() {
-        return "HTTPS 请求超时".into();
+        return ProbeError::new(ExclusionCode::HttpsTimeout, "HTTPS 请求超时");
     }
     let mut details = error.to_string();
     let mut cause = std::error::Error::source(&error);
@@ -991,11 +1058,12 @@ fn request_error(error: reqwest::Error) -> String {
             break;
         }
     }
-    if details.to_ascii_lowercase().contains("certificate") {
+    let message = if details.to_ascii_lowercase().contains("certificate") {
         format!("TLS 证书验证失败：{details}")
     } else {
         format!("HTTPS 请求失败：{details}")
-    }
+    };
+    ProbeError::new(ExclusionCode::HttpsFailure, message)
 }
 
 struct DownloadProbe {
@@ -1013,10 +1081,11 @@ async fn download_probe(
     ip: Ipv4Addr,
     allowance: Option<u64>,
     counter: Arc<std::sync::atomic::AtomicU64>,
-) -> Result<DownloadProbe, String> {
+) -> Result<DownloadProbe, ProbeError> {
     let request_timeout = Duration::from_millis(config.request_timeout_ms)
         + Duration::from_secs(config.download_seconds);
-    let client = client_for_ip(config, target, ip, request_timeout)?;
+    let client = client_for_ip(config, target, ip, request_timeout)
+        .map_err(|message| ProbeError::new(ExclusionCode::HttpsFailure, message))?;
     let (url, requested_bytes) = match allowance {
         Some(bytes) => {
             let (url, bytes) = bounded_download_url(target, bytes);
@@ -1044,25 +1113,32 @@ async fn measure_download_response(
     requested_bytes: Option<u64>,
     started: Instant,
     counter: Arc<std::sync::atomic::AtomicU64>,
-) -> Result<DownloadProbe, String> {
+) -> Result<DownloadProbe, ProbeError> {
     validate_response(&response, ip)?;
     if response
         .headers()
         .get(header::CONTENT_ENCODING)
         .is_some_and(|h| h != "identity")
     {
-        return Err("下载响应进行了压缩，无法可靠比较原始下载吞吐".into());
+        return Err(ProbeError::new(
+            ExclusionCode::DownloadFailure,
+            "下载响应进行了压缩，无法可靠比较原始下载吞吐",
+        ));
     }
     if requested_bytes
         .is_some_and(|limit| response.content_length().is_none_or(|bytes| bytes > limit))
     {
-        return Err(
-            "下载目标未返回预算内的明确内容长度；请使用支持 Range 的静态文件或默认测速地址".into(),
-        );
+        return Err(ProbeError::new(
+            ExclusionCode::DownloadFailure,
+            "下载目标未返回预算内的明确内容长度；请使用支持 Range 的静态文件或默认测速地址",
+        ));
     }
     let expected_bytes = response.content_length();
     if expected_bytes.is_some_and(|bytes| bytes < MIN_SAMPLE_BYTES) {
-        return Err("下载响应不足 64 KiB，样本过小；请使用较大的测试文件或增加数据预算".into());
+        return Err(ProbeError::new(
+            ExclusionCode::DownloadFailure,
+            "下载响应不足 64 KiB，样本过小；请使用较大的测试文件或增加数据预算",
+        ));
     }
     let colo = ray_colo(response.headers());
     let deadline = tokio::time::Instant::now() + Duration::from_secs(config.download_seconds);
@@ -1087,7 +1163,10 @@ async fn measure_download_response(
         }
     }
     if received < MIN_SAMPLE_BYTES {
-        return Err("下载样本不足 64 KiB，时限内未获得有效测速数据".into());
+        return Err(ProbeError::new(
+            ExclusionCode::DownloadFailure,
+            "下载样本不足 64 KiB，时限内未获得有效测速数据",
+        ));
     }
     // Include connection/TLS/header setup: this is effective single-request
     // throughput, consistently measured across all candidates.
@@ -1142,13 +1221,19 @@ fn observe_colo(item: &mut IpResult, colo: &str) {
     } else if colo != item.colo {
         match pop::location(colo) {
             Some((region, _)) if region != item.region_code => {
-                item.exclusion_reason = Some(format!(
-                    "接入地区发生变化：{} → {colo}，暂不作为固定地区推荐",
-                    item.colo
-                ));
+                item.exclude(
+                    ExclusionCode::PopDrift,
+                    format!(
+                        "接入地区发生变化：{} → {colo}，暂不作为固定地区推荐",
+                        item.colo
+                    ),
+                );
             }
             None => {
-                item.exclusion_reason = Some(format!("POP 变化至未知地区 {colo}，无法确认地区归属"))
+                item.exclude(
+                    ExclusionCode::PopDrift,
+                    format!("POP 变化至未知地区 {colo}，无法确认地区归属"),
+                );
             }
             _ => {}
         }
@@ -1179,7 +1264,7 @@ fn choose_stability_candidates(
     }
     let mut groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, result) in results.iter().enumerate() {
-        if result.exclusion_reason.is_none() && result.region_code != "UNKNOWN" {
+        if !result.is_excluded() && result.region_code != "UNKNOWN" {
             groups
                 .entry(result.region_code.clone())
                 .or_default()
@@ -1197,7 +1282,7 @@ fn choose_per_region(results: &[IpResult], config: &ScanConfig) -> BTreeMap<Stri
             let mut entries: Vec<_> = results
                 .iter()
                 .enumerate()
-                .filter(|(_, r)| r.region_code == *region && r.exclusion_reason.is_none())
+                .filter(|(_, r)| r.region_code == *region && !r.is_excluded())
                 .map(|(i, _)| i)
                 .collect();
             entries.sort_by(|a, b| {
@@ -1265,7 +1350,7 @@ fn choose_download_groups(
                 .iter()
                 .copied()
                 .filter(|index| {
-                    results[*index].exclusion_reason.is_none()
+                    !results[*index].is_excluded()
                         && results[*index].stability_exclusion(config).is_none()
                 })
                 .collect();
@@ -1279,9 +1364,10 @@ fn choose_download_groups(
             });
             if let Some(limit) = limit {
                 for index in entries.iter().skip(limit) {
-                    results[*index].exclusion_reason = Some(format!(
-                        "TCP 稳定性已完成，未进入本地区前 {limit} 名下载候选（未测速）"
-                    ));
+                    results[*index].exclude(
+                        ExclusionCode::DownloadShortlist,
+                        format!("TCP 稳定性已完成，未进入本地区前 {limit} 名下载候选（未测速）"),
+                    );
                 }
                 entries.truncate(limit);
             }
@@ -1327,14 +1413,17 @@ fn rank_results(results: &mut [IpResult], config: &ScanConfig, completed: bool) 
             && result.download_mbps < config.min_download_mbps
         {
             result.eligible = false;
-            result.exclusion_reason = Some(format!(
-                "下载 {:.2} Mbps，低于日常优选目标 {:.2} Mbps",
-                result.download_mbps, config.min_download_mbps
-            ));
+            result.exclude(
+                ExclusionCode::SpeedTarget,
+                format!(
+                    "下载 {:.2} Mbps，低于日常优选目标 {:.2} Mbps",
+                    result.download_mbps, config.min_download_mbps
+                ),
+            );
         } else if result.eligible && result.has_only_speed_target_exclusion() {
             // Reclassification may change the preference or target. This is
             // the only exclusion a passed measurement is allowed to clear.
-            result.exclusion_reason = None;
+            result.clear_exclusion();
         }
     }
     for region in &config.regions {
@@ -1388,52 +1477,26 @@ pub fn sample_candidates(config: &ScanConfig) -> Result<Vec<Ipv4Addr>, String> {
     if config.source == "cloudflare" {
         return sample_cloudflare(config.max_candidates);
     }
-    let mut explicit = Vec::new();
-    let mut networks = Vec::new();
-    let mut seen_networks = HashSet::new();
-    {
-        let mut count = 0;
-        for (line_number, line) in config.custom_ips.lines().enumerate() {
-            let line = line.split('#').next().unwrap_or("");
-            for token in line
-                .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
-                .filter(|s| !s.is_empty())
-            {
-                count += 1;
-                if count > 20000 {
-                    return Err("自定义列表最多接受 20000 个 IP / 网段条目".into());
-                }
-                if token.contains('/') {
-                    let net = token.parse::<Ipv4Net>().map_err(|_| {
-                        format!("第 {} 行不是有效 IPv4 CIDR：{token}", line_number + 1)
-                    })?;
-                    if seen_networks.insert(net.trunc()) {
-                        networks.push(net.trunc());
-                    }
-                } else {
-                    let ip = token.parse::<Ipv4Addr>().map_err(|_| {
-                        format!(
-                            "第 {} 行不是有效 IPv4：{token}（第一版暂不支持 IPv6）",
-                            line_number + 1
-                        )
-                    })?;
-                    explicit.push(ip);
-                }
-            }
-        }
-    }
+    let candidates = parse_custom_candidates(&config.custom_ips).map_err(|issue| issue.message)?;
+    sample_custom_candidates(candidates, config.max_candidates)
+}
+
+fn sample_custom_candidates(
+    CustomCandidates { explicit, networks }: CustomCandidates,
+    limit: usize,
+) -> Result<Vec<Ipv4Addr>, String> {
     let mut seen = HashSet::new();
     let mut output = Vec::new();
     for ip in explicit {
         if seen.insert(ip) {
             output.push(ip);
         }
-        if output.len() >= config.max_candidates {
+        if output.len() >= limit {
             return Ok(output);
         }
     }
-    if !networks.is_empty() && output.len() < config.max_candidates {
-        let remaining = config.max_candidates - output.len();
+    if !networks.is_empty() && output.len() < limit {
+        let remaining = limit - output.len();
         let quota = remaining.div_ceil(networks.len());
         let mut rng = rand::thread_rng();
         for round in 0..quota {
@@ -1450,7 +1513,7 @@ pub fn sample_candidates(config: &ScanConfig) -> Result<Vec<Ipv4Addr>, String> {
                 if seen.insert(ip) {
                     output.push(ip);
                 }
-                if output.len() >= config.max_candidates {
+                if output.len() >= limit {
                     return Ok(output);
                 }
             }
@@ -1465,7 +1528,7 @@ pub fn sample_candidates(config: &ScanConfig) -> Result<Vec<Ipv4Addr>, String> {
             if seen.insert(ip) {
                 output.push(ip);
             }
-            if output.len() >= config.max_candidates {
+            if output.len() >= limit {
                 break;
             }
         }
@@ -1611,7 +1674,7 @@ mod tests {
     ) -> IpResult
     where
         F: Fn(Ipv4Addr) -> Fut,
-        Fut: std::future::Future<Output = Result<TraceProbe, String>>,
+        Fut: std::future::Future<Output = Result<TraceProbe, ProbeError>>,
     {
         let ips = vec![row.ip.parse().unwrap()];
         let mut state = verification_state(vec![row]);
@@ -1652,6 +1715,7 @@ mod tests {
         let too_many_entries = "192.0.2.1\n".repeat(20001);
         assert!(prepare_scan(custom(&too_many_entries, 1))
             .unwrap_err()
+            .into_message()
             .contains("20000"));
     }
 
@@ -1886,13 +1950,17 @@ mod tests {
         let calls = std::cell::Cell::new(0);
         let verified = verify_row(row, vec![70.0], 5, |_| {
             calls.set(calls.get() + 1);
-            std::future::ready(Err("连接失败".into()))
+            std::future::ready(Err(ProbeError::new(
+                ExclusionCode::HttpsFailure,
+                "连接失败",
+            )))
         })
         .await;
         assert_eq!(calls.get(), 1, "excluded IP continued service verification");
         assert_eq!(verified.attempts, 2);
         assert_eq!(verified.success_count, 1);
         assert_eq!(verified.https_ms, 70.0);
+        assert_eq!(verified.exclusion_code, Some(ExclusionCode::HttpsFailure));
         assert!(verified.exclusion_reason.unwrap().contains("复测失败"));
     }
 
@@ -1974,6 +2042,7 @@ mod tests {
         assert_eq!(saved.success_count, 3, "completed successes were discarded");
         assert_eq!(saved.https_ms, 30.0);
         assert_eq!(saved.jitter_ms, 50.0);
+        assert_eq!(saved.exclusion_code, Some(ExclusionCode::Cancelled));
         assert_eq!(saved.observed_colos, vec!["SJC", "LAX"]);
         assert!(!saved.measurement_passed);
         assert!(!saved.eligible);
@@ -2081,6 +2150,10 @@ mod tests {
                 saved.exclusion_reason.as_deref(),
                 Some("下载后的 POP 复核未完成")
             );
+            assert_eq!(
+                saved.exclusion_code,
+                Some(ExclusionCode::PopRecheckIncomplete)
+            );
             assert!(!saved.has_complete_measurement(&config));
             assert!(
                 !saved.measurement_passed,
@@ -2111,7 +2184,10 @@ mod tests {
                                 https_ms: 60.0,
                                 colo: colo.into()
                             })
-                            .map_err(str::to_string)
+                            .map_err(|message| ProbeError::new(
+                                ExclusionCode::HttpsFailure,
+                                message
+                            ))
                     ),
                 )
                 .await
@@ -2125,6 +2201,12 @@ mod tests {
             assert_eq!(row.measurement_passed, passed);
             assert_eq!(row.eligible, passed);
             assert_eq!(row.exclusion_reason.is_none(), passed);
+            let code = match response {
+                Ok("HKG") => None,
+                Ok(_) => Some(ExclusionCode::PopDrift),
+                Err(_) => Some(ExclusionCode::PopRecheckFailure),
+            };
+            assert_eq!(row.exclusion_code, code);
         }
     }
 
@@ -2145,7 +2227,10 @@ mod tests {
                 &CancellationToken::new(),
                 || {
                     calls.set(calls.get() + 1);
-                    std::future::ready(Err("unnecessary trace request".into()))
+                    std::future::ready(Err(ProbeError::new(
+                        ExclusionCode::HttpsFailure,
+                        "unnecessary trace request",
+                    )))
                 },
             )
             .await
@@ -2533,7 +2618,8 @@ mod tests {
         .err()
         .unwrap();
         server.abort();
-        assert!(error.contains("预算内的明确内容长度"));
+        assert_eq!(error.code, ExclusionCode::DownloadFailure);
+        assert!(error.message.contains("预算内的明确内容长度"));
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
@@ -2862,7 +2948,18 @@ mod tests {
         assert!(results[0].measurement_passed);
         assert!(!results[0].eligible);
         assert!(results[0].has_only_speed_target_exclusion());
+        assert_eq!(results[0].exclusion_code, Some(ExclusionCode::SpeedTarget));
         assert_eq!(results[0].role.as_deref(), Some("candidate"));
+        rank_results(
+            &mut results,
+            &ScanConfig {
+                min_download_mbps: 0.0,
+                ..config
+            },
+            true,
+        );
+        assert!(results[0].eligible);
+        assert!(!results[0].is_excluded());
     }
 
     #[test]
@@ -3554,9 +3651,9 @@ mod tls_tests {
             .unwrap();
         assert_eq!(response.remote_addr(), Some(fixture.address));
         validate_response(&response, Ipv4Addr::LOCALHOST).unwrap();
-        assert!(validate_response(&response, Ipv4Addr::new(192, 0, 2, 1))
-            .unwrap_err()
-            .contains("连接对端发生变化"));
+        let wrong_peer = validate_response(&response, Ipv4Addr::new(192, 0, 2, 1)).unwrap_err();
+        assert_eq!(wrong_peer.code, ExclusionCode::PopDrift);
+        assert!(wrong_peer.message.contains("连接对端发生变化"));
         let body = response.text().await.unwrap();
         assert_eq!(parse_trace(&body, &target).unwrap(), "NRT");
         let observed = fixture.finish().await.unwrap();
@@ -3590,7 +3687,7 @@ mod tls_tests {
             .send()
             .await
             .expect_err("accepted self-signed certificate");
-        assert!(request_error(error).contains("TLS 证书验证失败"));
+        assert!(request_error(error).message.contains("TLS 证书验证失败"));
         assert!(fixture.finish().await.is_err());
     }
 
@@ -3603,7 +3700,7 @@ mod tls_tests {
             .send()
             .await
             .expect_err("accepted a certificate for a different hostname");
-        assert!(request_error(error).contains("TLS 证书验证失败"));
+        assert!(request_error(error).message.contains("TLS 证书验证失败"));
         assert!(fixture.finish().await.is_err());
     }
 
@@ -3620,7 +3717,7 @@ mod tls_tests {
         assert_eq!(response.url(), &target);
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
         let reason = validate_response(&response, Ipv4Addr::LOCALHOST).unwrap_err();
-        assert!(reason.contains("重定向已拒绝"));
+        assert!(reason.message.contains("重定向已拒绝"));
         // If redirects were enabled .send() would have tried the unresolvable
         // redirect target and failed instead of returning this original 302.
         assert_eq!(

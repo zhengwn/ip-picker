@@ -50,16 +50,10 @@ export interface FavoriteTestStart {
   job: FavoriteTestJob
 }
 
-/** Match the native IPv4 parser: one dotted-decimal address without leading zeroes. */
-export function validManualIpv4(value: string): boolean {
-  const parts = value.trim().split('.')
-  return parts.length === 4 && parts.every(part => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255)
-}
-
 export function favoriteHasTestData(entry: FavoriteEntry): boolean {
   const result = entry.result
   return !!(result.tcpMs || result.colo || result.attempts || result.tcpStability?.probesMs.length || result.downloadSamplesMbps.length
-    || result.exclusionReason && result.exclusionReason !== '测试已停止，验证或下载复测未完成')
+    || (result.exclusionCode ? result.exclusionCode !== 'cancelled' : result.exclusionReason && result.exclusionReason !== '测试已停止，验证或下载复测未完成'))
 }
 
 export function favoriteTestPhase(job: FavoriteTestJob): string {

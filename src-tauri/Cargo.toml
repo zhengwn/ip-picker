@@ -11,6 +11,13 @@ default-run = "ip-picker"
 name = "ip_picker_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+desktop-smoke = ["tauri/custom-protocol"]
+
+[[example]]
+name = "desktop_smoke"
+required-features = ["desktop-smoke"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

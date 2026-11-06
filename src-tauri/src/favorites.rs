@@ -1,5 +1,5 @@
 use crate::{
-    model::{IpResult, ScanConfig, ScanRun},
+    model::{ExclusionCode, IpResult, ScanConfig, ScanRun},
     network::NetworkPath,
 };
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,7 @@ impl FavoriteTestJob {
         self.run.progress.message = message.into();
         for result in &mut self.run.results {
             result.role = Some("candidate".into());
+            result.mark_cancelled(&self.run.config);
         }
         self.record_observed_regions();
     }
@@ -238,16 +239,6 @@ impl FavoriteLibrary {
         Ok(())
     }
 
-    /// A result-row star represents this IP across the entire library.
-    pub fn delete_ip(&mut self, ip: &str) -> Result<(), String> {
-        let ip = ip
-            .parse::<Ipv4Addr>()
-            .map_err(|_| "请输入有效的 IPv4 地址".to_string())?
-            .to_string();
-        self.entries.retain(|entry| entry.result.ip != ip);
-        Ok(())
-    }
-
     /// Resolve exact favorite IDs before launching. No discovery sampling or
     /// per-country shortlist is involved in a favorites test.
     pub fn prepare_test(
@@ -392,10 +383,15 @@ fn was_attempted(result: &IpResult) -> bool {
             .tcp_stability
             .as_ref()
             .is_some_and(|stats| !stats.probes_ms.is_empty())
-        || result
-            .exclusion_reason
-            .as_ref()
-            .is_some_and(|reason| reason != "测试已停止，验证或下载复测未完成")
+        || result.exclusion_code.map_or_else(
+            || {
+                result
+                    .exclusion_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason != "测试已停止，验证或下载复测未完成")
+            },
+            |code| code != ExclusionCode::Cancelled,
+        )
 }
 
 fn checked_note(note: &str) -> Result<String, String> {
@@ -513,30 +509,24 @@ mod tests {
     }
 
     #[test]
-    fn unstar_removes_the_ip_from_every_folder_and_preserves_other_entries() {
+    fn deleting_one_entry_preserves_the_same_ip_in_another_folder() {
         let mut favorites = FavoriteLibrary::default();
         let first = favorites.folders[0].id.clone();
         let second = favorites.folders[1].id.clone();
-        let mut run = sample_run();
+        let run = sample_run();
         let ip = run.results[0].ip.clone();
         favorites.save_snapshot(&first, &run, &ip, "流量").unwrap();
         favorites.save_snapshot(&second, &run, &ip, "宽带").unwrap();
-        run.results[0].ip = "192.0.2.42".into();
-        favorites
-            .save_snapshot(&first, &run, "192.0.2.42", "保留")
-            .unwrap();
-        let remaining = serde_json::to_value(&favorites.entries[2]).unwrap();
-        assert!(favorites.delete_ip("invalid").is_err());
-        assert_eq!(favorites.entries.len(), 3);
-        favorites.delete_ip(&ip).unwrap();
+        let removed_id = favorites.entries[0].id.clone();
+        let remaining = serde_json::to_value(&favorites.entries[1]).unwrap();
+        favorites.delete_entry(&removed_id).unwrap();
         assert_eq!(favorites.entries.len(), 1);
         assert_eq!(
             serde_json::to_value(&favorites.entries[0]).unwrap(),
             remaining
         );
         assert_eq!(favorites.folders.len(), 3);
-        // Repeated clicks or a delayed snapshot may already have removed it.
-        favorites.delete_ip(&ip).unwrap();
+        assert!(favorites.delete_entry(&removed_id).is_err());
         assert_eq!(favorites.entries.len(), 1);
     }
 
@@ -937,7 +927,7 @@ mod tests {
             .prepare_test(pending_run(), Some(&folder), None, None, None)
             .unwrap();
         job.run.results[0].exclusion_reason = Some("测试已停止，验证或下载复测未完成".into());
-        job.run.results[1].exclusion_reason = Some("TCP 连接超时".into());
+        job.run.results[1].exclude(ExclusionCode::TcpConnect, "TCP 连接超时");
         job.interrupt("cancelled");
         favorites.apply_test_results(&job);
         assert_eq!(
@@ -948,6 +938,10 @@ mod tests {
         assert_eq!(
             favorites.entries[1].result.exclusion_reason.as_deref(),
             Some("TCP 连接超时")
+        );
+        assert_eq!(
+            favorites.entries[1].result.exclusion_code,
+            Some(ExclusionCode::TcpConnect)
         );
         let (mut manual, _) = favorites
             .prepare_test(pending_run(), Some(&folder), None, Some("104.16.1.3"), None)

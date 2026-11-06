@@ -53,6 +53,13 @@ export interface ScanProgress {
   precisionBatch?: { number: number; candidateIps: string[] }
 }
 
+export type ExclusionCode =
+  | 'tcpConnect' | 'tcpLatency' | 'httpsTimeout' | 'httpsFailure'
+  | 'popUnknown' | 'regionMismatch' | 'regionalAdmission' | 'popDrift'
+  | 'stabilityEarly' | 'stabilityIncomplete' | 'stabilityAllFailed' | 'stabilityFailureRate' | 'stabilityLatency'
+  | 'downloadShortlist' | 'downloadBudget' | 'downloadFailure' | 'downloadIncomplete'
+  | 'popRecheckIncomplete' | 'popRecheckFailure' | 'cancelled' | 'speedTarget' | 'unknown'
+
 export interface IpResult {
   ip: string
   regionCode: string
@@ -69,6 +76,7 @@ export interface IpResult {
   measurementPassed: boolean
   tcpStability?: TcpStability
   eligible: boolean
+  exclusionCode?: ExclusionCode
   exclusionReason?: string
   role?: 'primary' | 'backup' | 'candidate'
 }

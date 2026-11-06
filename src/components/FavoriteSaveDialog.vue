@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Check, CircleAlert, LoaderCircle, Plus, Star, X } from '@lucide/vue'
+import { Check, CircleAlert, LoaderCircle, Plus, Star, Trash2, X } from '@lucide/vue'
 import { regionName, type IpResult, type ScanRun } from '../types'
 import { candidateMeasurementStatus, targetHost } from '../ui-state'
 import { favoriteDate, favoriteError, favoriteNumber, favoriteTcpSummary, type FavoriteLibrary } from '../favorites'
@@ -18,25 +18,39 @@ const emit = defineEmits<{
 const dialog = ref<HTMLDialogElement | null>(null)
 const folderSelect = ref<HTMLSelectElement | null>(null)
 const folderNameInput = ref<HTMLInputElement | null>(null)
-const folderId = ref(props.library.folders[0]?.id ?? '')
+const removeButton = ref<HTMLButtonElement | null>(null)
+const cancelRemovalButton = ref<HTMLButtonElement | null>(null)
+const entriesByFolder = computed(() => new Map(props.library.entries
+  .filter(entry => entry.result.ip === props.result.ip)
+  .map(entry => [entry.folderId, entry])))
+const defaultFolderId = computed(() => props.library.folders.find(folder => entriesByFolder.value.has(folder.id))?.id
+  ?? props.library.folders[0]?.id ?? '')
+const folderId = ref(defaultFolderId.value)
 const note = ref('')
 const newFolderOpen = ref(!props.library.folders.length)
 const newFolderName = ref('')
-const pending = ref<'save' | 'folder' | null>(null)
+const pending = ref<'save' | 'folder' | 'remove' | null>(null)
+const removeTargetId = ref<string | null>(null)
 const error = ref('')
 const folderStatus = ref('')
 let returnFocus: HTMLElement | null = null
 
 const location = computed(() => /^[A-Z]{2}$/.test(props.result.regionCode) ? regionName(props.result.regionCode) : '未知地区')
 const tcpSummary = computed(() => favoriteTcpSummary(props.result, props.run.config))
-const existing = computed(() => props.library.entries.find(entry => entry.folderId === folderId.value && entry.result.ip === props.result.ip))
-const validFolder = computed(() => props.library.folders.some(folder => folder.id === folderId.value))
+const existing = computed(() => entriesByFolder.value.get(folderId.value))
+const selectedFolder = computed(() => props.library.folders.find(folder => folder.id === folderId.value))
+const confirmingRemoval = computed(() => removeTargetId.value !== null && existing.value?.id === removeTargetId.value)
 const invalidFolderName = computed(() => !newFolderName.value.trim() || newFolderName.value.trim().length > 40 || props.library.folders.some(folder => folder.name === newFolderName.value.trim()))
-const saveDisabled = computed(() => !props.desktop || !!pending.value || !validFolder.value || note.value.length > 500)
+const saveDisabled = computed(() => !props.desktop || !!pending.value || confirmingRemoval.value || !selectedFolder.value || note.value.length > 500)
 
-watch(folderId, () => { note.value = existing.value?.note ?? ''; folderStatus.value = '' }, { immediate: true, flush: 'sync' })
+watch(folderId, () => {
+  note.value = existing.value?.note ?? ''
+  folderStatus.value = ''
+  error.value = ''
+  removeTargetId.value = null
+}, { immediate: true, flush: 'sync' })
 watch(() => props.library.folders, folders => {
-  if (!folders.some(folder => folder.id === folderId.value)) folderId.value = folders[0]?.id ?? ''
+  if (!folders.some(folder => folder.id === folderId.value)) folderId.value = defaultFolderId.value
   if (!folders.length) newFolderOpen.value = true
 })
 watch(() => props.open, async open => {
@@ -73,6 +87,11 @@ function restoreFocus() {
 
 function onBackdropClick(event: MouseEvent) {
   if (event.target === dialog.value) close()
+}
+
+function onCancel() {
+  if (confirmingRemoval.value) void cancelRemoval()
+  else close()
 }
 
 async function toggleNewFolder() {
@@ -121,15 +140,47 @@ async function save() {
   finally { pending.value = null }
 }
 
+async function requestRemoval() {
+  if (!props.desktop || pending.value || !existing.value) return
+  removeTargetId.value = existing.value.id
+  error.value = ''
+  await nextTick()
+  cancelRemovalButton.value?.focus()
+}
+
+async function cancelRemoval() {
+  if (pending.value) return
+  removeTargetId.value = null
+  error.value = ''
+  await nextTick()
+  removeButton.value?.focus()
+}
+
+async function remove() {
+  const favoriteId = removeTargetId.value
+  const folder = selectedFolder.value
+  if (!props.desktop || pending.value || !confirmingRemoval.value || !favoriteId || !folder) return
+  pending.value = 'remove'
+  error.value = ''
+  try {
+    const library = await invoke<FavoriteLibrary>('delete_favorite', { favoriteId })
+    emit('change', library)
+    emit('notify', `已从「${folder.name}」移除 ${props.result.ip} 的收藏`)
+    pending.value = null
+    close()
+  } catch (cause) { error.value = favoriteError(cause) }
+  finally { pending.value = null }
+}
+
 onMounted(show)
 onBeforeUnmount(() => { dialog.value?.close(); restoreFocus() })
 </script>
 
 <template>
   <Teleport to="body">
-    <dialog ref="dialog" class="favorite-save-dialog" aria-labelledby="favorite-save-title" aria-describedby="favorite-snapshot-explanation" @cancel.prevent="close" @click="onBackdropClick">
+    <dialog ref="dialog" class="favorite-save-dialog" aria-labelledby="favorite-save-title" aria-describedby="favorite-snapshot-explanation" @cancel.prevent="onCancel" @click="onBackdropClick">
       <form @submit.prevent="save">
-        <div class="favorite-save-heading"><div class="favorite-heading-title"><span class="favorite-heading-icon"><Star :size="16" aria-hidden="true" /></span><h2 id="favorite-save-title">收藏测试结果</h2></div><button type="button" class="icon-button" :disabled="!!pending" aria-label="关闭收藏窗口" @click="close"><X :size="17" aria-hidden="true" /></button></div>
+        <div class="favorite-save-heading"><div class="favorite-heading-title"><span class="favorite-heading-icon"><Star :size="16" aria-hidden="true" /></span><h2 id="favorite-save-title">{{ entriesByFolder.size ? '管理收藏' : '收藏测试结果' }}</h2></div><button type="button" class="icon-button" :disabled="!!pending" aria-label="关闭收藏窗口" @click="close"><X :size="17" aria-hidden="true" /></button></div>
         <div class="favorite-save-body">
           <div class="favorite-save-preview">
             <div class="favorite-preview-identity"><strong class="mono">{{ result.ip }}</strong><span class="favorite-preview-location" :title="result.city || undefined">{{ location }}<span v-if="result.colo" class="favorite-preview-pop">{{ result.colo }}</span></span></div>
@@ -139,15 +190,30 @@ onBeforeUnmount(() => { dialog.value?.close(); restoreFocus() })
           </div>
           <p id="favorite-snapshot-explanation" class="favorite-save-explanation">{{ run.status === 'running' ? '测试进行中，保存此刻已取得的数据、时间、目标与参数。' : '保存此 IP 的测试数据、时间、目标与本次参数。' }}后续测试不会自动覆盖此快照。</p>
           <p v-if="!desktop" class="favorite-save-error" role="status">浏览器预览不保存收藏，请在桌面应用中使用。</p>
-          <div class="favorite-save-folder-label"><label for="favorite-save-folder">收藏到</label><button v-if="library.folders.length" class="text-button" type="button" :disabled="!!pending || !desktop" :aria-expanded="newFolderOpen" aria-controls="favorite-new-folder" @click="toggleNewFolder"><Plus :size="12" aria-hidden="true" />新建收藏夹</button></div>
-          <SelectControl v-if="library.folders.length"><select id="favorite-save-folder" ref="folderSelect" v-model="folderId" :disabled="!!pending || !desktop" required><option v-for="folder in library.folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select></SelectControl>
-          <div v-if="newFolderOpen" id="favorite-new-folder" class="favorite-new-folder"><label class="field"><span>新收藏夹名称</span><input ref="folderNameInput" v-model="newFolderName" :disabled="!!pending || !desktop" maxlength="40" placeholder="例如：联通流量" @keydown.enter.prevent="createFolder" /></label><button class="button" type="button" :disabled="!!pending || !desktop || invalidFolderName" @click="createFolder"><LoaderCircle v-if="pending === 'folder'" :size="13" class="spinning" aria-hidden="true" />{{ pending === 'folder' ? '新建中…' : '新建' }}</button><p v-if="newFolderName.trim() && invalidFolderName" class="favorite-save-error">名称已存在，或超过 40 个字。</p></div>
+          <div class="favorite-save-folder-label"><label for="favorite-save-folder">{{ entriesByFolder.size ? '收藏分类' : '收藏到' }}</label><button v-if="library.folders.length && !confirmingRemoval" class="text-button" type="button" :disabled="!!pending || !desktop" :aria-expanded="newFolderOpen" aria-controls="favorite-new-folder" @click="toggleNewFolder"><Plus :size="12" aria-hidden="true" />新建收藏夹</button></div>
+          <SelectControl v-if="library.folders.length">
+            <select id="favorite-save-folder" ref="folderSelect" v-model="folderId" :disabled="!!pending || !desktop || confirmingRemoval" required>
+              <option v-for="folder in library.folders" :key="folder.id" :value="folder.id">{{ folder.name }}{{ entriesByFolder.has(folder.id) ? '（已收藏）' : '' }}</option>
+            </select>
+          </SelectControl>
+          <div v-if="newFolderOpen && !confirmingRemoval" id="favorite-new-folder" class="favorite-new-folder"><label class="field"><span>新收藏夹名称</span><input ref="folderNameInput" v-model="newFolderName" :disabled="!!pending || !desktop" maxlength="40" placeholder="例如：联通流量" @keydown.enter.prevent="createFolder" /></label><button class="button" type="button" :disabled="!!pending || !desktop || invalidFolderName" @click="createFolder"><LoaderCircle v-if="pending === 'folder'" :size="13" class="spinning" aria-hidden="true" />{{ pending === 'folder' ? '新建中…' : '新建' }}</button><p v-if="newFolderName.trim() && invalidFolderName" class="favorite-save-error">名称已存在，或超过 40 个字。</p></div>
           <p v-if="folderStatus" class="favorite-save-status" role="status"><Check :size="13" aria-hidden="true" /><span>{{ folderStatus }}</span></p>
-          <p v-if="existing" class="favorite-existing-note"><CircleAlert :size="14" aria-hidden="true" /><span>已收藏此 IP。「更新本次测试」将替换原有测试快照和备注。</span></p>
-          <label class="field favorite-save-note"><span class="favorite-note-label"><span>备注 <small>可选</small></span><span class="favorite-note-count">{{ note.length }} / 500</span></span><textarea v-model="note" :disabled="!!pending || !desktop" maxlength="500" placeholder="记录适用网络或使用体验" /></label>
+          <p v-if="confirmingRemoval" id="favorite-remove-description" class="favorite-existing-note"><CircleAlert :size="14" aria-hidden="true" /><span>将从「{{ selectedFolder?.name }}」移除此 IP 的收藏、备注和测试快照。</span></p>
+          <p v-else-if="existing" class="favorite-existing-note"><CircleAlert :size="14" aria-hidden="true" /><span>「更新本次测试」只更新所选分类的测试快照和备注。</span></p>
+          <label v-if="!confirmingRemoval" class="field favorite-save-note"><span class="favorite-note-label"><span>备注 <small>可选</small></span><span class="favorite-note-count">{{ note.length }} / 500</span></span><textarea v-model="note" :disabled="!!pending || !desktop" maxlength="500" placeholder="记录适用网络或使用体验" /></label>
         </div>
         <p v-if="error" class="favorite-save-error favorite-save-command-error" role="alert" tabindex="0" aria-label="提交错误，可滚动查看完整内容"><CircleAlert :size="14" aria-hidden="true" /><span>{{ error }}</span></p>
-        <div class="favorite-save-actions"><span class="favorite-save-local">仅保存在本机</span><div><button class="button" type="button" :disabled="!!pending" @click="close">取消</button><button class="button primary" type="submit" :disabled="saveDisabled"><LoaderCircle v-if="pending === 'save'" :size="14" class="spinning" aria-hidden="true" /><Star v-else :size="14" aria-hidden="true" />{{ pending === 'save' ? '保存中…' : existing ? '更新本次测试' : '收藏本次测试' }}</button></div></div>
+        <div v-if="confirmingRemoval" class="favorite-save-actions is-confirming">
+          <div>
+            <button ref="cancelRemovalButton" class="button" type="button" :disabled="!!pending" aria-describedby="favorite-remove-description" @click="cancelRemoval">返回</button>
+            <button class="button favorite-remove-button" type="button" :disabled="!!pending" aria-describedby="favorite-remove-description" @click="remove"><LoaderCircle v-if="pending === 'remove'" :size="14" class="spinning" aria-hidden="true" /><Trash2 v-else :size="14" aria-hidden="true" />{{ pending === 'remove' ? '移除中…' : '确认移除' }}</button>
+          </div>
+        </div>
+        <div v-else class="favorite-save-actions">
+          <button v-if="existing" ref="removeButton" class="button favorite-remove-button" type="button" :disabled="!!pending || !desktop" @click="requestRemoval"><Trash2 :size="14" aria-hidden="true" />移除本分类</button>
+          <span v-else class="favorite-save-local">仅保存在本机</span>
+          <div><button class="button" type="button" :disabled="!!pending" @click="close">取消</button><button class="button primary" type="submit" :disabled="saveDisabled"><LoaderCircle v-if="pending === 'save'" :size="14" class="spinning" aria-hidden="true" /><Star v-else :size="14" aria-hidden="true" />{{ pending === 'save' ? '保存中…' : existing ? '更新本次测试' : '收藏本次测试' }}</button></div>
+        </div>
       </form>
     </dialog>
   </Teleport>
@@ -210,6 +276,9 @@ onBeforeUnmount(() => { dialog.value?.close(); restoreFocus() })
 .favorite-save-local { color: var(--muted); font-size: 10px; white-space: nowrap; }
 .favorite-save-actions>div { display: flex; align-items: center; gap: 8px; }
 .favorite-save-dialog .button { min-height: var(--dialog-control-height,32px); font-size: 12px; border-radius: 6px; }
+.favorite-save-actions.is-confirming { justify-content: flex-end; }
+.favorite-remove-button { color: var(--error); }
+.favorite-remove-button:hover:not(:disabled) { background: var(--error-bg); }
 .favorite-save-actions .button:first-child { min-width: 64px; }
 .favorite-save-actions .button.primary { min-width: 118px; }
 @media (max-width: 400px) {
@@ -219,7 +288,7 @@ onBeforeUnmount(() => { dialog.value?.close(); restoreFocus() })
   .favorite-save-metrics>span { gap: 5px; }
   .favorite-save-metrics>span+span { padding-left: 10px; }
   .favorite-save-local { display: none; }
-  .favorite-save-actions { justify-content: flex-end; }
+  .favorite-save-actions { justify-content: flex-end; flex-wrap: wrap; }
 }
 @media (max-height: 500px) { .favorite-save-dialog { max-height: calc(100dvh - 24px); } .favorite-save-dialog>form { max-height: calc(100dvh - 26px); } .favorite-save-heading { padding-block: 10px; } .favorite-save-body { padding-block: 12px; } .favorite-save-actions { padding-block: 10px; } }
 </style>

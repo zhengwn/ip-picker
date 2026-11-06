@@ -3,8 +3,9 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { Check, ChevronDown, ChevronRight, CircleAlert, Clipboard, FolderOpen, LoaderCircle, Pencil, Plus, RotateCcw, Search, Settings2, Square, Star, Trash2, X } from '@lucide/vue'
 import { regionName, type ScanConfig } from '../types'
+import { validManualIpv4 } from '../custom-ips'
 import { candidateExclusionReason, candidateMeasurementStatus, precisionPolicyLabel, stabilityMetricLabel, stabilityVerdict, targetHost } from '../ui-state'
-import { favoriteDate, favoriteError, favoriteHasTestData, favoriteNumber, favoriteProbes, favoriteRunStatus, favoriteSnapshotRun, favoriteTcpSummary, favoriteTestPhase, validManualIpv4, type FavoriteEntry, type FavoriteFolder, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from '../favorites'
+import { favoriteDate, favoriteError, favoriteHasTestData, favoriteNumber, favoriteProbes, favoriteRunStatus, favoriteSnapshotRun, favoriteTcpSummary, favoriteTestPhase, type FavoriteEntry, type FavoriteFolder, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from '../favorites'
 import SelectControl from './SelectControl.vue'
 
 const props = defineProps<{ library: FavoriteLibrary; desktop: boolean; config: ScanConfig; loading?: boolean; testJob?: FavoriteTestJob | null; scanBusy?: boolean }>()

@@ -1,19 +1,33 @@
-import { defaultConfig, selectableRegions, type IpResult, type ScanConfig, type ScanRun, type TcpStability } from './types'
+import { defaultConfig, selectableRegions, type ExclusionCode, type IpResult, type ScanConfig, type ScanRun, type TcpStability } from './types'
+import { customIpsTooLarge, inspectCustomIps } from './custom-ips'
 
 export interface ValidationIssue { field: keyof ScanConfig; message: string }
 
+export function commandValidationIssue(error: unknown): ValidationIssue | null {
+  if (typeof error !== 'object' || error === null || !('field' in error) || !('message' in error)) return null
+  if (typeof error.field !== 'string' || typeof error.message !== 'string' || !Object.prototype.hasOwnProperty.call(defaultConfig(), error.field)) return null
+  return { field: error.field as keyof ScanConfig, message: error.message }
+}
+
 export function validateConfig(config: ScanConfig): ValidationIssue | null {
-  if (!config.regions.length) return { field: 'regions', message: '至少选择一个国家／地区。' }
+  if (!config.regions.length || config.regions.length > 32) return { field: 'regions', message: '请选择 1 至 32 个目标国家／地区。' }
+  if (config.regions.some(region => region.length !== 2 || !/^[A-Z]{2}$/.test(region))) return { field: 'regions', message: '地区代码必须是大写的两位代码。' }
+  if (new Set(config.regions).size !== config.regions.length) return { field: 'regions', message: '目标地区不能重复。' }
+  if (!['daily', 'download'].includes(config.preference)) return { field: 'preference', message: '未知推荐偏好。' }
   if (!['adaptive', 'limited'].includes(config.precisionMode)) return { field: 'precisionMode', message: '请选择精测方式。' }
   if (config.stabilityFirst !== true) return { field: 'stabilityFirst', message: '新测试须先完成稳定性筛选，请恢复默认参数后再开始。' }
   if (config.tcpLatencyScreening !== false) return { field: 'tcpLatencyScreening', message: '新测试不支持旧的单次延迟初筛规则，请恢复默认参数后再开始。' }
   if (!['average', 'p95', 'max'].includes(config.stabilityLatencyMetric)) return { field: 'stabilityLatencyMetric', message: '请选择 TCP 稳定性延迟判定指标。' }
-  if (config.source === 'custom' && !config.customIps.trim()) return { field: 'customIps', message: '请填写要测试的 IPv4 或 CIDR，每行一个。' }
+  if (config.source === 'custom') {
+    const { error } = inspectCustomIps(config.customIps)
+    if (error) return { field: 'customIps', message: error }
+  } else if (config.source !== 'cloudflare') return { field: 'source', message: '未知候选来源。' }
+  else if (customIpsTooLarge(config.customIps)) return { field: 'customIps', message: '自定义列表不能超过 2 MiB' }
   try {
     const url = new URL(config.targetUrl)
     if (url.protocol !== 'https:') return { field: 'targetUrl', message: '测速地址必须使用 HTTPS。' }
-    if (url.username || url.password || url.hash) return { field: 'targetUrl', message: '测速地址不能包含用户名、密码或 URL 片段。' }
-    if (/^[\d.]+$/.test(url.hostname) || url.hostname.includes(':') || url.port === '0') return { field: 'targetUrl', message: '测速地址须使用域名和有效端口，以正确验证 TLS 证书。' }
+    if (url.username || url.password || url.href.includes('#')) return { field: 'targetUrl', message: '测速地址不能包含用户名、密码或 URL 片段。' }
+    if (/^\d+(?:\.\d+){3}$/.test(url.hostname) || url.hostname.includes(':') || url.port === '0') return { field: 'targetUrl', message: '测速地址须使用域名和有效端口，以正确验证 TLS 证书。' }
   } catch { return { field: 'targetUrl', message: '请填写有效的 HTTPS 测速地址。' } }
   const limits: [keyof ScanConfig, number, number, string][] = [
     ['ipsPerRegion', 1, 10, '每区结果数'], ['maxTcpMs', 1, 30000, '稳定性延迟上限'], ['minDownloadMbps', 0, 10000, '日常优选最低速率'],
@@ -46,46 +60,83 @@ export interface ExclusionCategory {
   count: number
 }
 
-function isRegionalAdmissionExclusion(reason: string): boolean {
+type ExclusionDetails = Omit<ExclusionCategory, 'count'>
+
+const exclusionsByCode: Record<ExclusionCode, ExclusionDetails> = {
+  tcpConnect: { key: 'connection', label: 'TCP 连接失败或超时', kind: 'failure', field: 'connectTimeoutMs' },
+  tcpLatency: { key: 'tcp-limit', label: 'TCP 延迟超过本次上限', kind: 'filter', field: 'maxTcpMs' },
+  httpsTimeout: { key: 'https-timeout', label: 'HTTPS 请求超时', kind: 'failure', field: 'requestTimeoutMs' },
+  httpsFailure: { key: 'https', label: 'HTTPS 验证失败或目标响应不兼容', kind: 'failure', field: 'targetUrl' },
+  popUnknown: { key: 'unknown-pop', label: '未能确认 POP 地区', kind: 'failure', field: 'targetUrl' },
+  regionMismatch: { key: 'region-filter', label: '实际响应地区不在所选范围', kind: 'filter', field: 'regions' },
+  regionalAdmission: { key: 'regional-limit', label: '按初筛 TCP 延迟排序后未入围，未精测', kind: 'filter', field: 'regionalCandidateLimit' },
+  stabilityEarly: { key: 'tcp-stability-two-failures', label: 'TCP 稳定性累计 2 次连接失败', kind: 'filter', field: 'connectTimeoutMs' },
+  stabilityIncomplete: { key: 'tcp-stability-incomplete', label: 'TCP 稳定性测试未完成', kind: 'incomplete', field: 'stabilityAttempts' },
+  stabilityAllFailed: { key: 'tcp-stability-all-failed', label: 'TCP 稳定性探测全部连接失败', kind: 'failure', field: 'connectTimeoutMs' },
+  stabilityFailureRate: { key: 'tcp-stability-failure', label: 'TCP 稳定性连接失败率超过允许值', kind: 'filter', field: 'maxStabilityFailurePercent' },
+  stabilityLatency: { key: 'tcp-limit', label: 'TCP 延迟超过本次上限', kind: 'filter', field: 'maxTcpMs' },
+  downloadShortlist: { key: 'download-shortlist', label: '稳定性已完成，未进入本区前 10 名下载候选', kind: 'filter', field: 'stabilityLatencyMetric' },
+  downloadBudget: { key: 'budget', label: '下载预算用尽，未完成全部精测', kind: 'incomplete', field: 'downloadBudgetMiB' },
+  downloadFailure: { key: 'download', label: '下载请求失败或响应不符合测速要求', kind: 'failure', field: 'targetUrl' },
+  downloadIncomplete: { key: 'incomplete', label: '尚未完成必要复测', kind: 'incomplete', field: 'downloadBudgetMiB' },
+  popRecheckIncomplete: { key: 'pop-recheck-incomplete', label: '下载后的 POP 复核未完成', kind: 'incomplete', field: 'verificationAttempts' },
+  popRecheckFailure: { key: 'pop-recheck-failure', label: '下载后的 POP 复核失败', kind: 'failure', field: 'verificationAttempts' },
+  popDrift: { key: 'drift', label: '接入地区或连接对端变化', kind: 'failure', field: 'verificationAttempts' },
+  cancelled: { key: 'cancelled', label: '测速已停止，未完成必要复测', kind: 'incomplete', field: 'stabilityAttempts' },
+  speedTarget: { key: 'speed', label: '验证通过，有效下载速率低于日常目标', kind: 'filter', field: 'minDownloadMbps' },
+  unknown: { key: 'other', label: '其他未入选原因', kind: 'failure', field: 'targetUrl' },
+}
+
+function codedExclusion(code: ExclusionCode): ExclusionDetails {
+  return exclusionsByCode[code] ?? exclusionsByCode.unknown
+}
+
+function legacyRegionalAdmission(reason: string): boolean {
   return /按初筛\s*TCP\s*延迟排序|未进入本地区前\s*\d+\s*名精测候选/.test(reason)
 }
 
-function isDownloadShortlistExclusion(reason: string): boolean {
+function legacyDownloadShortlist(reason: string): boolean {
   return /未进入本地区前\s*\d+\s*名下载候选/.test(reason)
 }
 
-function exclusionCategory(reason: string): Omit<ExclusionCategory, 'count'> {
-  if (isDownloadShortlistExclusion(reason)) return { key: 'download-shortlist', label: '稳定性已完成，未进入本区前 10 名下载候选', kind: 'filter', field: 'stabilityLatencyMetric' }
-  if (/累计\s*2\s*次连接失败|累计\s*\d+\s*次连接失败，达到\s*2\s*次|连接失败累计达到\s*2\s*次/.test(reason)) return { key: 'tcp-stability-two-failures', label: 'TCP 稳定性累计 2 次连接失败', kind: 'filter', field: 'connectTimeoutMs' }
+function isRegionalAdmissionExclusion(result: IpResult): boolean {
+  return result.exclusionCode ? result.exclusionCode === 'regionalAdmission' : legacyRegionalAdmission(result.exclusionReason ?? '')
+}
+
+export function isDownloadShortlistExclusion(result: IpResult): boolean {
+  return result.exclusionCode ? result.exclusionCode === 'downloadShortlist' : legacyDownloadShortlist(result.exclusionReason ?? '')
+}
+
+function legacyExclusionCategory(reason: string): ExclusionDetails {
+  if (legacyDownloadShortlist(reason)) return exclusionsByCode.downloadShortlist
+  if (/累计\s*2\s*次连接失败|累计\s*\d+\s*次连接失败，达到\s*2\s*次|连接失败累计达到\s*2\s*次/.test(reason)) return exclusionsByCode.stabilityEarly
   if (/TCP 稳定性提前淘汰/.test(reason)) return /连接失败|失败率/.test(reason)
-    ? { key: 'tcp-stability-failure', label: 'TCP 稳定性连接失败率超过允许值', kind: 'filter', field: 'maxStabilityFailurePercent' }
-    : { key: 'tcp-limit', label: 'TCP 延迟超过本次上限', kind: 'filter', field: 'maxTcpMs' }
-  if (/稳定性.*(?:连接失败率|失败率).*(?:超过|超出|高于)/.test(reason)) return { key: 'tcp-stability-failure', label: 'TCP 稳定性连接失败率超过允许值', kind: 'filter', field: 'maxStabilityFailurePercent' }
-  if (/稳定性.*(?:未完成|已停止|统计不完整)|尚未完成.*TCP 稳定性/.test(reason)) return { key: 'tcp-stability-incomplete', label: 'TCP 稳定性测试未完成', kind: 'incomplete', field: 'stabilityAttempts' }
-  if (/TCP 稳定性探测全部连接失败/.test(reason)) return { key: 'tcp-stability-all-failed', label: 'TCP 稳定性探测全部连接失败', kind: 'failure', field: 'connectTimeoutMs' }
-  if (/TCP.*(?:超过|超出|高于).*(?:上限|限制)|TCP.*(?:上限|限制).*(?:超过|超出|高于)/.test(reason)) return { key: 'tcp-limit', label: 'TCP 延迟超过本次上限', kind: 'filter', field: 'maxTcpMs' }
+    ? exclusionsByCode.stabilityFailureRate : exclusionsByCode.stabilityLatency
+  if (/稳定性.*(?:连接失败率|失败率).*(?:超过|超出|高于)/.test(reason)) return exclusionsByCode.stabilityFailureRate
+  if (/稳定性.*(?:未完成|已停止|统计不完整)|尚未完成.*TCP 稳定性/.test(reason)) return exclusionsByCode.stabilityIncomplete
+  if (/TCP 稳定性探测全部连接失败/.test(reason)) return exclusionsByCode.stabilityAllFailed
+  if (/TCP.*(?:超过|超出|高于).*(?:上限|限制)|TCP.*(?:上限|限制).*(?:超过|超出|高于)/.test(reason)) return exclusionsByCode.tcpLatency
   if (/本地区已有足够达标结果/.test(reason)) return { key: 'region-satisfied', label: '已有足够达标结果，未继续精测', kind: 'filter', field: 'ipsPerRegion' }
-  if (/实际响应地区不在/.test(reason)) return { key: 'region-filter', label: '实际响应地区不在所选范围', kind: 'filter', field: 'regions' }
-  if (isRegionalAdmissionExclusion(reason)) return { key: 'regional-limit', label: '按初筛 TCP 延迟排序后未入围，未精测', kind: 'filter', field: 'regionalCandidateLimit' }
+  if (/实际响应地区不在/.test(reason)) return exclusionsByCode.regionMismatch
+  if (legacyRegionalAdmission(reason)) return exclusionsByCode.regionalAdmission
   if (/未进入本地区精测候选|达到本地区手动精测上限/.test(reason)) return { key: 'quota-filter', label: '达到本地区手动精测上限，未继续精测', kind: 'filter', field: 'precisionMode' }
-  if (/下载预算(?:不足|已用尽)/.test(reason)) return { key: 'budget', label: '下载预算用尽，未完成全部精测', kind: 'incomplete', field: 'downloadBudgetMiB' }
-  if (/测试已停止|未完成必要|复测未完成/.test(reason)) return { key: 'incomplete', label: '尚未完成必要复测', kind: 'incomplete', field: 'downloadBudgetMiB' }
-  if (/接入地区发生变化|POP 变化|连接对端发生变化|无法确认实际连接/.test(reason)) return { key: 'drift', label: '接入地区或连接对端变化', kind: 'failure', field: 'verificationAttempts' }
-  if (/低于日常优选目标/.test(reason)) return { key: 'speed', label: '验证通过，有效下载速率低于日常目标', kind: 'filter', field: 'minDownloadMbps' }
-  if (/无地区映射|未知地区|有效的 Cloudflare POP/.test(reason)) return { key: 'unknown-pop', label: '未能确认 POP 地区', kind: 'failure', field: 'targetUrl' }
-  if (/下载响应进行了压缩|下载目标未返回|下载响应不足|下载样本不足/.test(reason)) return { key: 'download', label: '下载目标或样本不符合测速要求', kind: 'failure', field: 'targetUrl' }
-  if (/^TCP/.test(reason)) return { key: 'connection', label: 'TCP 连接失败或超时', kind: 'failure', field: 'connectTimeoutMs' }
-  if (/HTTPS 请求超时/.test(reason)) return { key: 'https-timeout', label: 'HTTPS 请求超时', kind: 'failure', field: 'requestTimeoutMs' }
-  if (/HTTPS|TLS|HTTP|trace|测速地址/.test(reason)) return { key: 'https', label: 'HTTPS 验证失败或目标响应不兼容', kind: 'failure', field: 'targetUrl' }
-  if (!reason) return { key: 'incomplete', label: '尚未完成必要复测', kind: 'incomplete', field: 'downloadBudgetMiB' }
-  return { key: 'other', label: '其他未入选原因', kind: 'failure', field: 'targetUrl' }
+  if (/下载预算(?:不足|已用尽)/.test(reason)) return exclusionsByCode.downloadBudget
+  if (/测试已停止|未完成必要|复测未完成/.test(reason)) return exclusionsByCode.downloadIncomplete
+  if (/接入地区发生变化|POP 变化|连接对端发生变化|无法确认实际连接/.test(reason)) return exclusionsByCode.popDrift
+  if (/低于日常优选目标/.test(reason)) return exclusionsByCode.speedTarget
+  if (/无地区映射|未知地区|有效的 Cloudflare POP/.test(reason)) return exclusionsByCode.popUnknown
+  if (/下载响应进行了压缩|下载目标未返回|下载响应不足|下载样本不足/.test(reason)) return exclusionsByCode.downloadFailure
+  if (/^TCP/.test(reason)) return exclusionsByCode.tcpConnect
+  if (/HTTPS 请求超时/.test(reason)) return exclusionsByCode.httpsTimeout
+  if (/HTTPS|TLS|HTTP|trace|测速地址/.test(reason)) return exclusionsByCode.httpsFailure
+  return reason ? exclusionsByCode.unknown : exclusionsByCode.downloadIncomplete
 }
 
 export function summarizeExclusions(results: IpResult[], _status: ScanRun['status']): ExclusionCategory[] {
   const groups = new Map<string, ExclusionCategory>()
   for (const result of results) {
-    if ((result.eligible || result.measurementPassed) && !result.exclusionReason) continue
-    const category = exclusionCategory(result.exclusionReason ?? '')
+    if ((result.eligible || result.measurementPassed) && !result.exclusionCode && !result.exclusionReason) continue
+    const category = result.exclusionCode ? codedExclusion(result.exclusionCode) : legacyExclusionCategory(result.exclusionReason ?? '')
     const existing = groups.get(category.key)
     if (existing) existing.count += 1
     else groups.set(category.key, { ...category, count: 1 })
@@ -173,7 +224,7 @@ export function regionCandidatePool(run: ScanRun, region: string): { label: stri
     const collecting = run.status === 'running' && ['connecting', 'discovering'].includes(run.progress.stage)
     const selecting = !collecting && !['stabilizing'].includes(run.progress.stage)
     const downloadCandidates = selecting ? run.results.filter(result => result.regionCode === region && !!result.tcpStability
-      && !isDownloadShortlistExclusion(result.exclusionReason ?? '') && stabilityVerdict(result, run.config) === 'passed').length : null
+      && !isDownloadShortlistExclusion(result) && stabilityVerdict(result, run.config) === 'passed').length : null
     const label = `${collecting ? '预计入围稳定性' : '入围稳定性'} ${admitted} / ${limit} · 未入围 ${Math.max(0, identified - admitted)}${downloadCandidates == null ? '' : ` · 下载候选 ${Math.min(10, downloadCandidates)}`}`
     const detail = collecting ? '识别结束后按初筛 TCP 延迟确定稳定性入围名单'
       : !identified ? '未识别到本区 POP，暂无可测候选'
@@ -212,7 +263,8 @@ export function regionCandidatePool(run: ScanRun, region: string): { label: stri
 
 export function candidateExclusionReason(result: IpResult): string {
   const reason = result.exclusionReason ?? ''
-  if (isRegionalAdmissionExclusion(reason)) return reason.replace('初筛TCP', '初筛 TCP ')
+  if (result.exclusionCode) return reason || codedExclusion(result.exclusionCode).label
+  if (legacyRegionalAdmission(reason)) return reason.replace('初筛TCP', '初筛 TCP ')
   if (/本地区已有足够达标结果/.test(reason)) return '已有足够达标结果，未继续精测'
   if (/未进入本地区精测候选|达到本地区手动精测上限/.test(reason)) return '达到本地区手动精测上限，未继续精测'
   if (/下载预算(?:不足|已用尽)/.test(reason)) {
@@ -299,8 +351,8 @@ export function summarizeMeasurementCoverage(results: IpResult[], config: ScanCo
 
 /** Report evidence actually obtained, independently of why a candidate was excluded. */
 export function candidateMeasurementStatus(result: IpResult, run: ScanRun): string {
-  if (isDownloadShortlistExclusion(result.exclusionReason ?? '')) return '稳定性已完成 · 未入选下载'
-  if (isRegionalAdmissionExclusion(result.exclusionReason ?? '')) return '未入围 · 未精测'
+  if (isDownloadShortlistExclusion(result)) return '稳定性已完成 · 未入选下载'
+  if (isRegionalAdmissionExclusion(result)) return '未入围 · 未精测'
   if (completeMeasurement(result, run.config)) return '完整测速完成'
   const stability = result.tcpStability
   if (stability) {
@@ -314,10 +366,10 @@ export function candidateMeasurementStatus(result: IpResult, run: ScanRun): stri
     }
     if (run.config.stabilityFirst) {
       if (result.successCount < result.attempts) return '服务校验未通过'
-      if (result.attempts < run.config.verificationAttempts) return run.status === 'running' && !result.exclusionReason ? '待服务校验' : '服务校验未完成'
+      if (result.attempts < run.config.verificationAttempts) return run.status === 'running' && !result.exclusionCode && !result.exclusionReason ? '待服务校验' : '服务校验未完成'
     }
     if (result.downloadSamplesMbps.length < run.config.downloadRounds) {
-      return run.status === 'running' && !result.exclusionReason && !result.downloadSamplesMbps.length ? '待下载复测' : '下载未完成'
+      return run.status === 'running' && !result.exclusionCode && !result.exclusionReason && !result.downloadSamplesMbps.length ? '待下载复测' : '下载未完成'
     }
     return '完整测速未通过'
   }
@@ -325,7 +377,8 @@ export function candidateMeasurementStatus(result: IpResult, run: ScanRun): stri
     if (result.successCount < result.attempts) return '服务校验未通过'
     return result.attempts < run.config.verificationAttempts ? '服务校验未完成' : '待稳定性测试'
   }
-  if (!result.tcpMs && !result.attempts && /^TCP/.test(result.exclusionReason ?? '')) return 'TCP 未连通'
+  if (!result.tcpMs && !result.attempts
+    && (result.exclusionCode ? result.exclusionCode === 'tcpConnect' : /^TCP/.test(result.exclusionReason ?? ''))) return 'TCP 未连通'
   return '未精测'
 }
 
@@ -398,11 +451,12 @@ export function stabilityVerdict(result: IpResult, config: ScanConfig): 'passed'
 /** A settled candidate has a result, not merely a finished stability sub-stage. */
 export function precisionCandidateSettled(result: IpResult, config: ScanConfig): boolean {
   if (completeMeasurement(result, config) || stabilityVerdict(result, config) === 'failed') return true
-  if (config.stabilityFirst && isDownloadShortlistExclusion(result.exclusionReason ?? '') && completeStability(result, config)) return true
+  if (isDownloadShortlistExclusion(result)) return config.stabilityFirst && completeStability(result, config)
   const started = result.attempts > 1 || !!result.tcpStability || result.downloadSamplesMbps.length > 0
-  if (!started || !result.exclusionReason) return false
+  if (!started) return false
   // Stopping, budget limits and queue limits are not measured rejection evidence.
-  return !/未完成|测试已停止|未进入|手动精测上限|足够达标结果|下载预算/.test(result.exclusionReason)
+  if (result.exclusionCode) return result.exclusionCode !== 'regionalAdmission' && codedExclusion(result.exclusionCode).kind !== 'incomplete'
+  return !!result.exclusionReason && !/未完成|测试已停止|未进入|手动精测上限|足够达标结果|下载预算/.test(result.exclusionReason)
 }
 
 export function summarizePrecisionQueue(run: ScanRun) {
@@ -414,9 +468,10 @@ export function summarizePrecisionQueue(run: ScanRun) {
     : new Set<string>()
   // Precision admission happened before any later POP drift. Its work remains
   // accounted for even when the latest observed region is no longer selected.
-  const precisionJobs = run.results.filter(result => !isRegionalAdmissionExclusion(result.exclusionReason ?? '') && (inBatch.has(result.ip)
+  const precisionJobs = run.results.filter(result => !isRegionalAdmissionExclusion(result) && (inBatch.has(result.ip)
     || !!result.tcpStability || result.downloadSamplesMbps.length > 0
-    || result.attempts > 1 && (selected.has(result.regionCode) || /接入地区发生变化|POP 变化/.test(result.exclusionReason ?? ''))))
+    || result.attempts > 1 && (selected.has(result.regionCode) || (result.exclusionCode
+      ? result.exclusionCode === 'popDrift' : /接入地区发生变化|POP 变化/.test(result.exclusionReason ?? '')))))
   const identifiedAvailable = config.regions.reduce((total, code) => {
     const recorded = candidates.filter(result => result.regionCode === code).length
     const count = Math.max(recorded, Math.max(0, run.progress.discoveredByRegion[code] ?? 0))
