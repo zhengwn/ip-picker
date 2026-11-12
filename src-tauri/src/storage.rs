@@ -1,9 +1,17 @@
 use crate::{
     favorites::{FavoriteLibrary, FavoriteTestJob},
-    model::{ScanConfig, ScanRun, CLOUDFLARE_CANDIDATE_COUNT},
+    history::{has_history_results, recent_runs, HistoryEntry, HistoryKind},
+    model::{IpResult, ScanConfig, ScanProgress, ScanRun, CLOUDFLARE_CANDIDATE_COUNT},
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::Path};
+use std::{
+    collections::HashSet,
+    fs, io,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use uuid::Uuid;
 
 const CANDIDATE_COVERAGE_VERSION: u32 = 2;
 
@@ -19,6 +27,16 @@ pub struct SavedState {
     pub favorites: FavoriteLibrary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub favorite_test: Option<FavoriteTestJob>,
+    #[serde(default, skip_serializing)]
+    pub scan_history: Vec<HistoryEntry>,
+    // On disk this field is the archive index. Once loaded, only references
+    // that could not be read stay here so a settings save cannot erase them.
+    #[serde(default, rename = "scanHistoryFiles", skip_serializing)]
+    pub(crate) unavailable_history_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub measurement_revision: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending_favorite_results: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
 }
@@ -31,9 +49,172 @@ impl Default for SavedState {
             last_run: None,
             favorites: FavoriteLibrary::default(),
             favorite_test: None,
+            scan_history: Vec::new(),
+            unavailable_history_files: Vec::new(),
+            measurement_revision: 0,
+            pending_favorite_results: false,
             warning: None,
         }
     }
+}
+
+impl SavedState {
+    pub fn apply_pending_favorite_results(&mut self) {
+        if self.pending_favorite_results {
+            if let Some(job) = &self.favorite_test {
+                self.favorites.apply_test_results(job);
+            }
+            self.pending_favorite_results = false;
+        }
+    }
+
+    pub fn recent_history(&self) -> Vec<(HistoryKind, &ScanRun)> {
+        recent_runs(
+            &self.scan_history,
+            self.last_run.as_ref(),
+            self.favorite_test.as_ref().map(|job| &job.run),
+        )
+    }
+
+    // The latest scan and retest already live in their own state slots. Keep
+    // one copy of each run by moving it to the archive only on replacement.
+    pub fn archive_run(&mut self, kind: HistoryKind, run: ScanRun) {
+        if has_history_results(&run) {
+            self.scan_history.push(HistoryEntry {
+                kind,
+                run: Arc::new(run),
+                file_id: Some(Uuid::new_v4()),
+            });
+            self.retain_recent_history();
+        }
+    }
+
+    pub fn retain_recent_history(&mut self) {
+        let mut recent_ids: HashSet<_> = self
+            .recent_history()
+            .into_iter()
+            .map(|(_, run)| run.id.clone())
+            .collect();
+        if let Some(run) = &self.last_run {
+            recent_ids.remove(&run.id);
+        }
+        if let Some(job) = &self.favorite_test {
+            recent_ids.remove(&job.run.id);
+        }
+        self.scan_history
+            .retain(|entry| recent_ids.remove(&entry.run.id));
+    }
+}
+
+fn history_path(path: &Path, id: Uuid) -> PathBuf {
+    path.with_extension("history").join(format!("{id}.json"))
+}
+
+fn load_history(path: &Path, saved: &mut SavedState) -> Option<String> {
+    // Earlier versions embedded the archive in state.json. Allocate its file
+    // identifiers here, and move the data on the next successful state save.
+    for entry in &mut saved.scan_history {
+        entry.file_id = Some(Uuid::new_v4());
+    }
+    let mut seen = HashSet::new();
+    let mut unavailable = Vec::new();
+    for reference in std::mem::take(&mut saved.unavailable_history_files) {
+        if !seen.insert(reference.clone()) {
+            continue;
+        }
+        let entry = Uuid::parse_str(&reference).ok().and_then(|id| {
+            let bytes = fs::read(history_path(path, id)).ok()?;
+            let mut entry: HistoryEntry = serde_json::from_slice(&bytes).ok()?;
+            entry.file_id = Some(id);
+            Some(entry)
+        });
+        match entry {
+            Some(entry) => saved.scan_history.push(entry),
+            None => unavailable.push(reference),
+        }
+    }
+    saved.unavailable_history_files = unavailable;
+    let missing = saved.unavailable_history_files.len();
+    (missing > 0).then(|| {
+        format!("有 {missing} 轮测速归档无法读取。请检查应用数据目录中的 state.history 文件夹。")
+    })
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[derive(Deserialize)]
+struct MeasurementCheckpoint {
+    run_id: String,
+    revision: u64,
+    progress: ScanProgress,
+    results: Vec<IpResult>,
+}
+
+fn checkpoint_path(path: &Path) -> PathBuf {
+    path.with_extension("checkpoint.json")
+}
+
+pub fn save_checkpoint(path: &Path, run: &ScanRun, revision: u64) -> Result<(), String> {
+    #[derive(Serialize)]
+    struct Snapshot<'a> {
+        run_id: &'a str,
+        revision: u64,
+        progress: &'a ScanProgress,
+        results: &'a [IpResult],
+    }
+
+    let bytes = serde_json::to_vec(&Snapshot {
+        run_id: &run.id,
+        revision,
+        progress: &run.progress,
+        results: &run.results,
+    })
+    .map_err(|error| error.to_string())?;
+    write_atomic(&checkpoint_path(path), &bytes)
+}
+
+pub fn clear_checkpoint(path: &Path) {
+    // A surviving file cannot replace a terminal run or a different run.
+    let _ = fs::remove_file(checkpoint_path(path));
+}
+
+fn restore_checkpoint(path: &Path, saved: &mut SavedState) -> Result<Option<HistoryKind>, String> {
+    let (kind, run) = if let Some(run) = saved
+        .last_run
+        .as_mut()
+        .filter(|run| run.status == "running")
+    {
+        (HistoryKind::Scan, run)
+    } else if let Some(job) = saved
+        .favorite_test
+        .as_mut()
+        .filter(|job| job.run.status == "running")
+    {
+        (HistoryKind::Favorite, &mut job.run)
+    } else {
+        return Ok(None);
+    };
+
+    let bytes = match fs::read(checkpoint_path(path)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let checkpoint: MeasurementCheckpoint =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if checkpoint.run_id != run.id || checkpoint.revision <= saved.measurement_revision {
+        return Ok(None);
+    }
+    run.progress = checkpoint.progress;
+    run.results = checkpoint.results;
+    saved.measurement_revision = checkpoint.revision;
+    Ok(Some(kind))
 }
 
 fn preserve_legacy_budget(config: Option<&mut serde_json::Value>) {
@@ -140,6 +321,7 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
     }
     let mut saved: SavedState =
         serde_json::from_value(json).map_err(|e| format!("本地设置格式错误：{e}"))?;
+    let history_warning = load_history(path, &mut saved);
     if saved.candidate_coverage_version < 1 {
         // Upgrade the former built-in default only once. A later manual cap,
         // custom source, and every historical scan retain their own settings.
@@ -164,6 +346,7 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
     }
     saved.config.tcp_latency_screening = false;
     saved.config.stability_first = true;
+    let checkpoint = restore_checkpoint(path, &mut saved);
     if let Some(run) = saved.last_run.as_mut() {
         let interrupted = run.status == "running";
         if interrupted {
@@ -186,6 +369,9 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
                 && (result.measurement_passed
                     || result.eligible
                     || result.has_only_speed_target_exclusion());
+            if interrupted {
+                result.apply_recommendation_threshold(&run.config);
+            }
             if !run.config.accepts_initial_tcp_ms(result.tcp_ms) {
                 result.eligible = false;
                 result.role = Some("candidate".into());
@@ -206,31 +392,64 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
         }
     }
     recover_interrupted_favorite_test(&mut saved, path);
+    match checkpoint {
+        Ok(Some(HistoryKind::Scan)) => {
+            let previous_history = saved.scan_history.clone();
+            saved.retain_recent_history();
+            match save_replacing_history(path, &saved, &previous_history) {
+                Ok(()) => clear_checkpoint(path),
+                Err(error) => {
+                    saved.scan_history = previous_history;
+                    saved.warning = Some(format!("中断的测速快照尚未保存到本地：{error}"));
+                }
+            }
+        }
+        Err(error) => {
+            let message = format!("无法读取中断前的测速快照，已使用主状态文件：{error}");
+            saved.warning = Some(match saved.warning.take() {
+                Some(warning) => format!("{warning}；{message}"),
+                None => message,
+            });
+        }
+        _ => {}
+    }
+    if let Some(message) = history_warning {
+        saved.warning = Some(match saved.warning.take() {
+            Some(warning) => format!("{warning}；{message}"),
+            None => message,
+        });
+    }
     Ok(saved)
 }
 
 fn recover_interrupted_favorite_test(saved: &mut SavedState, path: &Path) {
-    let Some(job) = saved
+    if let Some(job) = saved
         .favorite_test
         .as_mut()
         .filter(|job| job.run.status == "running")
-    else {
+    {
+        job.interrupt("上次关闭应用时收藏测速中断，已保留已完成数据");
+        saved.pending_favorite_results = true;
+    }
+    if !saved.pending_favorite_results {
         return;
-    };
-    job.interrupt("上次关闭应用时收藏测速中断，已保留已完成数据");
+    }
     let mut next = saved.clone();
-    next.favorites
-        .apply_test_results(next.favorite_test.as_ref().unwrap());
+    next.apply_pending_favorite_results();
+    next.retain_recent_history();
     // Persist recovery before exposing its new library version. Reopening the
     // app then reads the same terminal job instead of generating another
     // different recovered snapshot with the same revision on each load.
     let committed = next.favorites.next_revision().and_then(|revision| {
         next.favorites.revision = revision;
         next.warning = None;
-        save(path, &next)
+        save_replacing_history(path, &next, &saved.scan_history)
     });
     match committed {
-        Ok(()) => *saved = next,
+        Ok(()) => {
+            *saved = next;
+            clear_checkpoint(path);
+        }
         Err(error) => {
             // Retain the interrupted job in memory for diagnosis, but preserve
             // the original library and its revision when persistence fails.
@@ -242,8 +461,65 @@ fn recover_interrupted_favorite_test(saved: &mut SavedState, path: &Path) {
 }
 
 pub fn save(path: &Path, saved: &SavedState) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(saved).map_err(|e| e.to_string())?;
-    write_atomic(path, &bytes)
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct StateFile<'a> {
+        #[serde(flatten)]
+        state: &'a SavedState,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        scan_history_files: Vec<String>,
+    }
+
+    let mut created = Vec::new();
+    let result = (|| {
+        let mut references = saved.unavailable_history_files.clone();
+        for entry in &saved.scan_history {
+            let id = entry.file_id.ok_or("测速归档缺少文件标识")?;
+            let archive = history_path(path, id);
+            if !archive
+                .try_exists()
+                .map_err(|error| format!("无法检查测速归档：{error}"))?
+            {
+                let bytes = serde_json::to_vec(entry).map_err(|error| error.to_string())?;
+                write_atomic(&archive, &bytes)?;
+                created.push(archive);
+            }
+            references.push(id.to_string());
+        }
+        // The state file commits the references only after their immutable
+        // files exist. A failed state write leaves the previous index intact.
+        let bytes = serde_json::to_vec_pretty(&StateFile {
+            state: saved,
+            scan_history_files: references,
+        })
+        .map_err(|error| error.to_string())?;
+        write_atomic(path, &bytes)
+    })();
+    if result.is_err() {
+        for archive in created {
+            let _ = fs::remove_file(archive);
+        }
+    }
+    result
+}
+
+pub fn save_replacing_history(
+    path: &Path,
+    saved: &SavedState,
+    previous: &[HistoryEntry],
+) -> Result<(), String> {
+    save(path, saved)?;
+    let retained: HashSet<_> = saved
+        .scan_history
+        .iter()
+        .filter_map(|entry| entry.file_id)
+        .collect();
+    for id in previous.iter().filter_map(|entry| entry.file_id) {
+        if !retained.contains(&id) {
+            let _ = fs::remove_file(history_path(path, id));
+        }
+    }
+    Ok(())
 }
 
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -265,6 +541,90 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_inline_history_without_rewriting_archives_on_settings_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let run = legacy_run();
+        let mut legacy = serde_json::to_value(SavedState::default()).unwrap();
+        legacy["scanHistory"] = serde_json::json!([{ "kind": "scan", "run": &run }]);
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let mut saved = load(&path).unwrap();
+        assert_eq!(saved.recent_history()[0].1.id, run.id);
+        save(&path, &saved).unwrap();
+        let archive = history_path(&path, saved.scan_history[0].file_id.unwrap());
+        let contents = fs::read(&archive).unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(state.get("scanHistory").is_none());
+        assert_eq!(state["scanHistoryFiles"].as_array().unwrap().len(), 1);
+
+        // A save must leave the existing archive file itself in place.
+        let file = fs::OpenOptions::new().write(true).open(&archive).unwrap();
+        file.set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        saved.config.max_tcp_ms = Some(234.0);
+        save(&path, &saved).unwrap();
+        assert_eq!(
+            fs::metadata(&archive).unwrap().modified().unwrap(),
+            modified
+        );
+        assert_eq!(fs::read(&archive).unwrap(), contents);
+        let reopened = load(&path).unwrap();
+        assert_eq!(reopened.config.max_tcp_ms, Some(234.0));
+        assert_eq!(reopened.recent_history()[0].1.id, run.id);
+    }
+
+    #[test]
+    fn an_unavailable_archive_preserves_other_state_and_its_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        saved.archive_run(HistoryKind::Scan, legacy_run());
+        save(&path, &saved).unwrap();
+        let archive = history_path(&path, saved.scan_history[0].file_id.unwrap());
+        let bytes = fs::read(&archive).unwrap();
+        fs::remove_file(&archive).unwrap();
+
+        let mut reopened = load_for_startup(&path).unwrap();
+        assert!(reopened
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("测速归档无法读取"));
+        assert_eq!(reopened.unavailable_history_files.len(), 1);
+        assert!(reopened.recent_history().is_empty());
+        reopened.config.max_tcp_ms = Some(240.0);
+        save(&path, &reopened).unwrap();
+        fs::write(&archive, bytes).unwrap();
+        let recovered = load(&path).unwrap();
+        assert_eq!(recovered.config.max_tcp_ms, Some(240.0));
+        assert_eq!(recovered.recent_history().len(), 1);
+        assert!(recovered.unavailable_history_files.is_empty());
+    }
+
+    #[test]
+    fn archive_cleanup_follows_the_successful_state_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        saved.archive_run(HistoryKind::Scan, legacy_run());
+        save(&path, &saved).unwrap();
+        let archive = history_path(&path, saved.scan_history[0].file_id.unwrap());
+
+        let blocked_path = dir.path().join("blocked.json");
+        fs::create_dir(&blocked_path).unwrap();
+        assert!(save(&blocked_path, &saved).is_err());
+        assert!(!history_path(&blocked_path, saved.scan_history[0].file_id.unwrap()).exists());
+        assert!(archive.is_file());
+
+        let next = SavedState::default();
+        save_replacing_history(&path, &next, &saved.scan_history).unwrap();
+        assert!(!archive.exists());
+        assert!(load(&path).unwrap().scan_history.is_empty());
+    }
 
     fn recovery_backups(path: &Path) -> Vec<std::path::PathBuf> {
         fs::read_dir(path.parent().unwrap())
@@ -295,6 +655,90 @@ mod tests {
         assert!(loaded.warning.is_none());
         assert_eq!(fs::read(&path).unwrap(), original);
         assert!(recovery_backups(&path).is_empty());
+    }
+
+    #[test]
+    fn startup_restores_a_newer_checkpoint_and_persists_the_cancelled_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut run = legacy_run();
+        run.status = "running".into();
+        run.finished_at = None;
+        let saved = SavedState {
+            last_run: Some(run.clone()),
+            measurement_revision: 2,
+            ..Default::default()
+        };
+        save(&path, &saved).unwrap();
+        let original = fs::read(&path).unwrap();
+        run.results[0].tcp_ms = 42.0;
+        let attempts = run.config.stability_attempts.unwrap();
+        run.results[1].tcp_stability = Some(crate::stability::summarize(
+            attempts,
+            run.config.max_tcp_ms.unwrap(),
+            vec![Some(42.0); attempts],
+        ));
+        run.results[1].measurement_passed = true;
+        run.results[1].eligible = false;
+        run.progress.downloaded_bytes = 2048;
+        save_checkpoint(&path, &run, 3).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), original);
+
+        let loaded = load_for_startup(&path).unwrap();
+        let recovered = loaded.last_run.unwrap();
+        assert_eq!(recovered.status, "cancelled");
+        assert_eq!(recovered.results[0].tcp_ms, 42.0);
+        assert!(recovered.results[1].measurement_passed);
+        assert!(recovered.results[1].eligible);
+        assert_eq!(recovered.results[1].role.as_deref(), Some("candidate"));
+        assert_eq!(recovered.progress.downloaded_bytes, 2048);
+        assert!(!checkpoint_path(&path).exists());
+        let reopened = load_for_startup(&path).unwrap().last_run.unwrap();
+        assert_eq!(reopened.finished_at, recovered.finished_at);
+        assert_eq!(reopened.results[0].tcp_ms, 42.0);
+    }
+
+    #[test]
+    fn startup_ignores_old_revisions_other_runs_and_corrupt_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut run = legacy_run();
+        run.status = "running".into();
+        run.results[0].tcp_ms = 22.0;
+        let mut saved = SavedState {
+            last_run: Some(run.clone()),
+            measurement_revision: 10,
+            ..Default::default()
+        };
+        save(&path, &saved).unwrap();
+        run.results[0].tcp_ms = 99.0;
+        save_checkpoint(&path, &run, 9).unwrap();
+        assert_eq!(
+            load(&path).unwrap().last_run.unwrap().results[0].tcp_ms,
+            22.0
+        );
+
+        run.id = "old-id".into();
+        save_checkpoint(&path, &run, 11).unwrap();
+        assert_eq!(
+            load(&path).unwrap().last_run.unwrap().results[0].tcp_ms,
+            22.0
+        );
+
+        fs::write(checkpoint_path(&path), b"invalid checkpoint").unwrap();
+        let recovered = load_for_startup(&path).unwrap();
+        assert_eq!(recovered.last_run.unwrap().results[0].tcp_ms, 22.0);
+        assert!(recovered.warning.unwrap().contains("已使用主状态文件"));
+        assert!(recovery_backups(&path).is_empty());
+
+        let durable = saved.last_run.as_mut().unwrap();
+        durable.status = "completed".into();
+        run.id = durable.id.clone();
+        save(&path, &saved).unwrap();
+        save_checkpoint(&path, &run, 11).unwrap();
+        let reopened = load(&path).unwrap().last_run.unwrap();
+        assert_eq!(reopened.status, "completed");
+        assert_eq!(reopened.results[0].tcp_ms, 22.0);
     }
 
     #[test]
@@ -658,18 +1102,21 @@ mod tests {
         pending.id = "favorite-job".into();
         pending.status = "running".into();
         pending.finished_at = None;
-        let (mut job, _) = saved
+        let (job, _) = saved
             .favorites
             .prepare_test(pending, Some(&folder), None, None, None)
             .unwrap();
-        job.run.results[0].tcp_ms = 42.0;
-        job.run.results[0].region_code = "GB".into();
+        let mut checkpoint = job.run.clone();
+        checkpoint.results[0].tcp_ms = 42.0;
+        checkpoint.results[0].region_code = "GB".into();
         saved.favorite_test = Some(job);
         saved.last_run = Some(previous);
         saved.favorites.revision = 13;
         save(&path, &saved).unwrap();
+        save_checkpoint(&path, &checkpoint, 1).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.favorites.revision, 14);
+        assert!(!checkpoint_path(&path).exists());
         // Recovery is persisted as one terminal snapshot, not regenerated on
         // every read with the same version and a different finishedAt value.
         let recovered = serde_json::to_value(&loaded.favorites).unwrap();

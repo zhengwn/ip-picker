@@ -3,13 +3,24 @@
 use crate::{
     engine::{EngineOutcome, EngineUpdate, PreparedScan, UpdateCallback},
     model::{ExclusionCode, IpResult, ScanProgress},
+    network::{InterfaceKind, NetworkPath},
     stability,
 };
 use std::{collections::BTreeMap, net::Ipv4Addr, path::PathBuf};
-use tauri::{plugin, Builder, Context, Listener, Manager, Wry};
+use tauri::{plugin, AppHandle, Builder, Context, Listener, Manager, Wry};
 use tokio_util::sync::CancellationToken;
 
 const FINISHED: &str = "ip-picker-smoke-finished";
+
+fn close_smoke_window(app: &AppHandle, phase: &str) -> tauri::Result<()> {
+    if cfg!(target_os = "macos") && phase == "exercise" {
+        #[cfg(target_os = "macos")]
+        return crate::macos_menu::exercise_quit_menu(app);
+    }
+    app.get_webview_window("main")
+        .expect("missing smoke window")
+        .close()
+}
 
 pub(crate) fn data_dir() -> Result<PathBuf, String> {
     let path = std::env::var_os("IP_PICKER_SMOKE_DATA_DIR")
@@ -54,12 +65,7 @@ pub(crate) fn configure(
                     match serde_json::from_str::<Option<String>>(event.payload()) {
                         Ok(None) => {
                             println!("desktop smoke {phase} passed");
-                            // close() dispatches the normal native CloseRequested event.
-                            if let Err(error) = app_handle
-                                .get_webview_window("main")
-                                .expect("missing smoke window")
-                                .close()
-                            {
+                            if let Err(error) = close_smoke_window(&app_handle, &phase) {
                                 eprintln!("desktop smoke could not request close: {error}");
                                 app_handle.exit(1);
                             }
@@ -89,13 +95,29 @@ pub(crate) async fn run_prepared_scan(
     result.observed_colos.push("HKG".into());
     result.attempts = 1;
     result.success_count = 1;
-    result.tcp_stability = Some(stability::summarize(100, 230.0, vec![Some(20.0)]));
+    let mut tcp = stability::summarize(100, 230.0, vec![Some(412.0), None]);
+    tcp.failure_details.push(stability::TcpProbeFailure {
+        attempt: 2,
+        failure: stability::TcpConnectFailure {
+            kind: stability::TcpConnectFailureKind::Timeout,
+            elapsed_ms: Some(1501.2),
+            message: None,
+        },
+    });
+    result.tcp_stability = Some(tcp);
     let mut progress = ScanProgress {
         stage: "stabilizing".into(),
-        completed: 1,
+        completed: 2,
         total: 100,
         discovered_by_region: BTreeMap::from([("HK".into(), 1)]),
         message: "桌面冒烟测试样本".into(),
+        network_path: Some(NetworkPath {
+            sample_ip: Ipv4Addr::LOCALHOST.to_string(),
+            interface_name: "en0".into(),
+            interface_kind: Some(InterfaceKind::Wifi),
+            tunnel_interface: false,
+            captured_at: chrono::Utc::now().to_rfc3339(),
+        }),
         ..Default::default()
     };
     callback(EngineUpdate {

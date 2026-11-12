@@ -2,9 +2,79 @@
 //! packet-loss observation. Only completed attempts enter the statistics.
 
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    future::Future,
+    io,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 use tokio::{net::TcpStream, time::MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TcpConnectFailureKind {
+    Timeout,
+    Connect,
+    Worker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpConnectFailure {
+    pub kind: TcpConnectFailureKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl TcpConnectFailure {
+    pub(crate) fn exclusion_reason(&self) -> String {
+        let message = self.message.as_deref().unwrap_or("未知错误");
+        match self.kind {
+            TcpConnectFailureKind::Timeout => "TCP 连接超时".into(),
+            TcpConnectFailureKind::Connect => format!("TCP 连接失败：{message}"),
+            TcpConnectFailureKind::Worker => format!("TCP 探测任务失败：{message}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TcpProbeFailure {
+    pub attempt: usize,
+    #[serde(flatten)]
+    pub failure: TcpConnectFailure,
+}
+
+pub(crate) async fn measure_tcp_connect(
+    addr: SocketAddr,
+    timeout: Duration,
+) -> Result<f64, TcpConnectFailure> {
+    time_connection(TcpStream::connect(addr), timeout).await
+}
+
+async fn time_connection<T>(
+    connect: impl Future<Output = io::Result<T>>,
+    timeout: Duration,
+) -> Result<f64, TcpConnectFailure> {
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(timeout, connect).await;
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    match outcome {
+        Ok(Ok(_)) => Ok(elapsed_ms),
+        Ok(Err(error)) => Err(TcpConnectFailure {
+            kind: TcpConnectFailureKind::Connect,
+            elapsed_ms: Some(elapsed_ms),
+            message: Some(error.to_string()),
+        }),
+        Err(_) => Err(TcpConnectFailure {
+            kind: TcpConnectFailureKind::Timeout,
+            elapsed_ms: Some(elapsed_ms),
+            message: None,
+        }),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +96,9 @@ pub struct TcpStability {
     pub jitter_ms: Option<f64>,
     /// None means a completed connection failure, not an unexecuted attempt.
     pub probes_ms: Vec<Option<f64>>,
+    /// Diagnostics for recorded failures, indexed by one-based probe number.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_details: Vec<TcpProbeFailure>,
     pub completed: bool,
     /// A partial measurement stopped after its rejection rule was met.
     /// Consumers must rederive this proof from the raw probes.
@@ -86,6 +159,7 @@ pub fn summarize(
         p95_ms,
         jitter_ms,
         probes_ms,
+        failure_details: Vec::new(),
         completed: requested > 0 && attempted == requested,
         early_rejection: None,
     }
@@ -314,6 +388,7 @@ async fn probe_tcp_inner<F: FnMut(&TcpStability) + Send>(
     }
     let mut cadence = tokio::time::interval(interval);
     cadence.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut failure_details = Vec::new();
     let mut early_rejection = None;
     for _ in 0..attempts {
         tokio::select! {
@@ -321,23 +396,24 @@ async fn probe_tcp_inner<F: FnMut(&TcpStability) + Send>(
             _ = cancellation.cancelled() => break,
             _ = cadence.tick() => {}
         }
-        let started = std::time::Instant::now();
-        let sample = tokio::select! {
+        let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => break,
-            connected = tokio::time::timeout(timeout, TcpStream::connect(addr)) => {
-                match connected {
-                    Ok(Ok(stream)) => {
-                        let ms = started.elapsed().as_secs_f64() * 1000.0;
-                        drop(stream);
-                        Some(ms)
-                    }
-                    _ => None,
-                }
+            connected = measure_tcp_connect(addr, timeout) => connected
+        };
+        let sample = match outcome {
+            Ok(ms) => Some(ms),
+            Err(failure) => {
+                failure_details.push(TcpProbeFailure {
+                    attempt: probes_ms.len() + 1,
+                    failure,
+                });
+                None
             }
         };
         probes_ms.push(sample);
         let mut update = summarize(attempts, max_tcp_ms, probes_ms.clone());
+        update.failure_details.clone_from(&failure_details);
         if probes_ms.len() < attempts {
             early_rejection = match policy {
                 ProbePolicy::FullLength => None,
@@ -359,6 +435,7 @@ async fn probe_tcp_inner<F: FnMut(&TcpStability) + Send>(
         }
     }
     let mut result = summarize(attempts, max_tcp_ms, probes_ms);
+    result.failure_details = failure_details;
     result.early_rejection = early_rejection;
     on_update(&result);
     result
@@ -528,11 +605,29 @@ mod tests {
     }
 
     #[test]
-    fn early_rejection_is_optional_in_old_serialized_measurements() {
-        let old = serde_json::to_value(summarize(100, 230.0, vec![Some(20.0)])).unwrap();
+    fn diagnostics_are_optional_in_old_serialized_measurements() {
+        let old = serde_json::to_value(summarize(100, 230.0, vec![Some(20.0), None])).unwrap();
         assert!(old.get("earlyRejection").is_none());
+        assert!(old.get("failureDetails").is_none());
         let recovered: TcpStability = serde_json::from_value(old).unwrap();
         assert!(recovered.early_rejection.is_none());
+        assert!(recovered.failure_details.is_empty());
+        assert_eq!(recovered.probes_ms, vec![Some(20.0), None]);
+    }
+
+    #[tokio::test]
+    async fn connection_timeout_records_observed_wait_without_a_success_sample() {
+        let failure = time_connection(
+            std::future::pending::<io::Result<()>>(),
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.kind, TcpConnectFailureKind::Timeout);
+        assert!(failure
+            .elapsed_ms
+            .is_some_and(|ms| ms.is_finite() && ms > 0.0));
+        assert_eq!(failure.exclusion_reason(), "TCP 连接超时");
     }
 
     #[tokio::test]
@@ -581,7 +676,29 @@ mod tests {
         assert_eq!((stats.attempted, stats.failed), (2, 2));
         assert_eq!(stats.probes_ms, vec![None, None]);
         assert!(!stats.completed);
-        assert!(stats.early_rejection.unwrap().contains("累计 2 次连接失败"));
+        assert!(stats
+            .early_rejection
+            .as_deref()
+            .unwrap()
+            .contains("累计 2 次连接失败"));
+        assert_eq!(stats.failure_details.len(), 2);
+        for (index, detail) in stats.failure_details.iter().enumerate() {
+            assert_eq!(detail.attempt, index + 1);
+            assert_eq!(detail.failure.kind, TcpConnectFailureKind::Connect);
+            assert!(detail
+                .failure
+                .elapsed_ms
+                .is_some_and(|ms| ms.is_finite() && ms >= 0.0));
+            assert!(detail.failure.message.is_some());
+        }
+        let snapshot = serde_json::to_value(&stats).unwrap();
+        let failure = &snapshot["failureDetails"][0];
+        assert_eq!(failure["attempt"], 1);
+        assert_eq!(failure["kind"], "connect");
+        assert!(failure["elapsedMs"].is_number());
+        assert!(failure["message"].is_string());
+        let restored: TcpStability = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(restored.failure_details.len(), 2);
     }
 
     #[tokio::test]
@@ -690,5 +807,6 @@ mod tests {
         assert_eq!(result.attempted, 0);
         assert!(!result.completed);
         assert!(result.early_rejection.is_none());
+        assert!(result.failure_details.is_empty());
     }
 }

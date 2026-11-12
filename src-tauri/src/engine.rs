@@ -6,17 +6,19 @@ use crate::model::{
     compare_ip_results_with_metric, parse_custom_candidates, pop, CustomCandidates, ExclusionCode,
     IpResult, ScanCommandError, ScanConfig, ScanProgress, StabilityBatch,
 };
+use crate::stability::{measure_tcp_connect, TcpConnectFailure, TcpConnectFailureKind};
 use futures_util::{stream, StreamExt};
 use ipnet::Ipv4Net;
 use rand::Rng;
 use reqwest::{header, redirect::Policy, Client, Response};
 use std::{
-    collections::{BTreeMap, HashSet},
+    cmp::Reverse,
+    collections::{BTreeMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::Range,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -250,7 +252,11 @@ async fn run_candidates(
     } {
         match outcome {
             Ok(ms) => apply_tcp_measurement(&mut state.results[index], ms, &config),
-            Err(reason) => state.results[index].exclude(ExclusionCode::TcpConnect, reason),
+            Err(failure) => {
+                let result = &mut state.results[index];
+                result.exclude(ExclusionCode::TcpConnect, failure.exclusion_reason());
+                result.tcp_connect_failure = Some(failure);
+            }
         }
         state.progress.completed += 1;
         state.emit(&callback, false);
@@ -444,12 +450,13 @@ async fn run_candidates(
             (region, entries)
         })
         .collect();
-    let schedule = download_schedule(&verified_groups, &config.regions, config.download_rounds);
+    let mut schedule =
+        DownloadQueue::new(&verified_groups, &config.regions, config.download_rounds);
     let total_budget = config.download_budget_bytes();
     let mut used = 0_u64;
     state.stage(
         "downloading",
-        schedule.len(),
+        schedule.remaining_rounds,
         if scope == ScanScope::Targeted {
             if config.download_budget_enabled {
                 "对全部验证通过的收藏 IP 进行下载复测，共享本轮下载预算".into()
@@ -461,29 +468,23 @@ async fn run_candidates(
         },
         &callback,
     );
-    for (slot, index) in schedule.iter().copied().enumerate() {
+    while let Some(slot) = schedule.next(total_budget, used) {
         if cancellation.is_cancelled() {
             state.progress.downloaded_bytes = used;
             return Ok(state.cancel(&config, &callback));
         }
-        if state.results[index].is_excluded() {
-            state.progress.completed += 1;
-            continue;
-        }
-        let slots_left = schedule[slot..]
-            .iter()
-            .filter(|i| !state.results[**i].is_excluded())
-            .count() as u64;
-        let allowance = total_budget.map(|total| download_allowance(total, used, slots_left));
-        if allowance.is_some_and(|bytes| bytes < MIN_SAMPLE_BYTES) {
-            state.results[index].exclude(
-                ExclusionCode::DownloadBudget,
-                "下载预算不足，未完成必要复测",
-            );
-            state.progress.completed += 1;
-            state.emit(&callback, false);
-            continue;
-        }
+        let (index, allowance) = match slot {
+            DownloadSlot::Round { index, allowance } => (index, allowance),
+            DownloadSlot::Unfunded(index) => {
+                state.results[index].exclude(
+                    ExclusionCode::DownloadBudget,
+                    "剩余下载预算不足以安排全部复测轮次",
+                );
+                state.progress.completed += config.download_rounds;
+                state.emit(&callback, false);
+                continue;
+            }
+        };
         let label = if state.results[index].city.is_empty() {
             state.results[index].colo.clone()
         } else {
@@ -536,6 +537,9 @@ async fn run_candidates(
                 }
             }
             Err(failure) => state.results[index].exclude(failure.code, failure.message),
+        }
+        if state.results[index].is_excluded() {
+            state.progress.completed += schedule.skip_remaining_rounds(index);
         }
         state.progress.completed += 1;
         state.emit(&callback, false);
@@ -689,25 +693,16 @@ fn spawn_stability_worker(
     });
 }
 
-async fn isolated_tcp_probe(addr: SocketAddr, timeout: Duration) -> Result<f64, String> {
+async fn isolated_tcp_probe(addr: SocketAddr, timeout: Duration) -> Result<f64, TcpConnectFailure> {
     // Record completion on an independent worker; a slow progress consumer must
     // not delay polling an already-ready socket and inflate its elapsed time.
-    let worker = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(tcp_probe(addr, timeout)));
-    worker
-        .await
-        .map_err(|error| format!("TCP 探测任务失败：{error}"))?
-}
-
-async fn tcp_probe(addr: SocketAddr, timeout: Duration) -> Result<f64, String> {
-    let started = Instant::now();
-    match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(stream)) => {
-            drop(stream);
-            Ok(started.elapsed().as_secs_f64() * 1000.0)
-        }
-        Ok(Err(e)) => Err(format!("TCP 连接失败：{e}")),
-        Err(_) => Err("TCP 连接超时".into()),
-    }
+    let worker =
+        tokio_util::task::AbortOnDropHandle::new(tokio::spawn(measure_tcp_connect(addr, timeout)));
+    worker.await.map_err(|error| TcpConnectFailure {
+        kind: TcpConnectFailureKind::Worker,
+        elapsed_ms: None,
+        message: Some(error.to_string()),
+    })?
 }
 
 fn apply_tcp_measurement(result: &mut IpResult, milliseconds: f64, config: &ScanConfig) {
@@ -734,13 +729,8 @@ fn pop_discovery_candidates(results: &[IpResult], ips: &[Ipv4Addr]) -> Vec<(usiz
         .collect()
 }
 
-fn client_for_ip(
-    config: &ScanConfig,
-    target: &Url,
-    ip: Ipv4Addr,
-    timeout: Duration,
-) -> Result<Client, String> {
-    client_builder_for_ip(config, target, ip, timeout)?
+fn client_for_ip(config: &ScanConfig, target: &Url, ip: Ipv4Addr) -> Result<Client, String> {
+    client_builder_for_ip(config, target, ip)?
         .build()
         .map_err(|e| format!("无法创建 HTTPS 测速连接：{e}"))
 }
@@ -749,7 +739,6 @@ fn client_builder_for_ip(
     config: &ScanConfig,
     target: &Url,
     ip: Ipv4Addr,
-    timeout: Duration,
 ) -> Result<reqwest::ClientBuilder, String> {
     let host = target.host_str().ok_or("测速地址缺少域名")?;
     let addr = SocketAddr::new(
@@ -764,7 +753,6 @@ fn client_builder_for_ip(
         .pool_max_idle_per_host(0)
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
-        .timeout(timeout)
         .resolve(host, addr)
         .user_agent(concat!("IP-Picker/", env!("CARGO_PKG_VERSION"))))
 }
@@ -960,16 +948,12 @@ async fn trace_probe(
     let mut trace_url = target.clone();
     trace_url.set_path("/cdn-cgi/trace");
     trace_url.set_query(None);
-    let client = client_for_ip(
-        config,
-        target,
-        ip,
-        Duration::from_millis(config.request_timeout_ms),
-    )
-    .map_err(|message| ProbeError::new(ExclusionCode::HttpsFailure, message))?;
+    let client = client_for_ip(config, target, ip)
+        .map_err(|message| ProbeError::new(ExclusionCode::HttpsFailure, message))?;
     let started = Instant::now();
     let mut response = client
         .get(trace_url)
+        .timeout(Duration::from_millis(config.request_timeout_ms))
         .header(header::CONNECTION, "close")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::ACCEPT_ENCODING, "identity")
@@ -1082,9 +1066,7 @@ async fn download_probe(
     allowance: Option<u64>,
     counter: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<DownloadProbe, ProbeError> {
-    let request_timeout = Duration::from_millis(config.request_timeout_ms)
-        + Duration::from_secs(config.download_seconds);
-    let client = client_for_ip(config, target, ip, request_timeout)
+    let client = client_for_ip(config, target, ip)
         .map_err(|message| ProbeError::new(ExclusionCode::HttpsFailure, message))?;
     let (url, requested_bytes) = match allowance {
         Some(bytes) => {
@@ -1093,7 +1075,6 @@ async fn download_probe(
         }
         None => (target.clone(), None),
     };
-    let started = Instant::now();
     let mut request = client
         .get(url)
         .header(header::CONNECTION, "close")
@@ -1102,7 +1083,24 @@ async fn download_probe(
     if let Some(bytes) = requested_bytes {
         request = request.header(header::RANGE, format!("bytes=0-{}", bytes - 1));
     }
-    let response = request.send().await.map_err(request_error)?;
+    measure_download_request(config, request, ip, requested_bytes, counter).await
+}
+
+async fn measure_download_request(
+    config: &ScanConfig,
+    request: reqwest::RequestBuilder,
+    ip: Ipv4Addr,
+    requested_bytes: Option<u64>,
+    counter: Arc<std::sync::atomic::AtomicU64>,
+) -> Result<DownloadProbe, ProbeError> {
+    let started = Instant::now();
+    let response = tokio::time::timeout(
+        Duration::from_millis(config.request_timeout_ms),
+        request.send(),
+    )
+    .await
+    .map_err(|_| ProbeError::new(ExclusionCode::HttpsTimeout, "等待下载响应头超时"))?
+    .map_err(request_error)?;
     measure_download_response(config, response, ip, requested_bytes, started, counter).await
 }
 
@@ -1382,22 +1380,108 @@ fn download_allowance(total_budget: u64, used: u64, remaining_rounds: u64) -> u6
     fair_share.max(MIN_SAMPLE_BYTES).min(remaining)
 }
 
+enum DownloadSlot {
+    Round {
+        index: usize,
+        allowance: Option<u64>,
+    },
+    Unfunded(usize),
+}
+
+struct DownloadQueue {
+    batches: VecDeque<VecDeque<usize>>,
+    active_rounds: VecDeque<usize>,
+    rounds_per_ip: usize,
+    remaining_rounds: usize,
+}
+
+impl DownloadQueue {
+    fn new(groups: &BTreeMap<String, Vec<usize>>, regions: &[String], rounds: usize) -> Self {
+        let batches: VecDeque<VecDeque<_>> = download_batches(groups, regions)
+            .map(VecDeque::from)
+            .collect();
+        let remaining_rounds = batches.iter().map(VecDeque::len).sum::<usize>() * rounds;
+        Self {
+            batches,
+            active_rounds: VecDeque::new(),
+            rounds_per_ip: rounds,
+            remaining_rounds,
+        }
+    }
+
+    fn next(&mut self, total_budget: Option<u64>, used: u64) -> Option<DownloadSlot> {
+        if self.active_rounds.is_empty() {
+            while self.batches.front().is_some_and(VecDeque::is_empty) {
+                self.batches.pop_front();
+            }
+            let batch = self.batches.front_mut()?;
+            // Admit only the IPs whose minimum sample size can be funded for every
+            // round. Revisit the rest of this rank if a failure frees enough budget.
+            let candidates = total_budget.map_or(batch.len(), |total| {
+                let per_ip = MIN_SAMPLE_BYTES * self.rounds_per_ip as u64;
+                batch
+                    .len()
+                    .min((total.saturating_sub(used) / per_ip) as usize)
+            });
+            if candidates == 0 {
+                self.remaining_rounds -= self.rounds_per_ip;
+                return batch.pop_front().map(DownloadSlot::Unfunded);
+            }
+            let admitted: Vec<_> = batch.drain(..candidates).collect();
+            for _ in 0..self.rounds_per_ip {
+                self.active_rounds.extend(admitted.iter().copied());
+            }
+        }
+        let index = self.active_rounds.pop_front()?;
+        let allowance =
+            total_budget.map(|total| download_allowance(total, used, self.remaining_rounds as u64));
+        self.remaining_rounds -= 1;
+        Some(DownloadSlot::Round { index, allowance })
+    }
+
+    fn skip_remaining_rounds(&mut self, index: usize) -> usize {
+        let before = self.active_rounds.len();
+        self.active_rounds.retain(|&candidate| candidate != index);
+        let skipped = before - self.active_rounds.len();
+        self.remaining_rounds -= skipped;
+        skipped
+    }
+}
+
+fn download_batches<'a>(
+    groups: &'a BTreeMap<String, Vec<usize>>,
+    region_order: &'a [String],
+) -> impl Iterator<Item = Vec<usize>> + 'a {
+    let max = region_order
+        .iter()
+        .filter_map(|region| groups.get(region))
+        .map(Vec::len)
+        .max()
+        .unwrap_or(0);
+    (0..max).map(|rank| {
+        region_order
+            .iter()
+            .filter_map(|region| {
+                groups
+                    .get(region)
+                    .and_then(|entries| entries.get(rank))
+                    .copied()
+            })
+            .collect()
+    })
+}
+
 fn download_schedule(
     groups: &BTreeMap<String, Vec<usize>>,
     region_order: &[String],
     rounds: usize,
 ) -> Vec<usize> {
-    let max = groups.values().map(Vec::len).max().unwrap_or(0);
     let mut plan = Vec::new();
     // Complete the first candidate of every region before spending budget on
     // later backups. Every round rotates across regions to prevent starvation.
-    for rank in 0..max {
+    for batch in download_batches(groups, region_order) {
         for _ in 0..rounds {
-            for region in region_order {
-                if let Some(index) = groups.get(region).and_then(|v| v.get(rank)) {
-                    plan.push(*index);
-                }
-            }
+            plan.extend_from_slice(&batch);
         }
     }
     plan
@@ -1407,24 +1491,7 @@ fn rank_results(results: &mut [IpResult], config: &ScanConfig, completed: bool) 
     for result in results.iter_mut() {
         result.role = Some("candidate".into());
         result.measurement_passed = result.has_complete_measurement(config);
-        result.eligible = result.measurement_passed;
-        if result.eligible
-            && config.preference == "daily"
-            && result.download_mbps < config.min_download_mbps
-        {
-            result.eligible = false;
-            result.exclude(
-                ExclusionCode::SpeedTarget,
-                format!(
-                    "下载 {:.2} Mbps，低于日常优选目标 {:.2} Mbps",
-                    result.download_mbps, config.min_download_mbps
-                ),
-            );
-        } else if result.eligible && result.has_only_speed_target_exclusion() {
-            // Reclassification may change the preference or target. This is
-            // the only exclusion a passed measurement is allowed to clear.
-            result.clear_exclusion();
-        }
+        result.apply_recommendation_threshold(config);
     }
     for region in &config.regions {
         let mut entries: Vec<_> = results
@@ -1485,8 +1552,11 @@ fn sample_custom_candidates(
     CustomCandidates { explicit, networks }: CustomCandidates,
     limit: usize,
 ) -> Result<Vec<Ipv4Addr>, String> {
+    if !(1..=10000).contains(&limit) {
+        return Err("抽样数量须为 1 至 10000".into());
+    }
     let mut seen = HashSet::new();
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(limit);
     for ip in explicit {
         if seen.insert(ip) {
             output.push(ip);
@@ -1495,48 +1565,108 @@ fn sample_custom_candidates(
             return Ok(output);
         }
     }
-    if !networks.is_empty() && output.len() < limit {
-        let remaining = limit - output.len();
-        let quota = remaining.div_ceil(networks.len());
-        let mut rng = rand::thread_rng();
-        for round in 0..quota {
-            for network in &networks {
-                let size = 1_u64 << (32 - network.prefix_len());
-                let strata = (quota as u64).min(size);
-                if round as u64 >= strata {
-                    continue;
-                }
-                let start = round as u64 * size / strata;
-                let end = (round as u64 + 1) * size / strata;
-                let offset = rng.gen_range(start..end);
-                let ip = Ipv4Addr::from((u64::from(u32::from(network.network())) + offset) as u32);
-                if seen.insert(ip) {
-                    output.push(ip);
-                }
-                if output.len() >= limit {
-                    return Ok(output);
-                }
-            }
-        }
-        // Overlapping ranges / small subnets may leave holes. Fill with bounded
-        // attempts rather than enumerating any large address space.
-        for round in 0..remaining.saturating_mul(8) {
-            let network = &networks[round % networks.len()];
-            let size = 1_u64 << (32 - network.prefix_len());
-            let offset = rng.gen_range(0..size);
-            let ip = Ipv4Addr::from((u64::from(u32::from(network.network())) + offset) as u32);
-            if seen.insert(ip) {
-                output.push(ip);
-            }
-            if output.len() >= limit {
-                break;
-            }
+    let mut explicit: Vec<_> = output.iter().map(|ip| u64::from(u32::from(*ip))).collect();
+    explicit.sort_unstable();
+    let pools: Vec<_> = disjoint_custom_ranges(networks)
+        .into_iter()
+        .filter_map(|range| {
+            let first = explicit.partition_point(|&ip| ip < range.start);
+            let last = explicit.partition_point(|&ip| ip < range.end);
+            let pool = CustomNetwork {
+                range,
+                explicit: &explicit[first..last],
+            };
+            (pool.capacity() > 0).then_some(pool)
+        })
+        .collect();
+    let remaining = limit - output.len();
+    let mut quotas = vec![0; pools.len()];
+    let mut available: VecDeque<_> = (0..pools.len()).collect();
+    let mut schedule = Vec::with_capacity(remaining);
+    for _ in 0..remaining {
+        let Some(index) = available.pop_front() else {
+            break;
+        };
+        quotas[index] += 1;
+        schedule.push(index);
+        if (quotas[index] as u64) < pools[index].capacity() {
+            available.push_back(index);
         }
     }
+
+    let mut rng = rand::thread_rng();
+    let mut samples: Vec<_> = pools
+        .into_iter()
+        .zip(quotas)
+        .map(|(pool, quota)| pool.sample(quota, &mut rng).into_iter())
+        .collect();
+    output.extend(schedule.into_iter().map(|index| {
+        samples[index]
+            .next()
+            .expect("each scheduled slot has a stratified sample")
+    }));
     if output.is_empty() {
         return Err("候选列表为空，请输入 IPv4 或 CIDR".into());
     }
     Ok(output)
+}
+
+fn disjoint_custom_ranges(networks: Vec<Ipv4Net>) -> Vec<Range<u64>> {
+    let mut ranges: Vec<_> = networks
+        .into_iter()
+        .enumerate()
+        .map(|(index, network)| {
+            let start = u64::from(u32::from(network.network()));
+            let end = start + (1_u64 << (32 - network.prefix_len()));
+            (index, start..end)
+        })
+        .collect();
+    // Aligned CIDRs can only overlap by containment. Sort wider ranges first
+    // when they share a start, then restore the order of the surviving inputs.
+    ranges.sort_unstable_by_key(|(_, range)| (range.start, Reverse(range.end)));
+    let mut covered_end = 0;
+    ranges.retain(|(_, range)| {
+        if range.start < covered_end {
+            return false;
+        }
+        covered_end = range.end;
+        true
+    });
+    ranges.sort_unstable_by_key(|(index, _)| *index);
+    ranges.into_iter().map(|(_, range)| range).collect()
+}
+
+struct CustomNetwork<'a> {
+    range: Range<u64>,
+    explicit: &'a [u64],
+}
+
+impl CustomNetwork<'_> {
+    fn capacity(&self) -> u64 {
+        self.range.end - self.range.start - self.explicit.len() as u64
+    }
+
+    fn sample(&self, quota: usize, rng: &mut impl Rng) -> Vec<Ipv4Addr> {
+        let capacity = self.capacity();
+        let quota = quota as u64;
+        let mut explicit = self.explicit.iter().copied().peekable();
+        let mut skipped = 0;
+        (0..quota)
+            .map(|stratum| {
+                let start = stratum * capacity / quota;
+                let end = (stratum + 1) * capacity / quota;
+                let mut ip = self.range.start + rng.gen_range(start..end) + skipped;
+                // Strata produce increasing ranks in the available addresses.
+                // Advance past explicit IPs once as those ranks are mapped back.
+                while explicit.peek().is_some_and(|&reserved| reserved <= ip) {
+                    explicit.next();
+                    skipped += 1;
+                    ip += 1;
+                }
+                Ipv4Addr::from(ip as u32)
+            })
+            .collect()
+    }
 }
 
 /// Cover distinct /24 routing prefixes before taking another host from any
@@ -2524,7 +2654,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlimited_downloads_read_unknown_lengths_and_stop_at_the_round_deadline() {
+    async fn download_waiting_for_headers_uses_only_the_request_timeout() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let config = ScanConfig {
+            request_timeout_ms: 100,
+            download_seconds: 1,
+            ..Default::default()
+        };
+        let error = tokio::time::timeout(
+            Duration::from_millis(800),
+            measure_download_request(
+                &config,
+                Client::new().get(format!("http://{address}/download")),
+                Ipv4Addr::LOCALHOST,
+                None,
+                counter.clone(),
+            ),
+        )
+        .await
+        .expect("header timeout must fire before the body window")
+        .err()
+        .unwrap();
+        server.abort();
+        assert_eq!(error.code, ExclusionCode::HttpsTimeout);
+        assert_eq!(error.message, "等待下载响应头超时");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn unlimited_downloads_read_slow_unknown_lengths_until_the_independent_body_deadline() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2533,23 +2701,19 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
             socket.read(&mut request).await.unwrap();
-            // Unknown-length body that deliberately remains open after enough
-            // data has arrived. Unlimited mode must enforce its time limit.
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nCF-Ray: abc-HKG\r\n\r\n")
                 .await
                 .unwrap();
+            // The response header is quick, but the body arrives after the
+            // header timeout and then stays open past the body deadline.
+            tokio::time::sleep(Duration::from_millis(400)).await;
             socket.write_all(&vec![b'x'; 128 * 1024]).await.unwrap();
             std::future::pending::<()>().await;
         });
-        let response = Client::new()
-            .get(format!("http://{address}/download"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.content_length(), None);
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let config = ScanConfig {
+            request_timeout_ms: 250,
             download_budget_enabled: false,
             download_budget_mi_b: 0,
             download_seconds: 1,
@@ -2557,13 +2721,12 @@ mod tests {
         };
         let started = Instant::now();
         let sample = tokio::time::timeout(
-            Duration::from_millis(1800),
-            measure_download_response(
+            Duration::from_secs(2),
+            measure_download_request(
                 &config,
-                response,
+                Client::new().get(format!("http://{address}/download")),
                 Ipv4Addr::LOCALHOST,
                 None,
-                started,
                 counter.clone(),
             ),
         )
@@ -2624,7 +2787,7 @@ mod tests {
     }
 
     #[test]
-    fn low_budget_completes_some_front_candidates_instead_of_rejecting_every_slot() {
+    fn low_budget_preserves_complete_samples_across_regions() {
         let total = 1024 * 1024;
         let groups = BTreeMap::from([
             ("HK".into(), (0..10).collect()),
@@ -2633,31 +2796,85 @@ mod tests {
             ("US".into(), (30..40).collect()),
         ]);
         let order = vec!["HK".into(), "JP".into(), "SG".into(), "US".into()];
-        let schedule = download_schedule(&groups, &order, 2);
-        let mut samples = BTreeMap::<usize, usize>::new();
-        let mut used = 0;
-        for (slot, candidate) in schedule.iter().enumerate() {
-            let allowance = download_allowance(total, used, (schedule.len() - slot) as u64);
-            if allowance < MIN_SAMPLE_BYTES {
-                break;
+        for (rounds, expected, unfunded) in [
+            (
+                2,
+                vec![0, 10, 20, 30, 0, 10, 20, 30, 1, 11, 21, 31, 1, 11, 21, 31],
+                32,
+            ),
+            (5, vec![0, 10, 20].repeat(5), 37),
+        ] {
+            let mut queue = DownloadQueue::new(&groups, &order, rounds);
+            let mut samples = Vec::new();
+            let mut skipped = 0;
+            let mut used = 0;
+            while let Some(slot) = queue.next(Some(total), used) {
+                match slot {
+                    DownloadSlot::Round { index, allowance } => {
+                        assert_eq!(allowance, Some(MIN_SAMPLE_BYTES));
+                        used += allowance.unwrap();
+                        samples.push(index);
+                    }
+                    DownloadSlot::Unfunded(_) => skipped += 1,
+                }
             }
-            assert_eq!(allowance, MIN_SAMPLE_BYTES);
-            used += allowance;
-            *samples.entry(*candidate).or_default() += 1;
+            assert_eq!(samples, expected);
+            assert_eq!(skipped, unfunded);
+            assert_eq!(used, samples.len() as u64 * MIN_SAMPLE_BYTES);
+            assert!(used <= total);
+            assert_eq!(queue.remaining_rounds, 0);
         }
-        assert_eq!(used, total);
-        assert_eq!(samples.len(), 8);
-        assert!(samples.values().all(|rounds| *rounds == 2));
         assert_eq!(download_allowance(total, total - 1, 80), 1);
+    }
+
+    #[test]
+    fn a_failed_download_frees_the_reserved_rounds_for_the_next_region() {
+        let order: Vec<_> = ["HK", "JP", "SG", "US"].map(str::to_owned).into();
+        let groups = order
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, region)| (region, vec![index]))
+            .collect();
+        let mut queue = DownloadQueue::new(&groups, &order, 5);
+        let total = Some(1024 * 1024);
+        assert!(matches!(
+            queue.next(total, 0),
+            Some(DownloadSlot::Round { index: 0, .. })
+        ));
+        assert_eq!(queue.skip_remaining_rounds(0), 4);
+
+        let mut used = 0;
+        let mut samples = Vec::new();
+        while let Some(slot) = queue.next(total, used) {
+            let DownloadSlot::Round {
+                index,
+                allowance: Some(bytes),
+            } = slot
+            else {
+                panic!("remaining regions should all be funded");
+            };
+            assert!(bytes >= MIN_SAMPLE_BYTES);
+            used += bytes;
+            samples.push(index);
+        }
+        assert_eq!(samples, [[1, 2].repeat(5), vec![3; 5]].concat());
+        assert_eq!(used, total.unwrap());
     }
 
     #[test]
     fn huge_cidr_materializes_only_the_limit() {
         let started = Instant::now();
-        let samples = sample_candidates(&custom("0.0.0.0/0", 128)).unwrap();
+        let samples = sample_candidates(&custom(
+            "128.0.0.0/1\n0.0.0.0/0\n255.255.255.255\n0.0.0.0",
+            128,
+        ))
+        .unwrap();
         assert_eq!(samples.len(), 128);
-        assert!(samples.iter().any(|ip| u32::from(*ip) < 1 << 31));
-        assert!(samples.iter().any(|ip| u32::from(*ip) >= 1 << 31));
+        assert_eq!(&samples[..2], &[Ipv4Addr::BROADCAST, Ipv4Addr::UNSPECIFIED]);
+        assert_eq!(samples.iter().collect::<HashSet<_>>().len(), 128);
+        assert!(samples[2..].iter().any(|ip| u32::from(*ip) < 1 << 31));
+        assert!(samples[2..].iter().any(|ip| u32::from(*ip) >= 1 << 31));
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
@@ -2671,6 +2888,54 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0], "192.0.2.1".parse::<Ipv4Addr>().unwrap());
         assert!(samples.contains(&"192.0.2.0".parse::<Ipv4Addr>().unwrap()));
+    }
+
+    #[test]
+    fn dense_contained_networks_do_not_consume_the_larger_networks_quota() {
+        let base = u32::from(Ipv4Addr::new(10, 0, 0, 0));
+        let source = (0..4096)
+            .map(|offset| format!("{}/32", Ipv4Addr::from(base + offset)))
+            .chain(
+                (0..4096)
+                    .step_by(2)
+                    .map(|offset| format!("{}/31", Ipv4Addr::from(base + offset))),
+            )
+            .chain(["10.0.3.1/16".into()])
+            .collect::<Vec<_>>()
+            .join("\n");
+        let samples = sample_candidates(&custom(&source, 10000)).unwrap();
+        assert_eq!(samples.len(), 10000);
+        assert_eq!(samples.iter().collect::<HashSet<_>>().len(), 10000);
+        assert!(samples.iter().all(|ip| ip.octets()[..2] == [10, 0]));
+        assert!(samples.iter().any(|ip| ip.octets()[2] >= 16));
+    }
+
+    #[test]
+    fn custom_sampling_prioritizes_explicit_ips_and_redistributes_exhausted_networks() {
+        let source = "198.51.100.255/32\n192.0.2.0/30\n255.255.255.254/31\n192.0.2.1\n255.255.255.255\n192.0.2.0\n192.0.2.1";
+        let expected: Vec<Ipv4Addr> = [
+            "192.0.2.1",
+            "255.255.255.255",
+            "192.0.2.0",
+            "198.51.100.255",
+            "192.0.2.2",
+            "255.255.255.254",
+            "192.0.2.3",
+        ]
+        .map(|ip| ip.parse().unwrap())
+        .into();
+        assert_eq!(
+            sample_candidates(&custom(source, 2)).unwrap(),
+            expected[..2]
+        );
+        assert_eq!(sample_candidates(&custom(source, 100)).unwrap(), expected);
+    }
+
+    #[test]
+    fn invalid_custom_sampling_limits_return_an_error() {
+        for limit in [0, 10001] {
+            assert!(sample_candidates(&custom("192.0.2.1", limit)).is_err());
+        }
     }
 
     #[test]
@@ -3438,10 +3703,19 @@ mod tests {
             ("US".into(), vec![3, 4]),
         ]);
         let regions = vec!["HK".into(), "JP".into(), "US".into()];
-        assert_eq!(
-            download_schedule(&groups, &regions, 2),
-            vec![0, 2, 3, 0, 2, 3, 1, 4, 1, 4]
-        );
+        let expected = vec![0, 2, 3, 0, 2, 3, 1, 4, 1, 4];
+        assert_eq!(download_schedule(&groups, &regions, 2), expected);
+        let mut queue = DownloadQueue::new(&groups, &regions, 2);
+        let actual: Vec<_> = std::iter::from_fn(|| queue.next(None, 0))
+            .map(|slot| match slot {
+                DownloadSlot::Round {
+                    index,
+                    allowance: None,
+                } => index,
+                _ => panic!("unlimited downloads should never be budgeted"),
+            })
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -3478,10 +3752,41 @@ mod tests {
     #[tokio::test]
     async fn tcp_measures_a_real_local_listener() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let ms = tcp_probe(listener.local_addr().unwrap(), Duration::from_secs(1))
+        let ms = measure_tcp_connect(listener.local_addr().unwrap(), Duration::from_secs(1))
             .await
             .unwrap();
         assert!(ms.is_finite() && ms >= 0.0 && ms < 1000.0);
+    }
+
+    #[tokio::test]
+    async fn initial_tcp_refusal_retains_elapsed_time_and_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let config = ScanConfig {
+            target_url: format!("https://example.com:{port}/"),
+            ..custom("127.0.0.1", 1)
+        };
+        let outcome = run_scan(config, CancellationToken::new(), Arc::new(|_| {}))
+            .await
+            .unwrap();
+        let result = &outcome.results[0];
+        let failure = result.tcp_connect_failure.as_ref().unwrap();
+        assert_eq!(result.tcp_ms, 0.0);
+        assert_eq!(result.exclusion_code, Some(ExclusionCode::TcpConnect));
+        assert_eq!(
+            result.exclusion_reason.as_deref(),
+            Some(failure.exclusion_reason().as_str())
+        );
+        assert_eq!(failure.kind, TcpConnectFailureKind::Connect);
+        assert!(failure
+            .elapsed_ms
+            .is_some_and(|ms| ms.is_finite() && ms >= 0.0));
+        assert!(failure.message.is_some());
+        let snapshot = serde_json::to_value(result).unwrap();
+        assert_eq!(snapshot["tcpConnectFailure"]["kind"], "connect");
+        let restored: IpResult = serde_json::from_value(snapshot).unwrap();
+        assert!(restored.tcp_connect_failure.is_some());
     }
 
     #[tokio::test]
@@ -3554,16 +3859,12 @@ mod tls_tests {
         /// Trust exists only in the test binary. Production always builds its
         /// client from the normal platform-independent rustls trust roots.
         fn trusted_client(&self) -> Client {
-            client_builder_for_ip(
-                &ScanConfig::default(),
-                &self.target(),
-                Ipv4Addr::LOCALHOST,
-                Duration::from_secs(3),
-            )
-            .unwrap()
-            .add_root_certificate(reqwest::Certificate::from_der(&self.certificate).unwrap())
-            .build()
-            .unwrap()
+            client_builder_for_ip(&ScanConfig::default(), &self.target(), Ipv4Addr::LOCALHOST)
+                .unwrap()
+                .timeout(Duration::from_secs(3))
+                .add_root_certificate(reqwest::Certificate::from_der(&self.certificate).unwrap())
+                .build()
+                .unwrap()
         }
 
         async fn finish(self) -> Result<ObservedRequest, String> {
@@ -3675,15 +3976,10 @@ mod tls_tests {
         let fixture = fixture(FIXTURE_HOST, false).await;
         let target = fixture.target();
         // This is exactly the production client, with no test root installed.
-        let client = client_for_ip(
-            &ScanConfig::default(),
-            &target,
-            Ipv4Addr::LOCALHOST,
-            Duration::from_secs(3),
-        )
-        .unwrap();
+        let client = client_for_ip(&ScanConfig::default(), &target, Ipv4Addr::LOCALHOST).unwrap();
         let error = client
             .get(target)
+            .timeout(Duration::from_secs(3))
             .send()
             .await
             .expect_err("accepted self-signed certificate");

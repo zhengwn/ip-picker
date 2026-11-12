@@ -370,13 +370,13 @@ impl FavoriteLibrary {
     }
 }
 
-fn checked_ipv4(ip: &str) -> Result<Ipv4Addr, String> {
+pub(crate) fn checked_ipv4(ip: &str) -> Result<Ipv4Addr, String> {
     ip.trim().parse::<Ipv4Addr>().map_err(|_| {
         "请输入一个有效的 IPv4 地址，例如 104.16.1.1（不支持域名、CIDR 或 IPv6）".into()
     })
 }
 
-fn was_attempted(result: &IpResult) -> bool {
+pub(crate) fn was_attempted(result: &IpResult) -> bool {
     result.tcp_ms > 0.0
         || result.attempts > 0
         || result
@@ -426,6 +426,7 @@ mod tests {
                     sample_ip: result.ip.clone(),
                     interface_name: "en0".into(),
                     tunnel_interface: false,
+                    interface_kind: None,
                     captured_at: "2026-10-23T00:00:01Z".into(),
                 }),
                 ..Default::default()

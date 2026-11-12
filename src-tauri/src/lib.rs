@@ -1,8 +1,12 @@
+mod checkpoint;
 #[cfg(feature = "desktop-smoke")]
 mod desktop_smoke;
 pub mod engine;
 mod favorites;
+mod history;
 mod instance;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 pub mod model;
 pub mod network;
 pub mod stability;
@@ -12,7 +16,8 @@ use crate::{
     engine::{
         prepare_scan, run_targeted_scan, EngineOutcome, EngineUpdate, PreparedScan, UpdateCallback,
     },
-    favorites::{FavoriteLibrary, FavoriteTestJob, FavoriteTestStart},
+    favorites::{checked_ipv4, FavoriteLibrary, FavoriteTestJob, FavoriteTestStart},
+    history::{compare_ip, HistoryEntry, HistoryKind, HistorySummary, ScanHistory, HISTORY_LIMIT},
     model::{ScanCommandError, ScanConfig, ScanProgress, ScanRun},
     storage::SavedState,
 };
@@ -27,6 +32,7 @@ use std::{
 };
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Keep slow UI serialization out of the network task. The single watch slot
@@ -60,6 +66,7 @@ where
 struct RuntimeState {
     saved: SavedState,
     cancellation: Option<CancellationToken>,
+    worker: Option<watch::Receiver<()>>,
 }
 
 impl RuntimeState {
@@ -68,11 +75,12 @@ impl RuntimeState {
         config: ScanConfig,
         token: CancellationToken,
         path: &std::path::Path,
+        persist_config: bool,
     ) -> Result<(ScanRun, PreparedScan), ScanCommandError> {
         if self.has_active_measurement() {
             return Err("已有测试正在运行，请先停止并等待结束".into());
         }
-        // Parse every custom entry and sample once before replacing history.
+        // Parse every custom entry and sample once before replacing the latest run.
         let prepared = prepare_scan(config.clone())?;
         let run = ScanRun {
             id: uuid::Uuid::new_v4().to_string(),
@@ -84,7 +92,7 @@ impl RuntimeState {
             results: Vec::new(),
             error: None,
         };
-        self.begin(run.clone(), token, path)?;
+        self.begin(run.clone(), token, path, persist_config)?;
         Ok((run, prepared))
     }
 
@@ -112,7 +120,7 @@ impl RuntimeState {
     ) -> Result<FavoriteLibrary, String> {
         next.favorites.revision = self.saved.favorites.next_revision()?;
         next.warning = None;
-        storage::save(path, &next)?;
+        storage::save_replacing_history(path, &next, &self.saved.scan_history)?;
         self.saved = next;
         Ok(self.saved.favorites.clone())
     }
@@ -128,6 +136,7 @@ impl RuntimeState {
         // Work from the latest state while holding the caller's mutex. A scan
         // update cannot be overwritten by a separately loaded saved snapshot.
         let mut next = self.saved.clone();
+        next.apply_pending_favorite_results();
         change(&self.saved, &mut next.favorites)?;
         self.commit_favorites(next, path)
     }
@@ -137,17 +146,25 @@ impl RuntimeState {
         run: ScanRun,
         token: CancellationToken,
         path: &std::path::Path,
+        persist_config: bool,
     ) -> Result<(), String> {
         if self.has_active_measurement() {
             return Err("已有测试正在运行，请先停止并等待结束".into());
         }
         let old_saved = self.saved.clone();
         let old_token = self.cancellation.clone();
-        self.saved.config = run.config.clone();
-        self.saved.last_run = Some(run);
+        if persist_config {
+            self.saved.config = run.config.clone();
+        }
+        if let Some(previous) = self.saved.last_run.replace(run) {
+            self.saved.archive_run(HistoryKind::Scan, previous);
+        }
         self.saved.warning = None;
+        self.saved.measurement_revision = 0;
         self.cancellation = Some(token);
-        if let Err(error) = storage::save(path, &self.saved) {
+        if let Err(error) =
+            storage::save_replacing_history(path, &self.saved, &old_saved.scan_history)
+        {
             self.saved = old_saved;
             self.cancellation = old_token;
             return Err(error);
@@ -169,6 +186,7 @@ impl RuntimeState {
             return Err("已有测试正在运行，请先停止并等待结束".into());
         }
         let mut next = self.saved.clone();
+        next.apply_pending_favorite_results();
         // Capture pending user settings before prepare_test replaces the source
         // with the explicit targets. A targeted test can legitimately ignore an
         // empty custom source, but that invalid source must not become active.
@@ -191,10 +209,45 @@ impl RuntimeState {
             ip,
             note,
         )?;
-        next.favorite_test = Some(job.clone());
+        if let Some(previous) = next.favorite_test.replace(job.clone()) {
+            next.archive_run(HistoryKind::Favorite, previous.run);
+        }
+        next.measurement_revision = 0;
         let favorites = self.commit_favorites(next, path)?;
         self.cancellation = Some(token);
         Ok((FavoriteTestStart { favorites, job }, ips))
+    }
+
+    fn complete_scan(
+        &mut self,
+        run_id: &str,
+        outcome: Result<EngineOutcome, String>,
+        cancelled: bool,
+        path: &std::path::Path,
+    ) -> Option<(ScanRun, Option<String>)> {
+        let run = self.saved.last_run.as_mut()?;
+        if run.id != run_id || run.status != "running" {
+            return None;
+        }
+        finish_run(run, outcome, cancelled);
+        let snapshot = run.clone();
+        self.cancellation = None;
+        let previous_history = self.saved.scan_history.clone();
+        self.saved.retain_recent_history();
+        let warning = match storage::save_replacing_history(path, &self.saved, &previous_history) {
+            Ok(()) => {
+                storage::clear_checkpoint(path);
+                None
+            }
+            Err(error) => {
+                self.saved.scan_history = previous_history;
+                self.saved.warning = Some(error.clone());
+                Some(format!(
+                    "本轮结果尚未保存到本地，可先复制需要的 IP：{error}"
+                ))
+            }
+        };
+        Some((snapshot, warning))
     }
 
     /// Commit each row and the terminal job in one atomic saved-state write.
@@ -214,11 +267,15 @@ impl RuntimeState {
         finish_run(&mut job.run, outcome, cancelled);
         job.record_observed_regions();
         self.cancellation = None;
+        self.saved.pending_favorite_results = true;
         let mut next = self.saved.clone();
-        next.favorites
-            .apply_test_results(next.favorite_test.as_ref().unwrap());
+        next.apply_pending_favorite_results();
+        next.retain_recent_history();
         let warning = match self.commit_favorites(next, path) {
-            Ok(_) => None,
+            Ok(_) => {
+                storage::clear_checkpoint(path);
+                None
+            }
             Err(error) => {
                 self.saved.warning = Some(error.clone());
                 Some(format!(
@@ -236,6 +293,12 @@ impl RuntimeState {
     }
 
     fn interrupt_for_shutdown(&mut self, path: &std::path::Path) -> Result<(), String> {
+        if !self.has_active_measurement()
+            && !self.saved.pending_favorite_results
+            && self.saved.warning.is_none()
+        {
+            return Ok(());
+        }
         if let Some(token) = &self.cancellation {
             token.cancel();
         }
@@ -260,12 +323,19 @@ impl RuntimeState {
             .filter(|job| job.run.status == "running")
         {
             job.interrupt("关闭应用时收藏测速中断，已保留已完成数据");
-            next.favorites.apply_test_results(job);
+            next.pending_favorite_results = true;
+        }
+        next.retain_recent_history();
+        if next.pending_favorite_results {
+            next.apply_pending_favorite_results();
             self.commit_favorites(next, path)?;
         } else {
-            storage::save(path, &next)?;
+            next.warning = None;
+            storage::save_replacing_history(path, &next, &self.saved.scan_history)?;
             self.saved = next;
         }
+        self.cancellation = None;
+        storage::clear_checkpoint(path);
         Ok(())
     }
 }
@@ -311,16 +381,78 @@ fn finish_run(run: &mut ScanRun, outcome: Result<EngineOutcome, String>, cancell
 struct AppState {
     inner: Arc<Mutex<RuntimeState>>,
     storage_path: PathBuf,
+    shutdown_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl AppState {
+    fn start_checkpoint_writer(
+        &self,
+        kind: HistoryKind,
+        run_id: String,
+    ) -> (watch::Sender<u64>, tokio::task::JoinHandle<()>) {
+        let state = self.clone();
+        checkpoint::start(move |requested_revision| {
+            let (run, revision) = {
+                let inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
+                let run = match kind {
+                    HistoryKind::Scan => inner.saved.last_run.as_ref(),
+                    HistoryKind::Favorite => inner.saved.favorite_test.as_ref().map(|job| &job.run),
+                };
+                let Some(run) = run.filter(|run| run.id == run_id && run.status == "running")
+                else {
+                    return Ok(requested_revision);
+                };
+                (run.clone(), inner.saved.measurement_revision)
+            };
+            storage::save_checkpoint(&state.storage_path, &run, revision)?;
+            Ok(revision)
+        })
+    }
+
+    async fn prepare_shutdown(&self) -> Result<Option<FavoriteLibrary>, String> {
+        let _gate = self.shutdown_gate.lock().await;
+        let worker = {
+            let inner = self.inner.lock().map_err(|_| "应用状态不可用")?;
+            if let Some(token) = &inner.cancellation {
+                token.cancel();
+            }
+            inner.worker.clone()
+        };
+        if let Some(mut worker) = worker {
+            // The worker holds its sender through the final write and events.
+            let _ = worker.changed().await;
+        }
+
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
+            let revision = inner.saved.favorites.revision;
+            inner.interrupt_for_shutdown(&state.storage_path)?;
+            Ok((inner.saved.favorites.revision != revision).then(|| inner.saved.favorites.clone()))
+        })
+        .await
+        .map_err(|error| format!("等待测速保存失败：{error}"))?
+    }
+}
+
+#[tauri::command]
+async fn prepare_shutdown(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(favorites) = state.prepare_shutdown().await? {
+        let _ = app.emit("favorites-update", favorites);
+    }
+    Ok(())
 }
 
 #[tauri::command]
 fn load_state(state: State<'_, AppState>) -> Result<SavedState, String> {
-    Ok(state
+    let mut snapshot = state
         .inner
         .lock()
         .map_err(|_| "应用状态不可用")?
         .saved
-        .clone())
+        .clone();
+    snapshot.scan_history.clear();
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -332,6 +464,44 @@ fn get_scan(state: State<'_, AppState>) -> Result<Option<ScanRun>, String> {
         .saved
         .last_run
         .clone())
+}
+
+#[tauri::command]
+fn get_scan_history(state: State<'_, AppState>) -> Result<ScanHistory, String> {
+    let inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
+    let entries = inner
+        .saved
+        .recent_history()
+        .into_iter()
+        .map(|(kind, run)| HistorySummary::new(kind, run))
+        .collect();
+    Ok(ScanHistory {
+        limit: HISTORY_LIMIT,
+        entries,
+    })
+}
+
+#[tauri::command]
+fn get_scan_history_run(
+    run_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<ScanRun>, String> {
+    let inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
+    Ok(inner
+        .saved
+        .recent_history()
+        .into_iter()
+        .find_map(|(_, run)| (run.id == run_id).then(|| run.clone())))
+}
+
+#[tauri::command]
+fn compare_scan_history_ip(
+    ip: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<HistoryEntry>, String> {
+    let ip = checked_ipv4(&ip)?.to_string();
+    let inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
+    Ok(compare_ip(inner.saved.recent_history(), &ip))
 }
 
 #[tauri::command]
@@ -492,12 +662,12 @@ async fn start_favorite_test(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<FavoriteTestStart, String> {
+    let _gate = state.shutdown_gate.try_lock().map_err(|_| "窗口正在关闭")?;
     let cancellation = CancellationToken::new();
-    let (started, ips) = state
-        .inner
-        .lock()
-        .map_err(|_| "应用状态不可用")?
-        .begin_favorite_test(
+    let (done, worker) = watch::channel(());
+    let (started, ips) = {
+        let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
+        let started = inner.begin_favorite_test(
             config,
             folder_id.as_deref(),
             favorite_id.as_deref(),
@@ -506,6 +676,9 @@ async fn start_favorite_test(
             cancellation.clone(),
             &state.storage_path,
         )?;
+        inner.worker = Some(worker);
+        started
+    };
     let _ = app.emit("favorites-update", started.favorites.clone());
     let _ = app.emit("favorite-test-update", started.job.clone());
     let owned_state = state.inner().clone();
@@ -515,6 +688,8 @@ async fn start_favorite_test(
         let callback_state = owned_state.clone();
         let callback_app = app.clone();
         let callback_id = run_id.clone();
+        let (checkpoint_updates, checkpoint_writer) =
+            owned_state.start_checkpoint_writer(HistoryKind::Favorite, run_id.clone());
         let (callback, forwarder) = progress_bridge(move |update: EngineUpdate| {
             let snapshot = callback_state.inner.lock().ok().and_then(|mut inner| {
                 let current = inner.saved.favorite_test.as_mut()?;
@@ -524,14 +699,20 @@ async fn start_favorite_test(
                 current.run.progress = update.progress;
                 current.run.results = update.results;
                 current.record_observed_regions();
-                Some(current.clone())
+                let snapshot = current.clone();
+                inner.saved.measurement_revision += 1;
+                Some((snapshot, inner.saved.measurement_revision))
             });
-            if let Some(snapshot) = snapshot {
+            if let Some((snapshot, revision)) = snapshot {
+                if snapshot.run.results.iter().any(favorites::was_attempted) {
+                    checkpoint_updates.send_replace(revision);
+                }
                 let _ = callback_app.emit("favorite-test-update", snapshot);
             }
         });
         let outcome = run_targeted_scan(config, ips, cancellation.clone(), callback).await;
         let _ = forwarder.await;
+        let _ = checkpoint_writer.await;
         let completed = owned_state.inner.lock().ok().and_then(|mut inner| {
             inner.complete_favorite_test(
                 &run_id,
@@ -547,6 +728,7 @@ async fn start_favorite_test(
             let _ = app.emit("favorites-update", snapshot.favorites);
             let _ = app.emit("favorite-test-update", snapshot.job);
         }
+        drop(done);
     });
     Ok(started)
 }
@@ -570,13 +752,23 @@ fn cancel_favorite_test(run_id: String, state: State<'_, AppState>) -> Result<()
 #[tauri::command]
 async fn start_scan(
     config: ScanConfig,
+    persist_config: Option<bool>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanRun, ScanCommandError> {
+    let _gate = state.shutdown_gate.try_lock().map_err(|_| "窗口正在关闭")?;
     let cancellation = CancellationToken::new();
+    let (done, worker) = watch::channel(());
     let (run, prepared) = {
         let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
-        inner.begin_scan(config, cancellation.clone(), &state.storage_path)?
+        let started = inner.begin_scan(
+            config,
+            cancellation.clone(),
+            &state.storage_path,
+            persist_config.unwrap_or(true),
+        )?;
+        inner.worker = Some(worker);
+        started
     };
     let owned_state = state.inner().clone();
     let run_id = run.id.clone();
@@ -584,6 +776,8 @@ async fn start_scan(
         let callback_state = owned_state.clone();
         let callback_app = app.clone();
         let callback_id = run_id.clone();
+        let (checkpoint_updates, checkpoint_writer) =
+            owned_state.start_checkpoint_writer(HistoryKind::Scan, run_id.clone());
         let (callback, forwarder) = progress_bridge(move |update: EngineUpdate| {
             let snapshot = callback_state.inner.lock().ok().and_then(|mut inner| {
                 let current = inner.saved.last_run.as_mut()?;
@@ -592,10 +786,15 @@ async fn start_scan(
                 }
                 current.progress = update.progress;
                 current.results = update.results;
-                Some(current.clone())
+                let snapshot = current.clone();
+                inner.saved.measurement_revision += 1;
+                Some((snapshot, inner.saved.measurement_revision))
             });
             // Serialization can be expensive; never retain the state lock here.
-            if let Some(snapshot) = snapshot {
+            if let Some((snapshot, revision)) = snapshot {
+                if snapshot.results.iter().any(favorites::was_attempted) {
+                    checkpoint_updates.send_replace(revision);
+                }
                 let _ = callback_app.emit("scan-update", snapshot);
             }
         });
@@ -603,63 +802,24 @@ async fn start_scan(
         // The scan drops its callback sender. Drain the last queued snapshot
         // before publishing the authoritative completed/cancelled result.
         let _ = forwarder.await;
-        if let Ok(mut inner) = owned_state.inner.lock() {
-            if let Some(current) = inner.saved.last_run.as_mut() {
-                if current.id != run_id {
-                    return;
-                }
-                match outcome {
-                    Ok(outcome) => {
-                        current.progress = outcome.progress;
-                        current.results = outcome.results;
-                        current.status = if cancellation.is_cancelled() {
-                            "cancelled"
-                        } else {
-                            "completed"
-                        }
-                        .into();
-                    }
-                    Err(error) => {
-                        current.status = if cancellation.is_cancelled() {
-                            "cancelled"
-                        } else {
-                            "failed"
-                        }
-                        .into();
-                        current.error = Some(error);
-                    }
-                }
-                current.progress.stage = current.status.clone();
-                current.progress.stability_batch = None;
-                current.progress.precision_batch = None;
-                current.finished_at = Some(chrono::Utc::now().to_rfc3339());
-                if current.status != "completed" {
-                    for result in &mut current.results {
-                        result.role = Some("candidate".into());
-                        if current.status == "cancelled" {
-                            result.mark_cancelled(&current.config);
-                        }
-                    }
-                    current.progress.message = if current.status == "cancelled" {
-                        "测试已停止，保留已完成数据"
-                    } else {
-                        "测试失败，请查看错误详情"
-                    }
-                    .into();
-                }
+        // The progress forwarder owns the checkpoint sender. Join any write
+        // already in flight before the authoritative terminal state is saved.
+        let _ = checkpoint_writer.await;
+        let completed = owned_state.inner.lock().ok().and_then(|mut inner| {
+            inner.complete_scan(
+                &run_id,
+                outcome,
+                cancellation.is_cancelled(),
+                &owned_state.storage_path,
+            )
+        });
+        if let Some((snapshot, warning)) = completed {
+            if let Some(warning) = warning {
+                let _ = app.emit("storage-warning", warning);
             }
-            inner.cancellation = None;
-            if let Err(error) = storage::save(&owned_state.storage_path, &inner.saved) {
-                inner.saved.warning = Some(error.clone());
-                let _ = app.emit(
-                    "storage-warning",
-                    format!("本轮结果尚未保存到本地，可先复制需要的 IP：{error}"),
-                );
-            }
-            if let Some(current) = inner.saved.last_run.as_ref() {
-                let _ = app.emit("scan-update", current.clone());
-            }
+            let _ = app.emit("scan-update", snapshot);
         }
+        drop(done);
     });
     Ok(run)
 }
@@ -693,6 +853,10 @@ fn copy_text(text: String, app: tauri::AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default().plugin(tauri_plugin_clipboard_manager::init());
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .menu(macos_menu::menu)
+        .on_menu_event(macos_menu::on_menu_event);
     let context = tauri::generate_context!();
     #[cfg(feature = "desktop-smoke")]
     let (builder, context) = desktop_smoke::configure(builder, context);
@@ -712,25 +876,20 @@ pub fn run() {
                 inner: Arc::new(Mutex::new(RuntimeState {
                     saved,
                     cancellation: None,
+                    worker: None,
                 })),
                 storage_path: path,
+                shutdown_gate: Arc::default(),
             });
             Ok(())
         })
-        .on_window_event(|window, event| {
-            // The frontend may prevent CloseRequested while it saves pending
-            // parameters. Only cancel tasks and save once closing is committed.
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                if let Some(state) = window.try_state::<AppState>() {
-                    if let Ok(mut inner) = state.inner.lock() {
-                        let _ = inner.interrupt_for_shutdown(&state.storage_path);
-                    };
-                }
-            }
-        })
         .invoke_handler(tauri::generate_handler![
             load_state,
+            prepare_shutdown,
             get_scan,
+            get_scan_history,
+            get_scan_history_run,
+            compare_scan_history_ip,
             get_favorites,
             get_favorite_test,
             save_config,
@@ -808,6 +967,243 @@ mod lifecycle_tests {
         }
     }
 
+    #[tokio::test]
+    async fn shutdown_waits_for_final_observations_and_can_retry_a_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let token = CancellationToken::new();
+        let (done, worker) = watch::channel(());
+        let mut inner = RuntimeState {
+            saved: SavedState::default(),
+            cancellation: None,
+            worker: Some(worker),
+        };
+        let mut active = run("closing-scan");
+        active.status = "running".into();
+        inner.begin(active, token.clone(), &path, true).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let state = AppState {
+            inner: Arc::new(Mutex::new(inner)),
+            storage_path: path.clone(),
+            shutdown_gate: Arc::default(),
+        };
+
+        let close_state = state.clone();
+        let closing = tokio::spawn(async move { close_state.prepare_shutdown().await });
+        token.cancelled().await;
+        assert!(!closing.is_finished());
+        let mut row = model::IpResult::new(Ipv4Addr::LOCALHOST);
+        row.tcp_ms = 42.0;
+        let (snapshot, warning) = state
+            .inner
+            .lock()
+            .unwrap()
+            .complete_scan(
+                "closing-scan",
+                Ok(EngineOutcome {
+                    progress: ScanProgress::default(),
+                    results: vec![row],
+                    cancelled: true,
+                }),
+                true,
+                &path,
+            )
+            .unwrap();
+        assert_eq!(snapshot.status, "cancelled");
+        assert!(warning.is_some());
+        drop(done);
+        assert!(closing.await.unwrap().is_err());
+
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, original).unwrap();
+        state.prepare_shutdown().await.unwrap();
+        let durable = storage::load(&path).unwrap().last_run.unwrap();
+        assert_eq!(durable.status, "cancelled");
+        assert_eq!(durable.results[0].tcp_ms, 42.0);
+    }
+
+    #[test]
+    fn quick_scan_persists_the_run_with_its_own_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut inner = RuntimeState {
+            saved: SavedState::default(),
+            cancellation: None,
+            worker: None,
+        };
+        let config = ScanConfig {
+            max_candidates: 100,
+            ..ScanConfig::default()
+        };
+        let (started, _) = inner
+            .begin_scan(config, CancellationToken::new(), &path, false)
+            .unwrap();
+        let saved = storage::load(&path).unwrap();
+        assert_eq!(
+            saved.config.max_candidates,
+            ScanConfig::default().max_candidates
+        );
+        let persisted = saved.last_run.unwrap();
+        assert_eq!(persisted.id, started.id);
+        assert_eq!(persisted.config.max_candidates, 100);
+    }
+
+    #[test]
+    fn history_survives_retesting_the_same_ip_and_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let ip = "104.16.1.1";
+        let mut row = model::IpResult::new(ip.parse().unwrap());
+        row.tcp_ms = 22.0;
+        let mut older = run("existing-scan");
+        older.started_at = "2000-01-01T00:00:00Z".into();
+        older.finished_at = Some("2000-01-01T00:01:00Z".into());
+        older.results.push(row.clone());
+        let saved = SavedState {
+            last_run: Some(older.clone()),
+            ..Default::default()
+        };
+        storage::save(&path, &saved).unwrap();
+        let mut inner = RuntimeState {
+            saved: storage::load(&path).unwrap(),
+            cancellation: None,
+            worker: None,
+        };
+        assert_eq!(inner.saved.recent_history()[0].1.id, older.id);
+        assert!(inner.saved.scan_history.is_empty());
+
+        let folder = inner.saved.favorites.folders[0].id.clone();
+        for (interface, kind, tcp_ms) in [
+            ("en7", network::InterfaceKind::Wired, 40.0),
+            ("en0", network::InterfaceKind::Wifi, 200.0),
+        ] {
+            let (started, _) = inner
+                .begin_favorite_test(
+                    ScanConfig::default(),
+                    Some(&folder),
+                    None,
+                    Some(ip),
+                    None,
+                    CancellationToken::new(),
+                    &path,
+                )
+                .unwrap();
+            row.tcp_ms = tcp_ms;
+            let outcome = EngineOutcome {
+                progress: ScanProgress {
+                    network_path: Some(network::NetworkPath {
+                        sample_ip: ip.into(),
+                        interface_name: interface.into(),
+                        tunnel_interface: false,
+                        interface_kind: Some(kind),
+                        captured_at: started.job.run.started_at,
+                    }),
+                    ..Default::default()
+                },
+                results: vec![row.clone()],
+                cancelled: false,
+            };
+            let (_, warning) = inner
+                .complete_favorite_test(&started.job.run.id, Ok(outcome), false, &path)
+                .unwrap();
+            assert!(warning.is_none());
+        }
+        let restored = storage::load(&path).unwrap();
+        assert_eq!(restored.scan_history.len(), 1);
+        let matches = compare_ip(restored.recent_history(), ip);
+        let comparisons: Vec<_> = matches
+            .iter()
+            .map(|entry| {
+                (
+                    entry
+                        .run
+                        .progress
+                        .network_path
+                        .as_ref()
+                        .map(|p| p.interface_name.as_str()),
+                    entry.run.results[0].tcp_ms,
+                )
+            })
+            .collect();
+        assert_eq!(
+            comparisons,
+            [(Some("en0"), 200.0), (Some("en7"), 40.0), (None, 22.0)]
+        );
+        assert!(matches!(matches[0].kind, HistoryKind::Favorite));
+        assert!(matches!(matches[2].kind, HistoryKind::Scan));
+    }
+
+    #[test]
+    fn history_caps_mixed_runs_and_skips_unobserved_cancellations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut older = run("old-favorite");
+        older
+            .results
+            .push(model::IpResult::new(Ipv4Addr::LOCALHOST));
+        let mut inner = RuntimeState {
+            saved: SavedState {
+                favorite_test: Some(FavoriteTestJob {
+                    run: older,
+                    favorite_ids: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            cancellation: None,
+            worker: None,
+        };
+        for number in 0..HISTORY_LIMIT + 1 {
+            let mut pending = run(&format!("scan-{number}"));
+            pending.status = "running".into();
+            pending.started_at = format!("2026-11-01T00:00:{number:02}Z");
+            inner
+                .begin(pending.clone(), CancellationToken::new(), &path, true)
+                .unwrap();
+            let mut row = model::IpResult::new(Ipv4Addr::LOCALHOST);
+            row.tcp_ms = 20.0;
+            let (_, warning) = inner
+                .complete_scan(
+                    &pending.id,
+                    Ok(EngineOutcome {
+                        progress: pending.progress,
+                        results: vec![row],
+                        cancelled: false,
+                    }),
+                    false,
+                    &path,
+                )
+                .unwrap();
+            assert!(warning.is_none());
+        }
+        let mut pending = run("empty-interruption");
+        pending.status = "running".into();
+        pending.started_at = "2026-11-01T00:01:00Z".into();
+        pending
+            .results
+            .push(model::IpResult::new(Ipv4Addr::LOCALHOST));
+        inner
+            .begin(pending, CancellationToken::new(), &path, true)
+            .unwrap();
+        inner.interrupt_for_shutdown(&path).unwrap();
+
+        let restored = storage::load(&path).unwrap();
+        let latest = restored.recent_history();
+        assert_eq!(latest.len(), HISTORY_LIMIT);
+        assert_eq!(restored.scan_history.len(), HISTORY_LIMIT);
+        assert_eq!(
+            std::fs::read_dir(path.with_extension("history"))
+                .unwrap()
+                .count(),
+            HISTORY_LIMIT
+        );
+        assert_eq!(latest[0].1.id, format!("scan-{HISTORY_LIMIT}"));
+        assert_eq!(latest[HISTORY_LIMIT - 1].1.id, "scan-1");
+        assert_eq!(restored.last_run.unwrap().id, "empty-interruption");
+        assert_eq!(restored.favorite_test.unwrap().run.id, "old-favorite");
+    }
+
     #[test]
     fn every_favorite_crud_commit_allocates_a_persisted_revision() {
         let dir = tempfile::tempdir().unwrap();
@@ -815,6 +1211,7 @@ mod lifecycle_tests {
         let mut inner = RuntimeState {
             saved: SavedState::default(),
             cancellation: None,
+            worker: None,
         };
         inner.saved.favorites.revision = 40;
         let mut previous_run = run("main");
@@ -869,7 +1266,7 @@ mod lifecycle_tests {
         );
         // Reads and a normal scan do not allocate a library revision.
         inner
-            .begin(run("other-main"), CancellationToken::new(), &path)
+            .begin(run("other-main"), CancellationToken::new(), &path, true)
             .unwrap();
         assert_eq!(inner.saved.favorites.revision, 47);
         assert_eq!(storage::load(&path).unwrap().favorites.revision, 47);
@@ -882,6 +1279,7 @@ mod lifecycle_tests {
         let mut inner = RuntimeState {
             saved: SavedState::default(),
             cancellation: None,
+            worker: None,
         };
         let folder = inner.saved.favorites.folders[0].id.clone();
         let (late_start_response, _) = inner
@@ -964,6 +1362,7 @@ mod lifecycle_tests {
         let mut inner = RuntimeState {
             saved: SavedState::default(),
             cancellation: None,
+            worker: None,
         };
         inner.saved.favorites.revision = 7;
         let original = serde_json::to_value(&inner.saved).unwrap();
@@ -999,6 +1398,7 @@ mod lifecycle_tests {
         let mut inner = RuntimeState {
             saved: SavedState::default(),
             cancellation: None,
+            worker: None,
         };
         let folder = inner.saved.favorites.folders[0].id.clone();
         let token = CancellationToken::new();
@@ -1052,6 +1452,7 @@ mod lifecycle_tests {
                 ..Default::default()
             },
             cancellation: None,
+            worker: None,
         };
         let mut next = run("new");
         next.status = "running".into();
@@ -1059,7 +1460,8 @@ mod lifecycle_tests {
             .begin(
                 next,
                 CancellationToken::new(),
-                &blocking_file.join("state.json")
+                &blocking_file.join("state.json"),
+                true,
             )
             .is_err());
         assert_eq!(inner.saved.last_run.unwrap().id, "old");
@@ -1080,6 +1482,7 @@ mod lifecycle_tests {
                 ..SavedState::default()
             },
             cancellation: None,
+            worker: None,
         };
         storage::save(&path, &inner.saved).unwrap();
         let original_file = std::fs::read(&path).unwrap();
@@ -1098,7 +1501,7 @@ mod lifecycle_tests {
             };
             let validation = config.validate_with_candidates().unwrap_err();
             let startup_error = inner
-                .begin_scan(config, CancellationToken::new(), &path)
+                .begin_scan(config, CancellationToken::new(), &path, true)
                 .unwrap_err();
             assert_eq!(
                 serde_json::to_value(startup_error).unwrap(),
@@ -1120,6 +1523,7 @@ mod lifecycle_tests {
                 ..SavedState::default()
             },
             cancellation: None,
+            worker: None,
         };
         storage::save(&path, &inner.saved).unwrap();
         let original_file = std::fs::read(&path).unwrap();
@@ -1130,7 +1534,12 @@ mod lifecycle_tests {
             ..ScanConfig::default()
         };
         assert!(inner
-            .begin_scan(config, CancellationToken::new(), &path.join("blocked"))
+            .begin_scan(
+                config,
+                CancellationToken::new(),
+                &path.join("blocked"),
+                true
+            )
             .is_err());
         assert_eq!(serde_json::to_value(&inner.saved).unwrap(), original_state);
         assert_eq!(std::fs::read(&path).unwrap(), original_file);
@@ -1154,6 +1563,7 @@ mod lifecycle_tests {
         let mut inner = RuntimeState {
             saved,
             cancellation: None,
+            worker: None,
         };
         inner.interrupt_for_shutdown(&path).unwrap();
         assert!(storage::load(&path).is_ok());
@@ -1176,6 +1586,7 @@ mod lifecycle_tests {
                 ..Default::default()
             },
             cancellation: Some(cancellation.clone()),
+            worker: None,
         };
         let original = serde_json::to_value(&inner.saved).unwrap();
         assert!(inner
@@ -1204,6 +1615,7 @@ mod lifecycle_tests {
                 ..Default::default()
             },
             cancellation: None,
+            worker: None,
         };
         let folder = inner.saved.favorites.folders[0].id.clone();
         inner
@@ -1223,7 +1635,9 @@ mod lifecycle_tests {
         );
         let mut next = run("next");
         next.status = "running".into();
-        inner.begin(next, CancellationToken::new(), &path).unwrap();
+        inner
+            .begin(next, CancellationToken::new(), &path, true)
+            .unwrap();
         assert_eq!(
             serde_json::to_value(&storage::load(&path).unwrap().favorites.entries[0]).unwrap(),
             favorite
@@ -1240,6 +1654,7 @@ mod lifecycle_tests {
                 ..Default::default()
             },
             cancellation: None,
+            worker: None,
         };
         let old_config = serde_json::to_value(&inner.saved.config).unwrap();
         let folder = inner.saved.favorites.folders[0].id.clone();
@@ -1257,7 +1672,7 @@ mod lifecycle_tests {
         let mut main = run("new-main");
         main.status = "running".into();
         assert!(inner
-            .begin(main.clone(), CancellationToken::new(), &path)
+            .begin(main.clone(), CancellationToken::new(), &path, true)
             .is_err());
         assert!(inner
             .begin_favorite_test(
@@ -1279,7 +1694,9 @@ mod lifecycle_tests {
         inner
             .complete_favorite_test(&job.run.id, Err("cancelled".into()), true, &path)
             .unwrap();
-        inner.begin(main, CancellationToken::new(), &path).unwrap();
+        inner
+            .begin(main, CancellationToken::new(), &path, true)
+            .unwrap();
         assert!(inner
             .begin_favorite_test(
                 ScanConfig::default(),
@@ -1306,6 +1723,7 @@ mod lifecycle_tests {
                     ..Default::default()
                 },
                 cancellation: None,
+                worker: None,
             };
             let config = ScanConfig {
                 max_tcp_ms: Some(231.0),
@@ -1351,6 +1769,7 @@ mod lifecycle_tests {
         let mut inner = RuntimeState {
             saved: SavedState::default(),
             cancellation: None,
+            worker: None,
         };
         let previous_config = serde_json::to_value(&inner.saved.config).unwrap();
         let config = ScanConfig {
@@ -1388,6 +1807,7 @@ mod lifecycle_tests {
         let mut inner = RuntimeState {
             saved: SavedState::default(),
             cancellation: None,
+            worker: None,
         };
         let folder = inner.saved.favorites.folders[0].id.clone();
         let original = serde_json::to_value(&inner.saved).unwrap();
@@ -1425,6 +1845,7 @@ mod lifecycle_tests {
                 ..Default::default()
             },
             cancellation: None,
+            worker: None,
         };
         let folder = inner.saved.favorites.folders[0].id.clone();
         inner
@@ -1467,5 +1888,11 @@ mod lifecycle_tests {
         assert!(inner.cancellation.is_none());
         assert_eq!(std::fs::read(&path).unwrap(), persisted);
         assert_eq!(inner.saved.last_run.as_ref().unwrap().id, "main");
+
+        inner.interrupt_for_shutdown(&path).unwrap();
+        let restored = storage::load(&path).unwrap();
+        assert_eq!(restored.favorites.revision, started.favorites.revision + 1);
+        assert_eq!(restored.favorites.entries[0].result.download_mbps, 99.0);
+        assert!(!restored.pending_favorite_results);
     }
 }

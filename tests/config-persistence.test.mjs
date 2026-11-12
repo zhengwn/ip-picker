@@ -34,7 +34,8 @@ async function fixture(context, options = {}) {
   setInvokeHandler(async (command, args) => {
     if (command === 'load_state') return { config: defaultConfig(), favorites: { revision: 0, folders: [], entries: [] } }
     if (command === 'get_scan' || command === 'get_favorite_test') return null
-    if (command === 'start_scan' && options.start) return options.start(args.config)
+    if (command === 'start_scan' && options.start) return options.start(args.config, args.persistConfig)
+    if (command === 'prepare_shutdown') return options.prepareShutdown?.()
     if (command === 'save_config') {
       const snapshot = structuredClone(args.config)
       saves.push(snapshot)
@@ -198,6 +199,28 @@ test('a save failure prevents closing and the next close retries the retained se
   assert.equal(state.configSaveError.value, '')
 })
 
+test('closing waits for the final measurement save and allows retry if it fails', async context => {
+  const write = deferred()
+  let attempts = 0
+  const { state, requestClose, windowState } = await fixture(context, {
+    prepareShutdown: () => ++attempts === 1 ? write.promise : undefined,
+  })
+  const closing = requestClose()
+  await setImmediate()
+  assert.equal(attempts, 1)
+  assert.equal(windowState.destroyed, 0)
+  write.reject('测速结果无法保存')
+  await closing.completion
+  assert.equal(windowState.destroyed, 0)
+  assert.equal(state.windowClosing.value, false)
+  assert.match(state.closeError.value, /测速结果无法保存/)
+
+  await requestClose().completion
+  assert.equal(attempts, 2)
+  assert.equal(windowState.destroyed, 1)
+  assert.equal(state.closeError.value, '')
+})
+
 test('invalid drafts do not block closing or overwrite the most recent valid edit', async context => {
   const { state, saves, requestClose, windowState } = await fixture(context)
   state.config.value.maxTcpMs = 231
@@ -253,4 +276,37 @@ test('starting a scan displays a native validation issue on the field and editin
   assert.equal(state.pageError.value, '')
   state.config.value.targetUrl = 'https://example.com/download'
   assert.equal(state.validationIssue.value, null)
+})
+
+test('quick validation starts a bounded run with pending ordinary settings already saved', async context => {
+  const write = deferred()
+  const starts = []
+  const { state, saves } = await fixture(context, {
+    save: () => write.promise,
+    start(config, persistConfig) {
+      starts.push({ config, persistConfig })
+      return { id: 'quick', status: 'running', config, results: [] }
+    },
+  })
+  state.config.value.maxCandidates = 2000
+  state.config.value.regions = ['JP']
+  state.config.value.downloadBudgetMiB = 32
+  state.config.value.downloadBudgetEnabled = true
+
+  const starting = state.startScan(true)
+  assert.equal(starts.length, 0)
+  write.resolve()
+  await starting
+  assert.equal(saves.at(-1).maxCandidates, 2000)
+  assert.equal(starts[0].persistConfig, false)
+  const quick = starts[0].config
+  assert.deepEqual(quick.regions, ['JP'])
+  assert.equal(quick.maxCandidates, 256)
+  assert.equal(quick.regionalCandidateLimit, 4)
+  assert.equal(quick.stabilityAttempts, 10)
+  assert.equal(quick.downloadBudgetEnabled, true)
+  assert.equal(quick.downloadBudgetMiB, 32)
+  assert.equal(state.run.value.config.maxCandidates, 256)
+  assert.equal(state.config.value.maxCandidates, 2000)
+  assert.equal(state.config.value.stabilityAttempts, 100)
 })

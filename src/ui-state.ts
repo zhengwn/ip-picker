@@ -76,7 +76,7 @@ const exclusionsByCode: Record<ExclusionCode, ExclusionDetails> = {
   stabilityFailureRate: { key: 'tcp-stability-failure', label: 'TCP 稳定性连接失败率超过允许值', kind: 'filter', field: 'maxStabilityFailurePercent' },
   stabilityLatency: { key: 'tcp-limit', label: 'TCP 延迟超过本次上限', kind: 'filter', field: 'maxTcpMs' },
   downloadShortlist: { key: 'download-shortlist', label: '稳定性已完成，未进入本区前 10 名下载候选', kind: 'filter', field: 'stabilityLatencyMetric' },
-  downloadBudget: { key: 'budget', label: '下载预算用尽，未完成全部精测', kind: 'incomplete', field: 'downloadBudgetMiB' },
+  downloadBudget: { key: 'budget', label: '下载预算不足，未安排全部复测', kind: 'incomplete', field: 'downloadBudgetMiB' },
   downloadFailure: { key: 'download', label: '下载请求失败或响应不符合测速要求', kind: 'failure', field: 'targetUrl' },
   downloadIncomplete: { key: 'incomplete', label: '尚未完成必要复测', kind: 'incomplete', field: 'downloadBudgetMiB' },
   popRecheckIncomplete: { key: 'pop-recheck-incomplete', label: '下载后的 POP 复核未完成', kind: 'incomplete', field: 'verificationAttempts' },
@@ -205,7 +205,7 @@ export function precisionPolicyDescription(config: ScanConfig): string {
   const budgetStop = config.downloadBudgetEnabled !== false ? '下载预算用尽、' : ''
   if (config.stabilityFirst) {
     const admission = limit == null ? '各区入围候选' : `各区按初筛 TCP 延迟取前 ${limit} 个入围，不足时全部入围`
-    return `先完成连通与 POP 识别，${admission}，全部执行 TCP 稳定性测试；累计 2 次连接失败立即淘汰，其余测满后判定。全部稳定性测试结束后，各区从达标候选中依次按失败率、所选延迟指标、HTTPS 耗时、波动与 IP 排序，选前 10 个进行服务校验和逐个下载测速；不足 10 个则全部选择。入选名单全部测速，不从名单外补位；${budgetStop}名单测完或手动停止时结束。`
+    return `先完成连通与 POP 识别，${admission}，全部执行 TCP 稳定性测试；累计 2 次连接失败立即淘汰，其余测满后判定。全部稳定性测试结束后，各区从达标候选中依次按失败率、所选延迟指标、HTTPS 耗时、HTTPS 首响波动与 IP 排序，选前 10 个进行服务校验和逐个下载测速；不足 10 个则全部选择。入选名单全部测速，不从名单外补位；${budgetStop}名单测完或手动停止时结束。`
   }
   if (typeof config.regionalCandidateLimit === 'number' && limit != null) {
     return `先完成连通与 POP 识别，各区按初筛 TCP 延迟从低到高排序，仅前 ${limit} 个入围精测；不足时全部入围。每批最多精测 5 个，在入围范围内补位，达到 ${config.ipsPerRegion} 个达标结果、入围候选测完、${budgetStop}手动停止时结束。不从前 ${limit} 名之外继续补测，未入围不表示节点不可用。`
@@ -275,6 +275,19 @@ export function candidateExclusionReason(result: IpResult): string {
   return reason
 }
 
+export const tcpConnectionFailureLabels = {
+  timeout: '连接超时',
+  connect: '连接失败',
+  worker: '探测任务异常',
+} as const
+
+export function initialTcpFailureReason(result: IpResult): string {
+  const { tcpConnectFailure, exclusionCode, exclusionReason } = result
+  if (tcpConnectFailure) return tcpConnectFailure.message || tcpConnectionFailureLabels[tcpConnectFailure.kind]
+  if (exclusionCode === 'tcpConnect') return exclusionReason || '连接失败'
+  return !exclusionCode && /^TCP (?:连接超时|连接失败|探测任务失败)/.test(exclusionReason ?? '') ? exclusionReason ?? '' : ''
+}
+
 export function completeStability(result: IpResult, config: ScanConfig): boolean {
   if (result.tcpStability?.earlyRejection) return false
   if (config.stabilityAttempts == null) return true
@@ -308,8 +321,17 @@ export function measuredTcpFailure(result: IpResult): number {
   return stability?.completed && stability.attempted === stability.requested && stability.attempted > 0 ? stability.failed / stability.attempted * 100 : Infinity
 }
 
+export function observedTcpMs(stability: TcpStability | undefined, metric: 'medianMs' | 'averageMs'): number | null {
+  if (!stability || stability.attempted <= 0 || stability.succeeded <= 0) return null
+  const value = stability[metric]
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
 export function observedFailurePercent(stability?: TcpStability): number | null {
-  return stability && stability.attempted > 0 ? stability.failed / stability.attempted * 100 : null
+  if (!stability) return null
+  const { attempted, failed } = stability
+  return Number.isInteger(attempted) && attempted > 0 && Number.isInteger(failed) && failed >= 0 && failed <= attempted
+    ? failed / attempted * 100 : null
 }
 
 export function completeMeasurement(result: IpResult, config: ScanConfig): boolean {

@@ -7,6 +7,8 @@ import { completedTcpMetricValue, observedFailurePercent, precisionPolicyLabel, 
 const props = defineProps<{ run: ScanRun; elapsed: string }>()
 
 const stabilityFirst = computed(() => props.run.config.stabilityFirst)
+const latencyMetric = computed(() => props.run.config.stabilityLatencyMetric ?? 'max')
+const latencyMetricLabel = computed(() => `${stabilityMetricLabel(latencyMetric.value)}延迟`)
 const stabilizing = computed(() => props.run.status === 'running' && props.run.progress.stage === 'stabilizing')
 const discovering = computed(() => ['connecting', 'discovering'].includes(props.run.progress.stage))
 const precision = computed(() => !discovering.value && props.run.status === 'running')
@@ -29,8 +31,8 @@ const currentScope = computed(() => discovering.value ? '发现阶段 · 连通�
 const criteria = computed(() => {
   const config = props.run.config
   if (config.stabilityAttempts == null || config.maxTcpMs == null) return '正在准备本批候选与本次稳定性判定参数。'
-  if (config.stabilityFirst) return `累计 2 次连接失败立即淘汰，与允许失败率无关；其余候选测满 ${config.stabilityAttempts} 次后，按 ${stabilityMetricLabel(config.stabilityLatencyMetric ?? 'p95')} ≤ ${config.maxTcpMs} ms、连接失败率 ≤ ${config.maxStabilityFailurePercent}% 判定。全部入围候选测完，再从各区达标候选中选前 10 名服务校验与下载测速。`
-  return `达标须测满 ${config.stabilityAttempts} 次，${stabilityMetricLabel(config.stabilityLatencyMetric ?? 'max')} ≤ ${config.maxTcpMs} ms、连接失败率 ≤ ${config.maxStabilityFailurePercent}%。已确定后续探测也无法达标时，立即淘汰并安排下一个；稳定性达标后还需下载复测。`
+  if (config.stabilityFirst) return `累计 2 次连接失败立即淘汰，与允许失败率无关。其余候选测满 ${config.stabilityAttempts} 次后，按${latencyMetricLabel.value} ≤ ${config.maxTcpMs} ms、连接失败率 ≤ ${config.maxStabilityFailurePercent}% 判定。全部入围候选测完，再从各区达标候选中选前 10 名服务校验与下载测速。`
+  return `达标须测满 ${config.stabilityAttempts} 次，${latencyMetricLabel.value} ≤ ${config.maxTcpMs} ms、连接失败率 ≤ ${config.maxStabilityFailurePercent}%。已确定后续探测也无法达标时，立即淘汰并安排下一个。稳定性达标后还需下载复测。`
 })
 const downloadStatus = computed(() => {
   const progress = props.run.progress
@@ -40,7 +42,7 @@ const downloadStatus = computed(() => {
   return stabilityFirst.value ? '全部稳定性测完后，仅对各区前 10 名进行下载测速' : '稳定性通过后进行下载测速'
 })
 const stopPolicy = computed(() => {
-  const budgetStop = props.run.config.downloadBudgetEnabled !== false ? '下载预算用尽、' : ''
+  const budgetStop = props.run.config.downloadBudgetEnabled !== false ? '剩余预算不足以复测、' : ''
   if (stabilityFirst.value) return `先完成各区${regionalLimit.value == null ? '全部入围候选' : `前 ${regionalLimit.value} 个入围候选`}的稳定性测试，再从达标候选中选前 10 名服务校验和下载测速。入选名单全部测速，不从名单外补位；${budgetStop}名单测完或主动停止时结束。处理中包含等待任务。`
   return `${regionalLimit.value == null ? '' : `每区仅精测初筛 TCP 延迟最低的前 ${regionalLimit.value} 个，不补测未入围候选。`}每区找到 ${props.run.config.ipsPerRegion} 个达标结果即停止补测该区；${budgetStop}${regionalLimit.value == null ? '候选' : '入围名单'}测完或主动停止时结束。${queue.value.qualifiedRegions} / ${props.run.config.regions.length} 个地区已达到数量目标。处理中包含本批等待任务。`
 })
@@ -58,7 +60,7 @@ function failure(candidate: StabilityBatchCandidate) {
 function verdict(candidate: StabilityBatchCandidate) {
   return candidate.result ? stabilityVerdict(candidate.result, props.run.config) : 'incomplete'
 }
-function p95(candidate: StabilityBatchCandidate) { return candidate.result ? completedTcpMetricValue(candidate.result, 'p95') : null }
+function settledLatency(candidate: StabilityBatchCandidate) { return candidate.result ? completedTcpMetricValue(candidate.result, latencyMetric.value) : null }
 </script>
 
 <template>
@@ -87,10 +89,30 @@ function p95(candidate: StabilityBatchCandidate) { return candidate.result ? com
             <article v-for="candidate in active" :key="`${batch.number}-${candidate.ip}`" class="scan-active-candidate">
               <div class="scan-candidate-count"><strong class="mono">{{ candidate.ip }}</strong><span>{{ candidate.attempted }} / {{ candidate.requested }} 次</span></div>
               <div class="progress-track scan-candidate-track" role="progressbar" :aria-label="`${candidate.ip} 已完成探测次数`" :aria-valuenow="candidate.attempted" aria-valuemin="0" :aria-valuemax="candidate.requested" :aria-valuetext="`已完成 ${candidate.attempted} / ${candidate.requested} 次，结果待复测完成`"><span :style="{ width: `${candidate.percent}%` }" /></div>
-              <p class="muted">{{ location(candidate) }} · 结果待复测完成</p><p class="muted">连接成功 {{ candidate.stability?.succeeded ?? 0 }} 次 · 连接失败 {{ candidate.stability?.failed ?? 0 }} 次</p><p class="muted">耗时 &gt; {{ run.config.maxTcpMs }} ms 的样本 {{ candidate.stability?.overLimitCount ?? 0 }} 次（仅统计）</p>
+              <p class="muted">{{ location(candidate) }} · 结果待复测完成</p>
+              <p class="muted">连接成功 {{ candidate.stability?.succeeded ?? 0 }} 次 · 连接失败 {{ candidate.stability?.failed ?? 0 }} 次</p>
+              <p v-if="candidate.stability?.maxMs != null" class="muted">当前成功样本峰值 {{ milliseconds(candidate.stability.maxMs) }}</p>
+              <p class="muted">耗时 &gt; {{ run.config.maxTcpMs }} ms 的样本 {{ candidate.stability?.overLimitCount ?? 0 }} 次（仅统计）</p>
             </article>
           </div>
-          <details v-if="batch.settled.length" class="scan-batch-details"><summary><span>已处理 {{ batch.settled.length }} 个 IP · 查看稳定性结论</span><ChevronDown :size="12" aria-hidden="true" /></summary><p class="scan-detail-description">提前淘汰不会计作测满 {{ batch.requestedPerIp }} 次，也不会生成最终 P95；{{ stabilityFirst ? '稳定性达标后仍需进入本区前 10 名，再完成服务校验与下载复测。' : '稳定性通过仍需下载复测。' }}</p><ul><li v-for="candidate in batch.settled" :key="candidate.ip"><div class="scan-completed-identity"><span class="mono">{{ candidate.ip }}</span><span class="muted">{{ location(candidate) }}</span></div><template v-if="candidate.state === 'rejected'"><span class="scan-completed-values">已测 {{ candidate.attempted }} / {{ candidate.requested }} 次 · 连接失败 {{ candidate.stability?.failed ?? 0 }} 次</span><span class="status-label warning">提前淘汰</span><p class="scan-rejection-reason">{{ candidate.stability?.earlyRejection }}</p></template><template v-else><span class="scan-completed-values">最终 P95 {{ milliseconds(p95(candidate)) }} · 连接失败率 {{ failure(candidate) }}</span><span class="status-label" :class="{ good: verdict(candidate) === 'passed', warning: verdict(candidate) === 'failed', quiet: verdict(candidate) === 'incomplete' }">{{ verdict(candidate) === 'passed' ? '稳定性达标' : verdict(candidate) === 'failed' ? '稳定性未达标' : '统计待确认' }}</span></template></li></ul></details>
+          <details v-if="batch.settled.length" class="scan-batch-details">
+            <summary><span>已处理 {{ batch.settled.length }} 个 IP · 查看稳定性结论</span><ChevronDown :size="12" aria-hidden="true" /></summary>
+            <p class="scan-detail-description">测满 {{ batch.requestedPerIp }} 次后才生成最终延迟统计。提前淘汰时保留已完成的探测。{{ stabilityFirst ? '稳定性达标后仍需进入本区前 10 名，再完成服务校验与下载复测。' : '稳定性通过仍需下载复测。' }}</p>
+            <ul>
+              <li v-for="candidate in batch.settled" :key="candidate.ip">
+                <div class="scan-completed-identity"><span class="mono">{{ candidate.ip }}</span><span class="muted">{{ location(candidate) }}</span></div>
+                <template v-if="candidate.state === 'rejected'">
+                  <span class="scan-completed-values">已测 {{ candidate.attempted }} / {{ candidate.requested }} 次 · 连接失败 {{ candidate.stability?.failed ?? 0 }} 次</span>
+                  <span class="status-label warning">提前淘汰</span>
+                  <p class="scan-rejection-reason">{{ candidate.stability?.earlyRejection }}</p>
+                </template>
+                <template v-else>
+                  <span class="scan-completed-values">最终{{ latencyMetricLabel }} {{ milliseconds(settledLatency(candidate)) }} · 连接失败率 {{ failure(candidate) }}</span>
+                  <span class="status-label" :class="{ good: verdict(candidate) === 'passed', warning: verdict(candidate) === 'failed', quiet: verdict(candidate) === 'incomplete' }">{{ verdict(candidate) === 'passed' ? '稳定性达标' : verdict(candidate) === 'failed' ? '稳定性未达标' : '统计待确认' }}</span>
+                </template>
+              </li>
+            </ul>
+          </details>
           <details v-if="batch.waiting.length" class="scan-batch-details"><summary><span>{{ batch.waiting.length }} 个候选等待开始</span><ChevronDown :size="12" aria-hidden="true" /></summary><ul><li v-for="candidate in batch.waiting" :key="candidate.ip"><span class="mono">{{ candidate.ip }}</span><span class="muted">{{ location(candidate) }}</span></li></ul></details>
         </template>
         <p v-else-if="stabilizing" class="scan-detail-description">正在准备本批候选；收到批次清单后，会逐个显示正在探测的 IP。</p>

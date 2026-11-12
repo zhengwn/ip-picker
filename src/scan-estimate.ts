@@ -12,7 +12,6 @@ export function formatDownloadedMiB(bytes: number): string {
 
 function candidateCapacity(config: ScanConfig): number {
   if (config.source === 'cloudflare') return config.maxCandidates
-  // Distinct entries can overlap, so capacity is a workload reference.
   return Math.min(config.maxCandidates, inspectCustomIps(config.customIps).capacity ?? 0)
 }
 

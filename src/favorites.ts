@@ -112,12 +112,10 @@ export function favoriteNumber(value?: number | null): string {
 export function favoriteTcpSummary(result: IpResult, config: ScanConfig): { label: string; value: number | null } {
   const completed = completedTcpMetricValue(result, config.stabilityLatencyMetric)
   if (completed !== null) return { label: stabilityMetricLabel(config.stabilityLatencyMetric), value: completed }
+  const peak = result.tcpStability?.maxMs
+  if (typeof peak === 'number' && Number.isFinite(peak) && peak >= 0) return { label: '样本峰值', value: peak }
   const connected = result.tcpMs > 0 || result.successCount > 0 || !!result.colo
   return { label: '初筛', value: connected ? result.tcpMs : null }
-}
-
-export function favoriteProbes(probes: (number | null)[]): string {
-  return probes.map(sample => sample === null ? '失败' : favoriteNumber(sample)).join(' / ')
 }
 
 export function favoriteError(error: unknown): string {

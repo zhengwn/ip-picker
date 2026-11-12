@@ -7,7 +7,7 @@ import { build } from 'esbuild'
 
 // Exercise real Vue setup and lifecycle with a minimal renderer and mocked IPC.
 const sourceDirectory = fileURLToPath(new URL('../../src/', import.meta.url))
-const components = ['App.vue', 'components/FavoriteSaveDialog.vue', 'components/AllResultsPanel.vue']
+const components = ['App.vue', 'components/FavoriteSaveDialog.vue', 'components/AllResultsPanel.vue', 'components/ScanHistoryPanel.vue']
 const scripts = new Map(await Promise.all(components.map(async component => {
   const path = join(sourceDirectory, component)
   const { descriptor } = parse(await readFile(path, 'utf8'), { filename: path })
@@ -20,11 +20,14 @@ const { outputFiles } = await build({
   stdin: {
     contents: `
       import { createRenderer } from 'vue'
+      export { reactive } from 'vue'
       export { default as App } from './App.vue'
       export { default as FavoriteSaveDialog } from './components/FavoriteSaveDialog.vue'
       export { default as AllResultsPanel } from './components/AllResultsPanel.vue'
+      export { default as ScanHistoryPanel } from './components/ScanHistoryPanel.vue'
       export { defaultConfig } from './types'
       export { estimateScan } from './scan-estimate'
+      export { stabilityFailureKind, summarizeScanResults } from './scan-result-summary'
       export { validateConfig } from './ui-state'
       export { setInvokeHandler } from '@tauri-apps/api/core'
       export { setWindowFixture } from '@tauri-apps/api/window'
@@ -82,4 +85,5 @@ try {
   fixture = await import(pathToFileURL(compiledPath).href)
 } finally { await rm(directory, { recursive: true, force: true }) }
 
-export const { App, AllResultsPanel, FavoriteSaveDialog, defaultConfig, estimateScan, mountComponent, setInvokeHandler, setWindowFixture, validateConfig } = fixture
+export const { App, AllResultsPanel, FavoriteSaveDialog, ScanHistoryPanel, defaultConfig, estimateScan, mountComponent, setInvokeHandler, setWindowFixture, stabilityFailureKind, summarizeScanResults, validateConfig } = fixture
+export const { reactive } = fixture

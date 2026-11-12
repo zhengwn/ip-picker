@@ -509,6 +509,8 @@ pub struct IpResult {
     pub colo: String,
     pub observed_colos: Vec<String>,
     pub tcp_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcp_connect_failure: Option<crate::stability::TcpConnectFailure>,
     pub https_ms: f64,
     /// Range (maximum - minimum) of successful HTTPS header timings.
     pub jitter_ms: f64,
@@ -540,6 +542,7 @@ impl IpResult {
             colo: String::new(),
             observed_colos: Vec::new(),
             tcp_ms: 0.0,
+            tcp_connect_failure: None,
             https_ms: 0.0,
             jitter_ms: 0.0,
             download_mbps: 0.0,
@@ -572,6 +575,25 @@ impl IpResult {
     pub(crate) fn mark_cancelled(&mut self, config: &ScanConfig) {
         if !self.is_excluded() && self.download_samples_mbps.len() < config.download_rounds {
             self.exclude(ExclusionCode::Cancelled, "测试已停止，验证或下载复测未完成");
+        }
+    }
+
+    pub(crate) fn apply_recommendation_threshold(&mut self, config: &ScanConfig) {
+        self.eligible = self.measurement_passed;
+        if self.eligible
+            && config.preference == "daily"
+            && self.download_mbps < config.min_download_mbps
+        {
+            self.eligible = false;
+            self.exclude(
+                ExclusionCode::SpeedTarget,
+                format!(
+                    "下载 {:.2} Mbps，低于日常优选目标 {:.2} Mbps",
+                    self.download_mbps, config.min_download_mbps
+                ),
+            );
+        } else if self.eligible && self.has_only_speed_target_exclusion() {
+            self.clear_exclusion();
         }
     }
 

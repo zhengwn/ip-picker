@@ -1,18 +1,26 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Check, ChevronDown, ChevronRight, CircleAlert, Clipboard, FolderOpen, LoaderCircle, Pencil, Plus, RotateCcw, Search, Settings2, Square, Star, Trash2, X } from '@lucide/vue'
+import { Check, ChevronDown, ChevronRight, CircleAlert, Clipboard, FolderOpen, History, LoaderCircle, Pencil, Plus, RotateCcw, Search, Settings2, Square, Star, Trash2, X } from '@lucide/vue'
 import { regionName, type ScanConfig } from '../types'
 import { validManualIpv4 } from '../custom-ips'
-import { candidateExclusionReason, candidateMeasurementStatus, precisionPolicyLabel, stabilityMetricLabel, stabilityVerdict, targetHost } from '../ui-state'
-import { favoriteDate, favoriteError, favoriteHasTestData, favoriteNumber, favoriteProbes, favoriteRunStatus, favoriteSnapshotRun, favoriteTcpSummary, favoriteTestPhase, type FavoriteEntry, type FavoriteFolder, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from '../favorites'
+import { candidateExclusionReason, candidateMeasurementStatus, precisionPolicyLabel, targetHost } from '../ui-state'
+import { favoriteDate, favoriteError, favoriteHasTestData, favoriteNumber, favoriteRunStatus, favoriteSnapshotRun, favoriteTestPhase, type FavoriteEntry, type FavoriteFolder, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from '../favorites'
+import type { TcpDisplayMetric } from '../result-preferences'
+import { tcpLatencyChartScale } from '../result-row-display'
 import SelectControl from './SelectControl.vue'
+import TcpDiagnostics from './TcpDiagnostics.vue'
+import TcpLatencyCell from './TcpLatencyCell.vue'
+import TcpLatencyHeader from './TcpLatencyHeader.vue'
 
-const props = defineProps<{ library: FavoriteLibrary; desktop: boolean; config: ScanConfig; loading?: boolean; testJob?: FavoriteTestJob | null; scanBusy?: boolean }>()
+const props = defineProps<{ library: FavoriteLibrary; desktop: boolean; config: ScanConfig; loading?: boolean; testJob?: FavoriteTestJob | null; scanBusy?: boolean; stopping?: boolean }>()
+const tcpDisplayMetric = defineModel<TcpDisplayMetric>('tcpDisplayMetric', { default: 'runMetric' })
 const emit = defineEmits<{
   change: [library: FavoriteLibrary]
   notify: [text: string, error?: boolean]
   'test-started': [start: FavoriteTestStart]
+  'stop-test': []
+  'compare-history': [ip: string]
 }>()
 
 const panel = ref<HTMLElement | null>(null)
@@ -34,13 +42,13 @@ const pending = ref(false)
 const error = ref('')
 const testError = ref('')
 const starting = ref(false)
-const stopping = ref(false)
 const localJob = ref<FavoriteTestJob | null>(null)
 let returnFocus: HTMLElement | null = null
 
 const selectedFolder = computed(() => props.library.folders.find(folder => folder.id === selectedFolderId.value))
 const entries = computed(() => props.library.entries.filter(entry => !selectedFolderId.value || entry.folderId === selectedFolderId.value)
   .slice().sort((a, b) => b.savedAt.localeCompare(a.savedAt)))
+const tcpScaleMaxMs = computed(() => tcpLatencyChartScale(entries.value.map(entry => entry.result)))
 const folderEntryCount = (id: string) => props.library.entries.filter(entry => entry.folderId === id).length
 const folderName = (id: string) => props.library.folders.find(folder => folder.id === id)?.name ?? '未知收藏夹'
 const visibleEntries = computed(() => {
@@ -177,26 +185,10 @@ async function startTest(target: { folderId?: string; favoriteId?: string; ip?: 
   } finally { starting.value = false }
 }
 
-async function stopTest() {
-  if (!props.desktop || !testRunning.value || stopping.value || !job.value) return
-  stopping.value = true
-  testError.value = ''
-  try { await invoke('cancel_favorite_test', { runId: job.value.run.id }) }
-  catch (cause) { testError.value = favoriteError(cause) }
-  finally { stopping.value = false }
-}
-
 async function copyIp(ip: string) {
   if (!props.desktop) return
   try { await invoke('copy_text', { text: ip }); emit('notify', '已复制 IP') }
   catch (cause) { emit('notify', `复制失败：${favoriteError(cause)}`, true) }
-}
-
-function stabilityLabel(entry: FavoriteEntry) {
-  const stats = entry.result.tcpStability
-  if (!stats) return '未测试'
-  if (stats.earlyRejection) return '提前淘汰'
-  return ({ passed: '达标', failed: '未达标', incomplete: '未完成' })[stabilityVerdict(entry.result, entry.config)]
 }
 
 function roleLabel(entry: FavoriteEntry) {
@@ -229,7 +221,7 @@ onBeforeUnmount(() => {
           <strong class="favorite-job-status"><LoaderCircle v-if="testRunning" :size="13" class="spinning" aria-hidden="true" /><Check v-else-if="job.run.status === 'completed'" :size="13" aria-hidden="true" />{{ testRunning ? '收藏复测中' : favoriteRunStatus(job.run.status) }}</strong>
           <span class="favorite-job-target" :title="testTargetFolders">{{ testRunning ? favoriteTestPhase(job) : `${testTargetFolders || '收藏 IP'} · ${testTargetCount} 个 IP` }}</span>
           <span class="favorite-job-numbers">完整通过 <strong>{{ testPassedCount }} / {{ testTargetCount }}</strong><span>·</span>{{ (job.run.progress.downloadedBytes / 1024 / 1024).toFixed(1) }} MiB</span>
-          <button v-if="testRunning" class="button stop-button favorite-compact" :disabled="stopping" @click="stopTest"><LoaderCircle v-if="stopping" :size="12" class="spinning" aria-hidden="true" /><Square v-else :size="11" aria-hidden="true" />{{ stopping ? '正在停止…' : '停止复测' }}</button>
+          <button v-if="testRunning" class="button stop-button favorite-compact" :disabled="stopping" @click="emit('stop-test')"><LoaderCircle v-if="stopping" :size="12" class="spinning" aria-hidden="true" /><Square v-else :size="11" aria-hidden="true" />{{ stopping ? '正在停止…' : '停止复测' }}</button>
           <details class="favorite-job-details"><summary><span>记录详情</span><ChevronDown :size="12" aria-hidden="true" /></summary><div class="favorite-job-detail-body"><strong>{{ testTargetFolders || '收藏 IP' }} · {{ testTargetCount }} 个 IP</strong><p>测试于 {{ favoriteDate(job.run.startedAt) }} · {{ favoriteRunStatus(job.run.status) }}</p><p>{{ favoriteTestPhase(job) }} · {{ downloadBudgetLabel(job.run.config) }}</p><p v-if="testRunning && job.run.progress.total">当前阶段 {{ job.run.progress.completed }} / {{ job.run.progress.total }}</p><p v-if="job.run.error" class="favorite-form-error">{{ job.run.error }}</p><p v-if="job.run.progress.message">{{ job.run.progress.message }}</p><p>{{ testRunning ? '复测期间保留上次测试快照，结束后更新取得的结果。' : job.run.status === 'cancelled' ? '已停止；收藏列表显示最近成功保存的记录，未开始测试的 IP 保留原结果。' : job.run.status === 'failed' ? '本次测试未完成；收藏列表显示最近成功保存的记录，可重新测速。' : '本次测试已结束；收藏列表显示最近成功保存的记录。' }}</p></div></details>
         </div>
         <div v-if="testRunning && job.run.progress.total" class="progress-track favorite-test-track" role="progressbar" aria-label="收藏复测当前阶段进度" :aria-valuenow="testPercent" aria-valuemin="0" aria-valuemax="100"><span :style="{ width: `${testPercent}%` }" /></div>
@@ -254,24 +246,30 @@ onBeforeUnmount(() => {
       <div v-else ref="table" class="favorites-table" role="region" aria-label="收藏 IP 表格，可滚动" tabindex="0">
         <table>
           <colgroup><col class="favorite-col-ip" /><col class="favorite-col-folder" /><col class="favorite-col-region" /><col class="favorite-col-tcp" /><col class="favorite-col-speed" /><col class="favorite-col-actions" /></colgroup>
-          <thead><tr><th scope="col">IP 地址 <span class="favorite-heading-hint">点击展开详情</span></th><th scope="col">分类</th><th scope="col">地区 / POP</th><th scope="col">TCP 延迟 <span class="favorite-table-unit">ms</span></th><th scope="col">下载 <span class="favorite-table-unit">Mbps</span></th><th scope="col">操作</th></tr></thead>
+          <thead><tr><th scope="col">IP 地址 <span class="favorite-heading-hint">点击展开详情</span></th><th scope="col">分类</th><th scope="col">地区 / POP</th><th scope="col" class="favorite-tcp-cell"><TcpLatencyHeader v-model="tcpDisplayMetric" /></th><th scope="col" class="favorite-speed-cell">下载 <span class="favorite-table-unit">Mbps</span></th><th scope="col">操作</th></tr></thead>
           <tbody>
             <template v-for="(entry, index) in visibleEntries" :key="entry.id">
               <tr class="favorite-data-row" :class="{ 'is-alt': index % 2 === 1, 'is-expanded': expandedEntryId === entry.id, 'is-testing': isEntryTesting(entry) }">
                 <td><button :id="toggleId(entry.id)" class="favorite-row-toggle" :aria-expanded="expandedEntryId === entry.id" :aria-controls="detailId(entry.id)" :aria-label="`${expandedEntryId === entry.id ? '收起' : '展开'} ${entry.result.ip} 在${folderName(entry.folderId)}中的测试详情`" :title="entryState(entry)" @click="toggleEntry(entry)"><ChevronRight :size="12" class="favorite-expand-icon" :class="{ expanded: expandedEntryId === entry.id }" aria-hidden="true" /><span class="favorite-state-dot" :class="{ good: entry.result.measurementPassed && !isEntryTesting(entry), testing: isEntryTesting(entry) }" aria-hidden="true" /><span class="mono">{{ entry.result.ip }}</span></button></td>
                 <td><span class="favorite-table-folder" :title="folderName(entry.folderId)">{{ folderName(entry.folderId) }}</span></td>
                 <td><span class="favorite-table-location" :title="`${entry.result.city || '城市未识别'} · ${roleLabel(entry)}`"><span>{{ regionName(entry.result.regionCode) || '地区未识别' }}</span><span v-if="entry.result.colo" class="favorite-pop">{{ entry.result.colo }}</span></span></td>
-                <td :title="`TCP ${favoriteTcpSummary(entry.result, entry.config).label}，按本条收藏的测试判据显示`"><span class="favorite-table-metric"><span class="favorite-metric-label">{{ favoriteTcpSummary(entry.result, entry.config).label }}</span><span>{{ favoriteNumber(favoriteTcpSummary(entry.result, entry.config).value) }}</span></span></td>
-                <td><span class="favorite-table-speed" :class="{ measured: entry.result.downloadSamplesMbps.length > 0 }">{{ entry.result.downloadSamplesMbps.length ? favoriteNumber(entry.result.downloadMbps) : '—' }}</span></td>
-                <td><div class="favorite-row-actions"><button class="icon-button" :disabled="!desktop" :aria-label="`复制收藏的 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="复制 IP" @click="copyIp(entry.result.ip)"><Clipboard :size="13" aria-hidden="true" /></button><button class="icon-button" :disabled="disabled" :aria-label="`重新测速 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="重新测速" @click="startTest({ favoriteId: entry.id })"><RotateCcw :size="13" aria-hidden="true" /></button><button class="icon-button" :disabled="disabled" :aria-label="`编辑收藏 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="编辑分类与备注" @click="showDialog('editEntry', null, entry)"><Pencil :size="13" aria-hidden="true" /></button><button class="icon-button favorite-danger" :disabled="disabled" :aria-label="`移除收藏 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="移除本条收藏" @click="showDialog('deleteEntry', null, entry)"><Trash2 :size="13" aria-hidden="true" /></button></div></td>
+                <td class="favorite-tcp-cell"><TcpLatencyCell :result="entry.result" :display-metric="tcpDisplayMetric" :scale-max-ms="tcpScaleMaxMs" :run-metric="entry.config.stabilityLatencyMetric ?? 'max'" label-run-metric /></td>
+                <td class="favorite-speed-cell"><span class="favorite-table-speed" :class="{ measured: entry.result.downloadSamplesMbps.length > 0 }">{{ entry.result.downloadSamplesMbps.length ? favoriteNumber(entry.result.downloadMbps) : '—' }}</span></td>
+                <td><div class="favorite-row-actions">
+                  <button class="icon-button" :disabled="!desktop" :aria-label="`复制收藏的 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="复制 IP" @click="copyIp(entry.result.ip)"><Clipboard :size="13" aria-hidden="true" /></button>
+                  <button class="icon-button" :disabled="!desktop" :aria-label="`对比 IP ${entry.result.ip} 的测速历史（${folderName(entry.folderId)}）`" title="对比该 IP 历史" @click="emit('compare-history', entry.result.ip)"><History :size="13" aria-hidden="true" /></button>
+                  <button class="icon-button" :disabled="disabled" :aria-label="`重新测速 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="重新测速" @click="startTest({ favoriteId: entry.id })"><RotateCcw :size="13" aria-hidden="true" /></button>
+                  <button class="icon-button" :disabled="disabled" :aria-label="`编辑收藏 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="编辑分类与备注" @click="showDialog('editEntry', null, entry)"><Pencil :size="13" aria-hidden="true" /></button>
+                  <button class="icon-button favorite-danger" :disabled="disabled" :aria-label="`移除收藏 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="移除本条收藏" @click="showDialog('deleteEntry', null, entry)"><Trash2 :size="13" aria-hidden="true" /></button>
+                </div></td>
               </tr>
               <tr v-if="expandedEntryId === entry.id" class="favorite-detail-row"><td colspan="6"><section :id="detailId(entry.id)" class="favorite-inline-detail" :aria-label="`${entry.result.ip} 在${folderName(entry.folderId)}中的测试详情`"><div class="favorite-detail-heading"><div><strong class="mono">{{ entry.result.ip }}</strong><span class="favorite-detail-status" :class="{ passed: entry.result.measurementPassed && !isEntryTesting(entry) }">{{ entryState(entry) }}</span><span>{{ folderName(entry.folderId) }}</span></div><button class="text-button" :aria-label="`收起 ${entry.result.ip} 的详情`" @click="collapseEntry">收起<ChevronDown :size="12" class="favorite-collapse-icon" /></button></div>
+            <div class="favorite-tcp-diagnostics"><TcpDiagnostics :result="entry.result" :config="entry.config" /></div>
             <dl class="favorite-detail-grid">
               <div><dt>收藏时间</dt><dd>{{ favoriteDate(entry.savedAt) }}</dd></div><div><dt>最近测试</dt><dd>{{ favoriteHasTestData(entry) ? `${favoriteDate(entry.runFinishedAt || entry.runStartedAt)} · ${favoriteRunStatus(entry.runStatus)}` : '尚无测试记录' }}</dd></div>
               <div><dt>地区 / 城市 / POP</dt><dd>{{ regionName(entry.result.regionCode) || '地区未识别' }} · {{ entry.result.city || '城市未识别' }} · {{ entry.result.colo || 'POP 未识别' }}</dd></div><div><dt>收藏时角色</dt><dd>{{ roleLabel(entry) }}</dd></div>
               <div v-if="entry.note" class="favorite-full"><dt>备注</dt><dd class="favorite-note-full">{{ entry.note }}</dd></div>
               <div class="favorite-full"><dt>测速结论</dt><dd>{{ candidateExclusionReason(entry.result) || (entry.result.measurementPassed ? '测速通过' : '尚未完成完整测速') }}{{ entry.result.eligible ? ' · 符合本次优选条件' : '' }}</dd></div>
-              <div><dt>TCP 连接失败</dt><dd>{{ entry.result.tcpStability ? `${entry.result.tcpStability.failed} / ${entry.result.tcpStability.attempted} · ${favoriteNumber(entry.result.tcpStability.failurePercent)}%` : '尚无测试数据' }}</dd></div>
               <div><dt>HTTPS 冷连接首响</dt><dd>{{ entry.result.successCount ? `${favoriteNumber(entry.result.httpsMs)} ms` : '尚无成功数据' }}</dd></div>
               <div><dt>测试开始</dt><dd>{{ favoriteDate(entry.runStartedAt) }}</dd></div><div><dt>测试结束</dt><dd>{{ entry.runFinishedAt ? favoriteDate(entry.runFinishedAt) : '收藏时尚未结束' }}</dd></div>
               <div class="favorite-full"><dt>测速地址</dt><dd class="mono">{{ entry.config.targetUrl }}</dd></div>
@@ -279,13 +277,10 @@ onBeforeUnmount(() => {
               <div class="favorite-full"><dt>精测策略</dt><dd>{{ entry.targeted ? `指定 IP 复测 · 全部测试，不按地区或前 10 名筛选；累计 2 次连接失败立即淘汰，${entry.config.downloadBudgetEnabled !== false ? '下载预算用尽、全部 IP 测完或主动停止时结束。' : '不限制流量，全部 IP 测完或主动停止时结束。'}` : precisionPolicyLabel(entry.config) }}</dd></div>
               <div><dt>HTTPS 服务校验</dt><dd>成功 {{ entry.result.successCount }} / 已测 {{ entry.result.attempts }} · 计划 {{ entry.config.verificationAttempts }} 次</dd></div><div><dt>HTTPS 首响波动</dt><dd>{{ entry.result.successCount ? `${favoriteNumber(entry.result.jitterMs)} ms` : '尚无成功数据' }}</dd></div>
               <div><dt>下载样本</dt><dd>{{ entry.result.downloadSamplesMbps.length ? entry.result.downloadSamplesMbps.map(favoriteNumber).join(' / ') + ' Mbps' : '尚无下载样本' }}</dd></div><div><dt>下载计划</dt><dd>{{ entry.config.downloadRounds }} 轮 × {{ entry.config.downloadSeconds }} 秒 · {{ downloadBudgetLabel(entry.config) }}</dd></div>
-              <div><dt>TCP 初筛延迟</dt><dd>{{ entry.result.tcpMs > 0 || entry.result.attempts ? `${favoriteNumber(entry.result.tcpMs)} ms` : '尚无成功数据' }}</dd></div><div><dt>TCP 稳定性</dt><dd>{{ stabilityLabel(entry) }} · 计划 {{ entry.config.stabilityAttempts ?? '历史未记录' }} 次 · 间隔 {{ entry.config.stabilityIntervalMs }} ms</dd></div>
-              <template v-if="entry.result.tcpStability"><div><dt>TCP 稳定性进度</dt><dd>已测 {{ entry.result.tcpStability.attempted }} / {{ entry.result.tcpStability.requested }} · 成功 {{ entry.result.tcpStability.succeeded }} · 失败 {{ entry.result.tcpStability.failed }}</dd></div><div><dt>TCP 统计（ms）</dt><dd>均值 {{ favoriteNumber(entry.result.tcpStability.averageMs) }} · 中位 {{ favoriteNumber(entry.result.tcpStability.medianMs) }} · P95 {{ favoriteNumber(entry.result.tcpStability.p95Ms) }}</dd></div><div><dt>TCP 范围与波动（ms）</dt><dd>最小 {{ favoriteNumber(entry.result.tcpStability.minMs) }} · 最大 {{ favoriteNumber(entry.result.tcpStability.maxMs) }} · 波动 {{ favoriteNumber(entry.result.tcpStability.jitterMs) }}</dd></div><div><dt>TCP 延迟超限样本</dt><dd>{{ entry.result.tcpStability.overLimitCount }} 次 · 本次上限 {{ entry.result.tcpStability.delayLimitMs }} ms</dd></div><div v-if="entry.result.tcpStability.earlyRejection" class="favorite-full"><dt>提前淘汰原因</dt><dd>{{ entry.result.tcpStability.earlyRejection }}</dd></div></template>
-              <div><dt>稳定性筛选条件</dt><dd>{{ stabilityMetricLabel(entry.config.stabilityLatencyMetric) }} ≤ {{ entry.config.maxTcpMs ?? '不限' }} ms · 失败率 ≤ {{ entry.config.maxStabilityFailurePercent }}%</dd></div><div><dt>请求超时</dt><dd>TCP {{ entry.config.connectTimeoutMs }} ms · HTTPS {{ entry.config.requestTimeoutMs }} ms</dd></div>
+              <div><dt>HTTPS 请求超时</dt><dd>{{ entry.config.requestTimeoutMs }} ms</dd></div>
               <template v-if="entry.networkPath"><div><dt>测试网络接口</dt><dd>{{ entry.networkPath.interfaceName }}{{ entry.networkPath.tunnelInterface ? ' · 隧道接口' : '' }}</dd></div><div><dt>网络路径采样</dt><dd>{{ entry.networkPath.sampleIp }} · {{ favoriteDate(entry.networkPath.capturedAt) }}</dd></div></template>
               <div class="favorite-full"><dt>测试记录 ID</dt><dd class="mono">{{ entry.runId }}</dd></div>
             </dl>
-            <details v-if="entry.result.tcpStability?.probesMs.length" class="favorite-probes"><summary>TCP 逐次探测 · {{ entry.result.tcpStability.probesMs.length }} 次（ms）</summary><p class="mono">{{ favoriteProbes(entry.result.tcpStability.probesMs) }}</p></details>
               </section></td></tr>
             </template>
           </tbody>
@@ -380,16 +375,17 @@ onBeforeUnmount(() => {
 .favorite-danger:hover:not(:disabled) { color: var(--error); background: var(--error-bg); }
 .favorites-table { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--panel); scrollbar-gutter: stable; }
 .favorites-table table { width: 100%; min-width: 720px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; }
-.favorite-col-ip { width: 23%; }
-.favorite-col-folder { width: 14%; }
-.favorite-col-region { width: 19%; }
-.favorite-col-tcp { width: 13%; }
-.favorite-col-speed { width: 14%; }
-.favorite-col-actions { width: 17%; }
+.favorite-col-ip { width: 21%; }
+.favorite-col-folder { width: 12%; }
+.favorite-col-region { width: 14%; }
+.favorite-col-tcp { width: 25%; }
+.favorite-col-speed { width: 9%; }
+.favorite-col-actions { width: 19%; }
 .favorites-table th { position: sticky; top: 0; z-index: 2; height: 32px; padding: 5px 20px; border-bottom: 1px solid var(--line); background: linear-gradient(var(--bg),color-mix(in srgb,var(--bg) 65%,var(--panel))); color: var(--muted); font-size: 11px; font-weight: 500; line-height: 21px; white-space: nowrap; }
-.favorites-table th:nth-child(4), .favorites-table th:nth-child(5) { text-align: right; }
+.favorites-table th.favorite-tcp-cell, .favorites-table th.favorite-speed-cell { text-align: right; }
 .favorites-table th:last-child { padding-inline: 8px; text-align: center; }
 .favorite-data-row>td { height: 38px; padding: 3px 20px; border: 0; border-bottom: 1px solid var(--line-subtle); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; line-height: 20px; }
+.favorites-table th.favorite-tcp-cell, .favorites-table th.favorite-speed-cell, .favorite-data-row>td.favorite-tcp-cell, .favorite-data-row>td.favorite-speed-cell { padding-inline: 10px; }
 .favorite-data-row.is-alt { background: color-mix(in srgb,var(--bg) 45%,var(--panel)); }
 .favorite-data-row:hover, .favorite-data-row:focus-within, .favorite-data-row.is-expanded { background: color-mix(in srgb,var(--brand) 5%,var(--panel)); }
 .favorite-data-row:hover>td:first-child, .favorite-data-row.is-expanded>td:first-child { box-shadow: inset 2px 0 0 color-mix(in srgb,var(--brand) 55%,var(--line)); }
@@ -404,12 +400,10 @@ onBeforeUnmount(() => {
 .favorite-table-location { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; font-size: 12px; }
 .favorite-table-location>span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .favorite-pop { flex: 0 0 auto; padding: 0 4px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-sunken); color: var(--muted); font-size: 10px; line-height: 17px; letter-spacing: .1px; }
-.favorite-table-metric { display: flex; justify-content: flex-end; align-items: center; gap: 6px; font-variant-numeric: tabular-nums; }
-.favorite-metric-label { color: var(--muted); font-size: 9px; }
 .favorite-table-speed { display: block; text-align: right; font-variant-numeric: tabular-nums; }
 .favorite-table-speed.measured { color: var(--brand); font-weight: 600; }
 .favorite-data-row>td:last-child { min-width: 0; max-width: none; padding-inline: 8px; }
-.favorite-row-actions { display: flex; justify-content: center; align-items: center; gap: 3px; }
+.favorite-row-actions { display: flex; justify-content: center; align-items: center; gap: 1px; }
 .favorite-row-actions>.icon-button { width: 26px; height: 26px; min-height: 26px; padding: 6px; color: var(--muted); }
 .favorite-row-actions>.icon-button:hover:not(:disabled) { color: var(--brand); background: var(--soft); }
 .favorite-row-actions>.favorite-danger { color: var(--error); }
@@ -432,9 +426,7 @@ onBeforeUnmount(() => {
 .favorite-detail-grid dd { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 11px; line-height: 19px; }
 .favorite-full { grid-column: 1/-1; }
 .favorite-note-full { white-space: pre-wrap; }
-.favorite-probes { margin-top: 9px; font-size: 11px; }
-.favorite-probes>summary { cursor: pointer; color: var(--brand); }
-.favorite-probes>p { margin-top: 7px; padding: 9px; background: var(--surface-sunken); border-radius: 5px; overflow-wrap: anywhere; line-height: 19px; color: var(--muted); }
+.favorite-tcp-diagnostics { margin: 8px 0 12px; }
 .favorite-modal { width: min(450px,calc(100vw - 32px)); max-height: calc(100vh - 40px); padding: 0; border: 1px solid var(--line-hover); border-radius: 11px; color: var(--text); background: var(--surface-raised); box-shadow: 0 20px 70px #1c204533; }
 .favorite-modal::backdrop { background: #23243e42; backdrop-filter: blur(3px); }
 .favorite-modal>form { display: flex; flex-direction: column; max-height: calc(100vh - 42px); }
@@ -475,7 +467,7 @@ onBeforeUnmount(() => {
 .favorite-delete-button { color: var(--error-ink); background: var(--error); border-color: var(--error); }
 .favorite-delete-button:hover:not(:disabled) { color: var(--error-ink); background: var(--error); border-color: var(--error); }
 @media (max-width: 900px) { .favorites-identity { min-width: 150px; } .favorites-symbol { display: none; } .favorite-search { flex: 1; width: auto; } }
-@media (max-width: 800px) { .favorite-table-footer { padding-inline: 16px; } .favorite-folder-list, .favorite-context-row { padding-inline: 16px; } .favorite-test-job { margin-inline: 16px; } .favorites-table th, .favorite-data-row>td { padding-inline: 16px; } .favorite-data-row>td:nth-child(4), .favorite-data-row>td:nth-child(5) { padding-inline: 10px; } .favorite-data-row>td:last-child { padding-inline: 4px; } .favorite-row-toggle { gap: 5px; font-size: 12px; } .favorite-row-actions { gap: 0; } .favorite-row-actions>.icon-button { width: 24px; height: 26px; } .favorite-inline-detail { padding-inline: 16px; } .favorite-heading-hint { display: none; } .favorite-table-location { gap: 4px; font-size: 11px; } }
+@media (max-width: 800px) { .favorite-table-footer { padding-inline: 16px; } .favorite-folder-list, .favorite-context-row { padding-inline: 16px; } .favorite-test-job { margin-inline: 16px; } .favorites-table th, .favorite-data-row>td { padding-inline: 16px; } .favorite-data-row>td:last-child { padding-inline: 4px; } .favorite-row-toggle { gap: 5px; font-size: 12px; } .favorite-row-actions { gap: 0; } .favorite-row-actions>.icon-button { width: 24px; height: 26px; } .favorite-inline-detail { padding-inline: 16px; } .favorite-heading-hint { display: none; } .favorite-table-location { gap: 4px; font-size: 11px; } }
 @media (max-width: 650px) { .favorites-identity { flex: 1; } .favorite-search { order: 3; flex: 1 1 100%; } .favorite-folder-hint { display: none; } .favorite-context-row { gap: 7px; } .favorite-table-live-note { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } }
 @media (max-width: 440px) { .favorite-detail-grid { grid-template-columns: minmax(0,1fr); } .favorite-folder-actions>.text-button { font-size: 10px; } }
 </style>

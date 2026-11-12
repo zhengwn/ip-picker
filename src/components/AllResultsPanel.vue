@@ -3,11 +3,16 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { Activity, BarChart3, ChevronDown, ChevronLeft, ChevronRight, Copy, Search, SearchX, SlidersHorizontal } from '@lucide/vue'
 import { regionName, type IpResult, type ScanRun } from '../types'
-import { candidateExclusionReason, candidateMeasurementStatus, completeMeasurement, completedTcpMetricValue, hasPrecisionMeasurement, isDownloadShortlistExclusion, regionalPrecisionLimit, stabilityMetricLabel, stabilityVerdict, summarizeExclusions } from '../ui-state'
-import { readResultPreferences, saveResultPreferences, type ResultSortBy } from '../result-preferences'
+import { candidateExclusionReason, candidateMeasurementStatus, completeMeasurement, completedTcpMetricValue, hasPrecisionMeasurement, initialTcpFailureReason, isDownloadShortlistExclusion, observedFailurePercent, observedTcpMs, regionalPrecisionLimit, stabilityMetricLabel, stabilityVerdict, summarizeExclusions } from '../ui-state'
+import type { ResultSortBy, TcpDisplayMetric } from '../result-preferences'
+import { describeResultRow, tcpLatencyChartScale } from '../result-row-display'
+import { summarizeScanResults } from '../scan-result-summary'
 import { useDismissiblePopover } from '../popovers'
 import FavoriteButton from './FavoriteButton.vue'
 import SelectControl from './SelectControl.vue'
+import TcpDiagnostics from './TcpDiagnostics.vue'
+import TcpLatencyCell from './TcpLatencyCell.vue'
+import TcpLatencyHeader from './TcpLatencyHeader.vue'
 
 const props = defineProps<{ run: ScanRun; savedIps: Set<string>; favoriteDisabled: boolean }>()
 const emit = defineEmits<{ favorite: [result: IpResult, event: MouseEvent]; notify: [text: string, error?: boolean] }>()
@@ -22,14 +27,18 @@ async function copyIp(ip: string) {
   finally { copyingIp.value = null }
 }
 
-type ResultStatus = 'qualified' | 'measured' | 'rejected' | 'notDownloaded' | 'stability' | 'unfinished'
+type ResultStatus = 'qualified' | 'measured' | 'pendingSummary' | 'rejected' | 'notDownloaded' | 'stability' | 'unfinished'
 const query = ref('')
 const regionFilter = ref('all')
 const popFilter = ref('all')
 const statusFilter = ref('all')
-const preferences = readResultPreferences()
-const sortBy = ref<ResultSortBy>(preferences.sortBy)
-const completedDownloadOnly = ref(preferences.completedDownloadOnly)
+const sortBy = defineModel<ResultSortBy>('sortBy', { default: 'tcp' })
+const completedDownloadOnly = defineModel<boolean>('completedDownloadOnly', { default: true })
+const tcpDisplayMetric = defineModel<TcpDisplayMetric>('tcpDisplayMetric', { default: 'runMetric' })
+const initialIssuesOpen = ref(false)
+const initialIssueQuery = ref('')
+const initialIssuesTrigger = ref<HTMLButtonElement | null>(null)
+const initialIssueSearchInput = ref<HTMLInputElement | null>(null)
 const minDownloadMbps = ref<number | ''>('')
 const maxTcpMs = ref<number | ''>('')
 const moreFiltersOpen = ref(false)
@@ -45,6 +54,8 @@ const resultsTable = ref<HTMLElement | null>(null)
 const expandedIp = ref<string | null>(null)
 const page = ref(1)
 const pageSize = 50
+const ipOrder = new Intl.Collator(undefined, { numeric: true })
+const failureRateFormat = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 })
 const metric = computed(() => props.run.config.stabilityLatencyMetric ?? 'max')
 const metricName = computed(() => stabilityMetricLabel(metric.value))
 const runStatus = computed(() => ({ running: '测试中', completed: '已完成', cancelled: '已停止', failed: '测试失败' })[props.run.status])
@@ -55,14 +66,21 @@ const testTime = computed(() => {
 const statusOptions: { value: ResultStatus; label: string }[] = [
   { value: 'qualified', label: '完整测速达标' },
   { value: 'measured', label: '完整测速未达标' },
+  { value: 'pendingSummary', label: '测速完成 · 待汇总' },
   { value: 'rejected', label: '稳定性未达标／提前淘汰' },
   { value: 'notDownloaded', label: '稳定性已完成 · 未入选下载' },
   { value: 'stability', label: '稳定性达标 · 完整测速未通过' },
   { value: 'unfinished', label: '精测未完成' },
 ]
+const visibleStatusOptions = computed(() => props.run.status === 'running'
+  ? statusOptions : statusOptions.filter(option => option.value !== 'pendingSummary'))
 
 function status(result: IpResult): ResultStatus {
-  if (completeMeasurement(result, props.run.config)) return result.eligible ? 'qualified' : 'measured'
+  if (completeMeasurement(result, props.run.config)) {
+    // The engine assigns eligibility when it ranks the finished run.
+    if (props.run.status === 'running') return 'pendingSummary'
+    return result.eligible ? 'qualified' : 'measured'
+  }
   if (isDownloadShortlistExclusion(result)) return 'notDownloaded'
   const verdict = stabilityVerdict(result, props.run.config)
   if (verdict === 'failed') return 'rejected'
@@ -71,7 +89,6 @@ function status(result: IpResult): ResultStatus {
 }
 function location(code: string) { return /^[A-Z]{2}$/.test(code) ? regionName(code) : '未知地区' }
 function firstPop(result: IpResult) { return result.colo || result.observedColos[0] || '' }
-function locationCode(code: string) { return /^[A-Z]{2}$/.test(code) ? code : '?' }
 function fixed(value: number | null) { return value != null && Number.isFinite(value) ? value.toFixed(1) : '—' }
 function downloadValue(result: IpResult): number | null {
   return result.downloadSamplesMbps.length && Number.isFinite(result.downloadMbps) ? result.downloadMbps : null
@@ -86,20 +103,44 @@ function completeDownloadValue(result: IpResult): number | null {
 function initialTcp(result: IpResult): number | null {
   return Number.isFinite(result.tcpMs) && (result.tcpMs > 0 || result.attempts > 0 || !!result.colo) ? result.tcpMs : null
 }
+function hasInitialTcpIssue(result: IpResult) {
+  return !!initialTcpFailureReason(result) || result.exclusionCode === 'tcpLatency'
+    || (!result.exclusionCode && /^TCP 延迟 .*超过上限/.test(result.exclusionReason ?? ''))
+}
 function compareNullable(a: number | null, b: number | null, descending = false) {
   if (a == null) return b == null ? 0 : 1
   if (b == null) return -1
   return descending ? b - a : a - b
 }
-function compareIps(a: string, b: string) { return a.localeCompare(b, undefined, { numeric: true }) }
 
-const records = computed(() => props.run.results.filter(hasPrecisionMeasurement).map(result => ({
-  result,
-  status: status(result),
-  download: completeDownloadValue(result),
-  tcp: completedTcpMetricValue(result, metric.value),
-  reason: candidateExclusionReason(result) || result.tcpStability?.earlyRejection,
-})))
+function record(result: IpResult) {
+  const tcp = completedTcpMetricValue(result, metric.value)
+  const resultStatus = status(result)
+  return {
+    result,
+    status: resultStatus,
+    download: completeDownloadValue(result),
+    tcp,
+    tcpFailurePercent: observedFailurePercent(result.tcpStability),
+    reason: candidateExclusionReason(result) || result.tcpStability?.earlyRejection,
+    display: describeResultRow(result, props.run, tcp, initialTcp(result), resultStatus),
+  }
+}
+function sortValue(entry: ReturnType<typeof record>, order: ResultSortBy): number | null {
+  switch (order) {
+    case 'tcp': return entry.tcp
+    case 'medianTcp': return observedTcpMs(entry.result.tcpStability, 'medianMs')
+    case 'averageTcp': return observedTcpMs(entry.result.tcpStability, 'averageMs')
+    case 'tcpFailure': return entry.tcpFailurePercent
+    case 'initialTcp': return initialTcp(entry.result)
+    case 'download': return downloadValue(entry.result)
+    case 'ip': return null
+  }
+}
+const precisionRecords = computed(() => props.run.results.filter(hasPrecisionMeasurement).map(record))
+const initialIssueResults = computed(() => props.run.results.filter(result => !hasPrecisionMeasurement(result) && hasInitialTcpIssue(result)))
+const records = computed(() => initialIssuesOpen.value ? initialIssueResults.value.map(record) : precisionRecords.value)
+const tcpChartScaleMs = computed(() => tcpLatencyChartScale(props.run.results))
 const regionalStats = computed(() => {
   const run = props.run
   const limit = regionalPrecisionLimit(run.config)
@@ -130,17 +171,20 @@ function downloadDescription(result: IpResult) {
   const completion = completeDownloadValue(result) != null ? '已完成下载测速' : `尚未取得完整有效的下载结果：已记录 ${result.downloadSamplesMbps.length} / ${props.run.config.downloadRounds} 轮样本`
   return `${completion}，${fixed(value)} Mbps；横条相对于本轮最高已测速率 ${fixed(maxDownloadMbps.value)} Mbps`
 }
-const completeCount = computed(() => records.value.filter(record => ['qualified', 'measured'].includes(record.status)).length)
-const downloadedCount = computed(() => records.value.filter(record => record.download != null).length)
-const regionOptions = computed(() => [...new Set(records.value.map(record => record.result.regionCode))]
+const downloadedCount = computed(() => precisionRecords.value.filter(record => record.download != null).length)
+const roundSummary = computed(() => props.run.status === 'running' ? null : summarizeScanResults(props.run, downloadedCount.value))
+const canFilterDownloads = computed(() => props.run.status === 'running' || downloadedCount.value > 0)
+const downloadFilterActive = computed(() => !initialIssuesOpen.value && canFilterDownloads.value && completedDownloadOnly.value)
+function count(value: number) { return value.toLocaleString('zh-CN') }
+const regionOptions = computed(() => [...new Set(precisionRecords.value.map(record => record.result.regionCode))]
   .sort((a, b) => location(a).localeCompare(location(b), 'zh-CN')))
-const popOptions = computed(() => [...new Set(records.value
+const popOptions = computed(() => [...new Set(precisionRecords.value
   .filter(record => regionFilter.value === 'all' || record.result.regionCode === regionFilter.value)
   .map(record => firstPop(record.result))
   .filter(Boolean))].sort())
 const matchingRecords = computed(() => {
   const search = query.value.trim().toLowerCase()
-  return records.value.filter(({ result, download, tcp }) => {
+  return precisionRecords.value.filter(({ result, download, tcp }) => {
     return (regionFilter.value === 'all' || result.regionCode === regionFilter.value)
       && (popFilter.value === 'all' || firstPop(result) === popFilter.value)
       && (minDownloadMbps.value === '' || (download != null && download >= minDownloadMbps.value))
@@ -148,59 +192,80 @@ const matchingRecords = computed(() => {
       && (!search || [result.ip, result.colo, result.city, result.regionCode, location(result.regionCode), ...result.observedColos].some(value => value.toLowerCase().includes(search)))
   })
 })
-const statusCandidates = computed(() => completedDownloadOnly.value ? matchingRecords.value.filter(record => record.download != null) : matchingRecords.value)
+const statusCandidates = computed(() => downloadFilterActive.value ? matchingRecords.value.filter(record => record.download != null) : matchingRecords.value)
 const statusCounts = computed(() => Object.fromEntries(statusOptions.map(option => [option.value, statusCandidates.value.filter(record => record.status === option.value).length])))
-const statusDownloadConflict = computed(() => completedDownloadOnly.value
+const statusDownloadConflict = computed(() => downloadFilterActive.value
   && statusFilter.value !== 'all'
   && statusCounts.value[statusFilter.value] === 0
   && matchingRecords.value.some(record => record.status === statusFilter.value))
-const filtered = computed(() => statusCandidates.value
-  .filter(record => statusFilter.value === 'all' || record.status === statusFilter.value)
-  .sort((a, b) => {
-    const first = a.result
-    const second = b.result
-    const difference = sortBy.value === 'tcp'
-      ? compareNullable(a.tcp, b.tcp)
-      : sortBy.value === 'initialTcp'
-        ? compareNullable(initialTcp(first), initialTcp(second))
-        : sortBy.value === 'download'
-          ? compareNullable(downloadValue(first), downloadValue(second), true)
-          : 0
-    return difference || compareIps(first.ip, second.ip)
-  }))
+const filtered = computed(() => {
+  if (initialIssuesOpen.value) {
+    const search = initialIssueQuery.value.trim()
+    return records.value.filter(({ result }) => result.ip.includes(search))
+      .sort((a, b) => ipOrder.compare(a.result.ip, b.result.ip))
+  }
+  return statusCandidates.value
+    .filter(record => statusFilter.value === 'all' || record.status === statusFilter.value)
+    .sort((a, b) => {
+      const order = sortBy.value
+      const difference = compareNullable(sortValue(a, order), sortValue(b, order), order === 'download')
+      return difference || ipOrder.compare(a.result.ip, b.result.ip)
+    })
+})
 const pageCount = computed(() => Math.max(1, Math.ceil(filtered.value.length / pageSize)))
 const currentPage = computed(() => Math.min(page.value, pageCount.value))
 const firstRow = computed(() => (currentPage.value - 1) * pageSize)
 const visibleRows = computed(() => filtered.value.slice(firstRow.value, firstRow.value + pageSize))
-const transientFilterCount = computed(() => [!!query.value.trim(), regionFilter.value !== 'all', popFilter.value !== 'all', statusFilter.value !== 'all', minDownloadMbps.value !== '', maxTcpMs.value !== ''].filter(Boolean).length)
 const moreFilterCount = computed(() => [statusFilter.value !== 'all', minDownloadMbps.value !== '', maxTcpMs.value !== ''].filter(Boolean).length)
-const hasFilters = computed(() => transientFilterCount.value > 0 || completedDownloadOnly.value)
+const transientFilterCount = computed(() => initialIssuesOpen.value ? Number(!!initialIssueQuery.value.trim())
+  : [!!query.value.trim(), regionFilter.value !== 'all', popFilter.value !== 'all'].filter(Boolean).length + moreFilterCount.value)
+const hasFilters = computed(() => transientFilterCount.value > 0 || downloadFilterActive.value)
 const emptyTitle = computed(() => {
-  if (records.value.length) return completedDownloadOnly.value && !downloadedCount.value && !transientFilterCount.value ? (props.run.status === 'running' ? '下载结果正在路上' : '本轮没有完成下载测速的 IP') : '没有符合条件的结果'
-  return props.run.status === 'running' ? '正在寻找可精测的 IP' : '本轮尚未取得精测结果'
+  if (initialIssuesOpen.value) return records.value.length ? '找不到这个 IP 的初筛记录' : '本轮暂无初筛问题'
+  if (!records.value.length) return props.run.status === 'running' ? '正在寻找可精测的 IP' : '本轮没有精测记录'
+  return downloadFilterActive.value && !downloadedCount.value && !transientFilterCount.value ? '还没有完成下载的 IP' : '没有符合条件的精测结果'
 })
 const emptyDescription = computed(() => {
+  if (initialIssuesOpen.value) return records.value.length ? '清除搜索可查看本轮全部初筛问题。' : ''
   if (statusDownloadConflict.value) return '「仅完成下载」隐藏了符合所选状态的记录。'
-  if (records.value.length) return completedDownloadOnly.value && !downloadedCount.value && !transientFilterCount.value ? '已取得的稳定性记录仍然保留，可关闭下载筛选查看。' : '试试放宽地区、POP 或指标限制，查看其他已测结果。'
-  return props.run.status === 'running' ? '完成连通性检查与地区识别后，精测数据会在这里实时出现。' : '可在「分区统计」查看地区识别情况和已记录的排除原因。'
+  if (records.value.length) return downloadFilterActive.value ? '可取消下载筛选，查看已取得的 TCP 精测记录。' : ''
+  return props.run.status === 'running' ? '完成初筛和地区识别后，精测记录会显示在这里。' : ''
 })
-function resetTransientFilters() { query.value = ''; regionFilter.value = 'all'; popFilter.value = 'all'; statusFilter.value = 'all'; minDownloadMbps.value = ''; maxTcpMs.value = '' }
+function resetTransientFilters() {
+  if (initialIssuesOpen.value) {
+    initialIssueQuery.value = ''
+    return
+  }
+  query.value = ''
+  regionFilter.value = 'all'
+  popFilter.value = 'all'
+  statusFilter.value = 'all'
+  minDownloadMbps.value = ''
+  maxTcpMs.value = ''
+}
+async function setInitialIssuesOpen(open: boolean) {
+  moreFiltersOpen.value = false
+  initialIssuesOpen.value = open
+  await nextTick()
+  const target = initialIssuesOpen.value ? initialIssueSearchInput.value : initialIssuesTrigger.value
+  target?.focus({ preventScroll: true })
+}
 async function includeIncompleteDownloads() {
   completedDownloadOnly.value = false
   await nextTick()
   statusSelect.value?.focus({ preventScroll: true })
 }
 
-watch([completedDownloadOnly, sortBy], ([completedDownloadOnly, sortBy]) => {
-  saveResultPreferences({ completedDownloadOnly, sortBy })
-}, { immediate: true, flush: 'sync' })
 watch(popOptions, options => {
   if (popFilter.value !== 'all' && !options.includes(popFilter.value)) popFilter.value = 'all'
 })
+watch(() => props.run.status, status => {
+  if (status !== 'running' && statusFilter.value === 'pendingSummary') statusFilter.value = 'all'
+})
 async function resetTableScroll() { await nextTick(); if (resultsTable.value) resultsTable.value.scrollTop = 0 }
-watch([query, regionFilter, popFilter, statusFilter, sortBy, completedDownloadOnly, minDownloadMbps, maxTcpMs], () => { page.value = 1; expandedIp.value = null; void resetTableScroll() })
+watch([query, regionFilter, popFilter, statusFilter, sortBy, completedDownloadOnly, minDownloadMbps, maxTcpMs, initialIssuesOpen, initialIssueQuery], () => { page.value = 1; expandedIp.value = null; void resetTableScroll() })
 watch(currentPage, () => { expandedIp.value = null; void resetTableScroll() })
-watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expandedIp.value = null; summaryOpen.value = false })
+watch(() => props.run.id, () => { initialIssuesOpen.value = false; initialIssueQuery.value = ''; resetTransientFilters(); page.value = 1; expandedIp.value = null; summaryOpen.value = false })
 </script>
 
 <template>
@@ -208,17 +273,17 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
     <div class="all-results-controls">
     <div class="all-results-heading">
       <h2 id="all-results-title">测试结果</h2>
-      <span class="status-label" :class="{ active: run.status === 'running', good: run.status === 'completed', quiet: run.status === 'cancelled', error: run.status === 'failed' }" role="status" aria-live="polite">{{ runStatus }}</span>
-      <span class="results-summary muted small" :title="`完整测速通过 ${completeCount} 个 IP`"><span>精测 <strong>{{ records.length }}</strong></span><span class="summary-divider" aria-hidden="true" /><span>完成下载 <strong>{{ downloadedCount }}</strong></span></span>
+      <span class="status-label" :class="{ active: run.status === 'running', good: run.status === 'completed' && downloadedCount > 0, quiet: run.status === 'cancelled' || run.status === 'completed' && !downloadedCount, error: run.status === 'failed' }" role="status" aria-live="polite">{{ runStatus }}</span>
+      <time v-if="testTime" class="results-test-time muted" :datetime="run.startedAt" title="本轮开始时间">{{ testTime }}</time>
       <template v-if="run.status !== 'running'">
         <button ref="summaryTrigger" type="button" class="button more-filters-button run-summary-button" :class="{ 'is-active': summaryOpen }" :aria-expanded="summaryOpen" aria-controls="run-summary" @click="summaryOpen = !summaryOpen">
-          <BarChart3 :size="13" aria-hidden="true" />分区统计<ChevronDown :size="12" :class="{ 'is-open': summaryOpen }" aria-hidden="true" />
+          <BarChart3 :size="13" aria-hidden="true" />各地区详情<ChevronDown :size="12" :class="{ 'is-open': summaryOpen }" aria-hidden="true" />
         </button>
         <section v-if="summaryOpen" id="run-summary" ref="summaryPanel" class="run-summary-panel" aria-labelledby="run-summary-title" tabindex="0">
-          <h3 id="run-summary-title">本轮分区统计</h3>
-          <p>{{ run.error || run.progress.message }}</p>
+          <h3 id="run-summary-title">各地区测速详情</h3>
+          <p v-if="run.error">{{ run.error }}</p>
           <table>
-            <thead><tr><th scope="col">目标地区</th><th scope="col">已识别</th><th scope="col">已入围</th><th scope="col">稳定性通过</th><th scope="col">完成下载</th></tr></thead>
+            <thead><tr><th scope="col">目标地区</th><th scope="col">识别到的 IP</th><th scope="col">入围复测</th><th scope="col">稳定性通过</th><th scope="col">完成下载</th></tr></thead>
             <tbody>
               <tr v-for="region in regionalStats" :key="region.code">
                 <th scope="row">{{ location(region.code) }}</th>
@@ -229,7 +294,7 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
               </tr>
             </tbody>
           </table>
-          <p>统计涵盖本轮所有观测，不受筛选影响。完成下载表示已取得本轮所需的有效下载样本。<template v-if="regionalStats.some(region => region.admitted == null)"> — 表示入围数无法确认。</template></p>
+          <p>统计涵盖本轮所有观测。<template v-if="regionalStats.some(region => region.admitted == null)"> — 表示入围数无法确认。</template></p>
           <h4>本轮排除或未完成原因</h4>
           <ul v-if="exclusions.length">
             <li v-for="item in exclusions" :key="item.key"><span>{{ item.label }}</span><strong>{{ item.count }}</strong></li>
@@ -237,25 +302,64 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
           <p v-else>暂无已记录的排除或未完成原因。</p>
         </section>
       </template>
-      <time v-if="testTime" class="results-test-time muted small" :datetime="run.startedAt">{{ testTime }}</time>
     </div>
 
-    <div class="all-results-filters">
-      <label class="field results-search"><span class="visually-hidden">搜索 IP / POP</span><span class="results-search-control"><Search :size="14" aria-hidden="true" /><input v-model="query" type="search" placeholder="搜索 IP、POP 或地区" aria-label="搜索 IP / POP" /></span></label>
-      <label class="field"><span class="visually-hidden">地区</span><SelectControl compact><select v-model="regionFilter" aria-label="地区"><option value="all">全部地区</option><option v-for="code in regionOptions" :key="code" :value="code">{{ location(code) }}{{ /^[A-Z]{2}$/.test(code) ? ` · ${code}` : '' }}</option></select></SelectControl></label>
-      <label class="field"><span class="visually-hidden">POP</span><SelectControl compact><select v-model="popFilter" aria-label="POP"><option value="all">全部 POP</option><option v-for="code in popOptions" :key="code" :value="code">{{ code }}</option></select></SelectControl></label>
-      <label class="field results-sort"><span class="visually-hidden">排序</span><SelectControl compact><select v-model="sortBy" aria-label="排序"><option value="tcp">TCP {{ metricName }} 从低到高</option><option value="download">下载速度从高到低</option><option value="initialTcp">TCP 初筛从低到高</option><option value="ip">IP 地址排序</option></select></SelectControl></label>
+    <div v-if="roundSummary" class="results-overview">
+      <div class="results-overview-outcome">
+        <p class="results-overview-title">{{ roundSummary.headline }}</p>
+        <p v-if="roundSummary.detail" class="results-overview-detail">{{ roundSummary.detail }}</p>
+      </div>
+      <dl class="results-overview-counts" aria-label="本轮各阶段的 IP 数量">
+        <div>
+          <dt>已做初筛</dt>
+          <dd>
+            {{ count(roundSummary.checkedCandidates) }}<span v-if="roundSummary.checkedCandidates < roundSummary.totalCandidates" title="已初筛 / 抽样数"> / {{ count(roundSummary.totalCandidates) }}</span>
+            <button v-if="initialIssueResults.length && !initialIssuesOpen" ref="initialIssuesTrigger" type="button" class="text-button initial-issues-link" @click="setInitialIssuesOpen(true)">查看初筛异常（{{ count(initialIssueResults.length) }}）<ChevronRight :size="11" aria-hidden="true" /></button>
+          </dd>
+        </div>
+        <div><dt>有精测记录</dt><dd>{{ count(roundSummary.precisionCount) }}</dd></div>
+        <div><dt>完成下载</dt><dd>{{ count(roundSummary.downloadedCount) }}</dd></div>
+      </dl>
+    </div>
+
+    <div v-if="initialIssuesOpen" class="initial-issues-toolbar">
+      <button type="button" class="text-button initial-issues-back" @click="setInitialIssuesOpen(false)"><ChevronLeft :size="14" aria-hidden="true" />返回精测结果</button>
+      <h3>初筛异常</h3>
+      <label class="field initial-issues-search">
+        <span class="visually-hidden">搜索初筛异常 IP</span>
+        <span class="results-search-control"><Search :size="14" aria-hidden="true" /><input ref="initialIssueSearchInput" v-model="initialIssueQuery" type="search" placeholder="搜索 IP 地址" aria-label="搜索初筛异常 IP" /></span>
+      </label>
+      <button v-if="transientFilterCount" class="text-button" @click="resetTransientFilters">清除搜索</button>
+    </div>
+    <div v-else-if="canFilterDownloads || transientFilterCount || (!roundSummary && initialIssueResults.length)" class="results-filter-toolbar">
+      <label v-if="canFilterDownloads" class="check-field">
+        <input v-model="completedDownloadOnly" type="checkbox" aria-describedby="completed-download-help" /><span>仅完成下载</span>
+      </label>
+      <span v-if="canFilterDownloads" id="completed-download-help" class="visually-hidden">只显示取得全部有效下载样本的 IP；此选择会自动保存。</span>
+      <button v-if="!roundSummary && initialIssueResults.length" ref="initialIssuesTrigger" type="button" class="text-button" @click="setInitialIssuesOpen(true)">查看 {{ count(initialIssueResults.length) }} 个初筛异常<ChevronRight :size="12" aria-hidden="true" /></button>
+      <button v-if="transientFilterCount" class="text-button clear-result-filters" @click="resetTransientFilters">清除筛选</button>
+    </div>
+
+    <div v-if="!initialIssuesOpen" class="all-results-filters">
+      <label class="field results-search"><span class="visually-hidden">搜索 IP、地区或机房</span><span class="results-search-control"><Search :size="14" aria-hidden="true" /><input v-model="query" type="search" placeholder="搜索 IP、地区或机房" aria-label="搜索 IP、地区或机房" /></span></label>
+      <label class="field"><span class="visually-hidden">地区</span><SelectControl compact><select v-model="regionFilter" aria-label="地区"><option value="all">全部地区</option><option v-if="regionFilter !== 'all' && !regionOptions.includes(regionFilter)" :value="regionFilter">{{ location(regionFilter) }}</option><option v-for="code in regionOptions" :key="code" :value="code">{{ location(code) }}{{ /^[A-Z]{2}$/.test(code) ? ` · ${code}` : '' }}</option></select></SelectControl></label>
+      <label class="field"><span class="visually-hidden">机房（POP）</span><SelectControl compact><select v-model="popFilter" aria-label="机房（POP）"><option value="all">全部机房</option><option v-if="popFilter !== 'all' && !popOptions.includes(popFilter)" :value="popFilter">{{ popFilter }}</option><option v-for="code in popOptions" :key="code" :value="code">{{ code }}</option></select></SelectControl></label>
+      <label class="field results-sort"><span class="visually-hidden">排序</span><SelectControl compact>
+        <select v-model="sortBy" aria-label="排序">
+          <option value="tcp">复测延迟（{{ metricName }}）升序</option>
+          <option value="medianTcp">中位延迟从低到高</option>
+          <option value="averageTcp">样本平均延迟从低到高</option>
+          <option value="tcpFailure">连接失败率从低到高</option>
+          <option value="download">下载速度从高到低</option>
+          <option value="initialTcp">初筛延迟从低到高</option>
+          <option value="ip">IP 地址排序</option>
+        </select>
+      </SelectControl></label>
       <button ref="moreFiltersTrigger" class="button more-filters-button" :class="{ 'is-active': moreFiltersOpen || moreFilterCount }" :aria-expanded="moreFiltersOpen" aria-controls="additional-result-filters" @click="moreFiltersOpen = !moreFiltersOpen"><SlidersHorizontal :size="13" />更多筛选<span v-if="moreFilterCount" class="filter-count">{{ moreFilterCount }}</span><ChevronDown :size="12" :class="{ 'is-open': moreFiltersOpen }" /></button>
     </div>
-    <div class="results-filter-toolbar">
-      <label class="check-field"><input v-model="completedDownloadOnly" type="checkbox" aria-describedby="completed-download-help" /><span>仅完成下载</span></label>
-      <span id="completed-download-help" class="visually-hidden">只显示已测满 {{ run.config.downloadRounds }} 轮下载的 IP；此选择会自动保存。</span>
-      <span v-if="transientFilterCount" class="muted small">已应用 {{ transientFilterCount }} 项筛选</span>
-      <button v-if="transientFilterCount" class="text-button" @click="resetTransientFilters">清除筛选</button>
-    </div>
-    <div v-if="moreFiltersOpen" id="additional-result-filters" ref="moreFiltersPanel" class="additional-result-filters">
+    <div v-if="moreFiltersOpen && !initialIssuesOpen" id="additional-result-filters" ref="moreFiltersPanel" class="additional-result-filters">
       <div class="all-results-thresholds">
-        <label class="field"><span>测试状态</span><SelectControl compact><select ref="statusSelect" v-model="statusFilter" aria-label="测试状态"><option value="all">全部状态 · {{ statusCandidates.length }}</option><option v-for="option in statusOptions" :key="option.value" :value="option.value">{{ option.label }} · {{ statusCounts[option.value] }}</option></select></SelectControl></label>
+        <label class="field"><span>测试状态</span><SelectControl compact><select ref="statusSelect" v-model="statusFilter" aria-label="测试状态"><option value="all">全部状态 · {{ statusCandidates.length }}</option><option v-for="option in visibleStatusOptions" :key="option.value" :value="option.value">{{ option.label }} · {{ statusCounts[option.value] }}</option></select></SelectControl></label>
         <label class="field"><span>最低下载速度（Mbps）</span><input v-model.number="minDownloadMbps" type="number" min="0" step="any" placeholder="不限" aria-describedby="results-threshold-help" /></label>
         <label class="field"><span>最高 TCP {{ metricName }}（ms）</span><input v-model.number="maxTcpMs" type="number" min="0" step="any" placeholder="不限" aria-describedby="results-threshold-help" /></label>
       </div>
@@ -264,38 +368,75 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
     </div>
     </div>
 
-    <div v-if="visibleRows.length" ref="resultsTable" class="all-results-table" role="region" aria-label="全部精测结果表格，可滚动" tabindex="0">
-      <table>
-        <colgroup><col class="ip-column" /><col class="location-column" /><col class="tcp-column" /><col class="download-column" /><col class="favorite-column" /></colgroup>
-        <thead><tr><th scope="col">IP 地址</th><th scope="col">地区 / POP</th><th scope="col" :title="`TCP ${metricName}延迟`">TCP {{ metricName }} <span class="table-unit">ms</span></th><th scope="col">下载 <span class="table-unit">Mbps</span></th><th scope="col">收藏</th></tr></thead>
+    <div v-if="visibleRows.length" ref="resultsTable" class="all-results-table" role="region" :aria-label="initialIssuesOpen ? '初筛连接问题表格，可滚动' : '全部精测结果表格，可滚动'" tabindex="0">
+      <table :class="{ 'initial-issues-table': initialIssuesOpen }">
+        <colgroup>
+          <col class="ip-column" />
+          <col v-if="!initialIssuesOpen" class="location-column" />
+          <col class="outcome-column" />
+          <col class="tcp-column" />
+          <col v-if="!initialIssuesOpen" class="download-column" />
+          <col class="favorite-column" />
+        </colgroup>
+        <thead><tr>
+          <th scope="col">IP 地址</th>
+          <th v-if="!initialIssuesOpen" scope="col">地区 / 机房</th>
+          <th scope="col">{{ initialIssuesOpen ? '初筛结论' : '测试结论' }}</th>
+          <th scope="col" class="result-measurement-cell">
+            <template v-if="initialIssuesOpen">连接耗时 <span class="table-unit">ms</span></template>
+            <TcpLatencyHeader v-else v-model="tcpDisplayMetric" :run-metric="metric" />
+          </th>
+          <th v-if="!initialIssuesOpen" scope="col" class="result-measurement-cell">下载 <span class="table-unit">Mbps</span></th>
+          <th scope="col">收藏</th>
+        </tr></thead>
         <tbody>
           <template v-for="(record, index) in visibleRows" :key="record.result.ip">
             <tr :class="{ striped: index % 2 === 1 }">
               <td><span class="result-ip-cell">
-                <button v-if="record.reason || (run.status !== 'running' && record.status !== 'qualified')" type="button" class="icon-button result-reason-trigger" :aria-label="`查看 ${record.result.ip} 的测速原因`" title="查看测速原因" :aria-expanded="expandedIp === record.result.ip" :aria-controls="expandedIp === record.result.ip ? `result-reason-${record.result.ip}` : undefined" @click="expandedIp = expandedIp === record.result.ip ? null : record.result.ip">
+                <button v-if="initialIssuesOpen || record.reason || record.result.tcpStability?.attempted || (run.status !== 'running' && record.status !== 'qualified')" type="button" class="icon-button result-reason-trigger" :aria-label="`查看 ${record.result.ip} 的测速详情`" title="查看测速详情" :aria-expanded="expandedIp === record.result.ip" :aria-controls="expandedIp === record.result.ip ? `result-reason-${record.result.ip}` : undefined" @click="expandedIp = expandedIp === record.result.ip ? null : record.result.ip">
                   <ChevronRight :size="13" aria-hidden="true" />
                 </button>
                 <span class="mono result-ip">{{ record.result.ip }}</span><button class="icon-button result-copy" :disabled="!desktop || copyingIp !== null" :aria-label="`复制 IP ${record.result.ip}`" :title="desktop ? '复制 IP 地址' : '请在桌面应用中复制'" @click="copyIp(record.result.ip)"><Copy :size="13" aria-hidden="true" /></button></span></td>
-              <td :title="record.result.observedColos.length > 1 ? `本次观测 POP：${record.result.observedColos.join(' / ')}；显示首次观测` : undefined"><span class="location-cell"><span class="region-badge" :title="record.result.regionCode">{{ locationCode(record.result.regionCode) }}</span><span class="location-name">{{ location(record.result.regionCode) }}</span><span v-if="firstPop(record.result)" class="result-pop">{{ firstPop(record.result) }}</span></span></td>
-              <td><span class="result-number">{{ fixed(record.tcp) }}</span></td>
-              <td><span class="speed-cell" :class="{ 'is-partial': downloadValue(record.result) != null && record.download == null }" :title="downloadDescription(record.result)"><span v-if="downloadValue(record.result) != null && maxDownloadMbps > 0" class="speed-meter" aria-hidden="true"><span :style="{ width: relativeDownloadWidth(record.result) }" /></span><span class="result-number" :class="{ 'result-speed': record.download != null }">{{ fixed(downloadValue(record.result)) }}</span></span></td>
+              <td v-if="!initialIssuesOpen" :title="record.result.observedColos.length > 1 ? `本次观测到的机房 ${record.result.observedColos.join(' / ')}。表格显示首次观测。` : undefined"><span class="location-cell"><span class="location-name">{{ location(record.result.regionCode) }}</span><span v-if="firstPop(record.result)" class="result-pop">{{ firstPop(record.result) }}</span></span></td>
+              <td>
+                <span class="result-outcome" :data-tone="record.display.outcome.tone" :title="record.reason || record.display.outcome.label">{{ record.display.outcome.label }}</span>
+                <small v-if="!initialIssuesOpen && record.result.tcpStability && record.tcpFailurePercent != null" class="result-tcp-failures" title="TCP 连接失败次数 / 已探测次数">
+                  失败 {{ record.result.tcpStability.failed }}/{{ record.result.tcpStability.attempted }} · {{ failureRateFormat.format(record.tcpFailurePercent) }}%
+                </small>
+              </td>
+              <td class="result-measurement-cell">
+                <template v-if="initialIssuesOpen">
+                  <span v-if="record.result.tcpConnectFailure?.elapsedMs != null && Number.isFinite(record.result.tcpConnectFailure.elapsedMs) && record.result.tcpConnectFailure.elapsedMs >= 0" class="result-tcp-value"><small>失败前等待</small><span class="result-number">{{ fixed(record.result.tcpConnectFailure.elapsedMs) }}</span></span>
+                  <span v-else-if="record.display.tcp" class="result-tcp-value" :title="record.display.tcp.title"><small>{{ record.display.tcp.label }}</small><span class="result-number">{{ fixed(record.display.tcp.value) }}</span></span>
+                  <span v-else class="result-value-missing">未测得</span>
+                </template>
+                <TcpLatencyCell v-else :result="record.result" :run-metric="metric" :completed-value="record.tcp"
+                  :display-metric="tcpDisplayMetric" :scale-max-ms="tcpChartScaleMs" />
+              </td>
+              <td v-if="!initialIssuesOpen" class="result-measurement-cell">
+                <span v-if="downloadValue(record.result) == null" class="result-value-missing" :title="record.reason || downloadDescription(record.result)">{{ record.display.missingDownload }}</span>
+                <template v-else>
+                  <span class="speed-cell" :class="{ 'is-partial': record.download == null }" :title="downloadDescription(record.result)"><span v-if="maxDownloadMbps > 0" class="speed-meter" aria-hidden="true"><span :style="{ width: relativeDownloadWidth(record.result) }" /></span><span class="result-number" :class="{ 'result-speed': record.download != null }">{{ fixed(downloadValue(record.result)) }}</span></span>
+                  <span v-if="record.download == null" class="result-value-missing">部分样本</span>
+                </template>
+              </td>
               <td><FavoriteButton :ip="record.result.ip" :saved="savedIps.has(record.result.ip)" :disabled="favoriteDisabled" compact @click="$emit('favorite', record.result, $event)" /></td>
             </tr>
             <tr v-if="expandedIp === record.result.ip" :id="`result-reason-${record.result.ip}`" class="result-reason-row">
-              <td colspan="5">
+              <td :colspan="initialIssuesOpen ? 4 : 6">
                 <strong>{{ candidateMeasurementStatus(record.result, run) }}</strong>
                 <p v-if="record.reason">{{ record.reason }}</p>
-                <p v-else>本轮未记录其他原因。</p>
+                <TcpDiagnostics :result="record.result" :config="run.config" />
               </td>
             </tr>
           </template>
         </tbody>
       </table>
     </div>
-    <div v-else class="all-results-empty"><span class="results-empty-icon"><Activity v-if="run.status === 'running' && !records.length" :size="24" /><SearchX v-else :size="24" /></span><h3>{{ emptyTitle }}</h3><p>{{ emptyDescription }}</p><div v-if="records.length" class="results-empty-actions"><button v-if="transientFilterCount" class="button" @click="resetTransientFilters">清除筛选</button><button v-if="completedDownloadOnly" class="text-button" @click="completedDownloadOnly = false">查看含未完成下载的结果<ChevronRight :size="14" /></button></div></div>
+    <div v-else class="all-results-empty"><span class="results-empty-icon"><Activity v-if="run.status === 'running' && !records.length" :size="24" /><SearchX v-else :size="24" /></span><h3>{{ emptyTitle }}</h3><p v-if="emptyDescription">{{ emptyDescription }}</p><div v-if="!initialIssuesOpen && records.length && (transientFilterCount || downloadFilterActive)" class="results-empty-actions"><button v-if="transientFilterCount" class="button" @click="resetTransientFilters">清除筛选</button><button v-if="downloadFilterActive" class="text-button" @click="completedDownloadOnly = false">查看全部精测结果<ChevronRight :size="14" /></button></div></div>
     <div class="all-results-footer">
-      <span class="muted small" role="status" aria-live="polite">{{ hasFilters ? `显示 ${filtered.length} / ${records.length} 个结果` : `共 ${records.length} 个结果` }}{{ filtered.length > pageSize ? ` · 当前 ${firstRow + 1}–${firstRow + visibleRows.length}` : '' }}</span>
-      <nav v-if="pageCount > 1" class="all-results-pagination" aria-label="精测结果分页"><span class="muted small">{{ currentPage }} / {{ pageCount }} 页</span><button class="icon-button" :disabled="currentPage <= 1" aria-label="上一页" @click="page = currentPage - 1"><ChevronLeft :size="15" aria-hidden="true" /></button><button class="icon-button" :disabled="currentPage >= pageCount" aria-label="下一页" @click="page = currentPage + 1"><ChevronRight :size="15" aria-hidden="true" /></button></nav>
+      <span class="muted small" role="status" aria-live="polite">{{ hasFilters ? `显示 ${count(filtered.length)} / ${count(records.length)} 个 IP` : `共 ${count(records.length)} 个 IP` }}{{ filtered.length > pageSize ? ` · 当前 ${count(firstRow + 1)}–${count(firstRow + visibleRows.length)}` : '' }}</span>
+      <nav v-if="pageCount > 1" class="all-results-pagination" :aria-label="initialIssuesOpen ? '初筛异常分页' : '精测结果分页'"><span class="muted small">{{ currentPage }} / {{ pageCount }} 页</span><button class="icon-button" :disabled="currentPage <= 1" aria-label="上一页" @click="page = currentPage - 1"><ChevronLeft :size="15" aria-hidden="true" /></button><button class="icon-button" :disabled="currentPage >= pageCount" aria-label="下一页" @click="page = currentPage + 1"><ChevronRight :size="15" aria-hidden="true" /></button></nav>
     </div>
   </section>
 </template>
@@ -303,32 +444,43 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
 <style scoped>
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
 .all-results-panel { display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; box-shadow: none; background: var(--panel); }
-.all-results-controls { position: relative; z-index: 3; display: flex; flex-direction: column; flex: 0 0 calc(var(--workspace-controls-height,208px) - var(--scan-controls-height,102px)); height: calc(var(--workspace-controls-height,208px) - var(--scan-controls-height,102px)); min-height: 0; overflow: visible; }
+.all-results-controls { position: relative; z-index: 3; display: flex; flex-direction: column; flex: 0 0 auto; padding-bottom: 8px; overflow: visible; }
 .all-results-heading { display: flex; flex: 0 0 42px; align-items: center; gap: 10px; height: 42px; min-height: 0; padding: 0 20px; }
 .all-results-heading h2 { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; line-height: 20px; font-weight: 600; letter-spacing: -.15px; white-space: nowrap; }
 .all-results-heading h2::before { content: ""; width: 3px; height: 13px; border-radius: 2px; background: var(--brand); opacity: .8; }
 .all-results-heading .status-label { min-height: 20px; padding: 0 7px; font-size: 11px; line-height: 20px; border-radius: 5px; border: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
-.results-summary { display: inline-flex; align-items: center; gap: 9px; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.results-summary strong { margin-left: 2px; color: var(--text); font-size: 11px; font-weight: 600; }
-.summary-divider { width: 1px; height: 10px; background: var(--line); }
-.results-test-time { margin-left: auto; padding-left: 10px; border-left: 1px solid var(--line); font-size: 11px; line-height: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.results-test-time { font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .run-summary-button { margin-left: auto; }
-.run-summary-panel + .results-test-time, .run-summary-button + .results-test-time { margin-left: 0; }
+.results-overview { display: flex; align-items: center; gap: 16px; justify-content: space-between; margin: 0 20px 8px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-sunken); }
+.results-overview-outcome { min-width: 0; }
+.results-overview-title { margin: 0; font-size: 13px; font-weight: 650; line-height: 19px; }
+.results-overview-detail { margin: 3px 0 0; color: var(--muted); font-size: 11px; line-height: 16px; overflow-wrap: anywhere; }
+.results-overview-counts { display: grid; grid-template-columns: repeat(3,minmax(70px,auto)); flex: 0 0 auto; margin: 0; text-align: center; font-variant-numeric: tabular-nums; }
+.results-overview-counts>div { padding: 0 12px; border-left: 1px solid var(--line); }
+.results-overview-counts dt { color: var(--muted); font-size: 10px; line-height: 14px; white-space: nowrap; }
+.results-overview-counts dd { margin: 2px 0 0; font-size: 16px; font-weight: 650; line-height: 20px; }
+.results-overview-counts dd>span { color: var(--muted); font-size: 11px; font-weight: 400; }
+.initial-issues-link { display: flex; min-height: 18px; gap: 2px; margin: 0 auto; padding: 0; color: var(--brand); font-size: 11px; line-height: 16px; white-space: nowrap; }
 .all-results-filters { display: grid; flex: 0 0 auto; grid-template-columns: minmax(160px,1.7fr) minmax(108px,1fr) minmax(90px,.8fr) minmax(160px,1.15fr) auto; gap: 8px; padding: 0 20px; }
 .all-results-filters .field { gap: 0; }
 .all-results-filters :deep(select), .all-results-filters input[type=search], .more-filters-button { border-color: color-mix(in srgb, var(--line) 88%, var(--muted)); background: linear-gradient(var(--panel), color-mix(in srgb, var(--bg) 38%, var(--panel))); box-shadow: 0 1px 1px color-mix(in srgb, var(--text) 3%, transparent); transition: border-color .15s, box-shadow .15s, background .15s; }
 .all-results-filters :deep(select:hover:not(:disabled)), .all-results-filters input[type=search]:hover { border-color: var(--line-hover); }
 .all-results-filters :deep(select:focus-visible), .all-results-filters input[type=search]:focus-visible, .more-filters-button:focus-visible { outline: 2px solid color-mix(in srgb, var(--brand) 55%, transparent); outline-offset: 2px; border-color: var(--brand); box-shadow: 0 0 0 1px var(--panel); }
-.all-results-filters :deep(.select-control>select), .additional-result-filters :deep(.select-control>select), .all-results-filters input[type=search], .additional-result-filters input[type=number] { height: 30px; min-height: 30px; font-size: 12px; border-radius: 5px; }
+.all-results-filters :deep(.select-control>select), .additional-result-filters :deep(.select-control>select), .results-search-control>input[type=search], .additional-result-filters input[type=number] { height: 30px; min-height: 30px; font-size: 12px; border-radius: 5px; }
 .results-search-control { position: relative; display: block; }
 .results-search-control>svg { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
 .results-search-control>input[type=search] { padding-left: 29px; }
 .results-search-control:focus-within>svg { color: var(--brand); }
-.results-filter-toolbar { display: flex; flex: 1 1 0; align-items: center; gap: 12px; min-height: 0; overflow: hidden; padding: 0 20px; }
+.results-filter-toolbar { display: flex; flex: 0 0 auto; align-items: center; flex-wrap: wrap; gap: 6px 12px; min-height: 34px; padding: 0 20px; margin-bottom: 6px; }
 .results-filter-toolbar .check-field { min-height: 28px; font-size: 12px; transition: color .15s; }
 .results-filter-toolbar .check-field:hover { color: var(--brand); }
 .results-filter-toolbar .check-field input { width: 14px; height: 14px; }
 .results-filter-toolbar .text-button { min-height: 26px; padding: 0; font-size: 11px; }
+.initial-issues-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; min-height: 34px; padding: 0 20px; }
+.initial-issues-toolbar h3 { font-size: 13px; font-weight: 600; }
+.initial-issues-back { padding: 0; white-space: nowrap; }
+.initial-issues-search { flex: 0 1 260px; min-width: 140px; margin-left: auto; }
+.clear-result-filters { margin-left: auto; white-space: nowrap; }
 .more-filters-button { min-height: 30px; gap: 5px; padding-inline: 8px; font-size: 12px; border-radius: 5px; }
 .more-filters-button.is-active { background: var(--soft); border-color: var(--selected-border); color: var(--brand); box-shadow: inset 0 1px 0 color-mix(in srgb, var(--panel) 70%, transparent); }
 .more-filters-button>svg:last-child { transition: transform .15s; }
@@ -344,7 +496,7 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
 .run-summary-panel { top: 41px; width: min(540px,calc(100% - 40px)); max-height: 48vh; font-size: 12px; }
 .run-summary-panel h3, .run-summary-panel h4 { font-size: 12px; }
 .run-summary-panel p { margin: 4px 0 8px; color: var(--muted); overflow-wrap: anywhere; }
-.run-summary-panel table { width: 100%; margin-bottom: 6px; border-collapse: collapse; font-variant-numeric: tabular-nums; text-align: right; }
+.run-summary-panel table { width: 100%; margin: 6px 0; border-collapse: collapse; font-variant-numeric: tabular-nums; text-align: right; }
 .run-summary-panel th, .run-summary-panel td { padding: 4px 8px; border-bottom: 1px solid var(--line); font-weight: 400; }
 .run-summary-panel thead { background: var(--bg); color: var(--muted); white-space: nowrap; }
 .run-summary-panel th:first-child { text-align: left; }
@@ -352,11 +504,18 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
 .run-summary-panel li { display: flex; justify-content: space-between; gap: 6px; }
 .run-summary-panel li strong { flex: none; color: var(--text); font-variant-numeric: tabular-nums; }
 .all-results-table { flex: 1 1 0; min-width: 0; min-height: 0; max-width: 100%; overflow: auto; overscroll-behavior: contain; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); scrollbar-gutter: stable; }
-.all-results-table table { width: 100%; min-width: 580px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; text-align: left; }
-.ip-column { width: 35%; }
-.location-column { width: 25%; }
-.tcp-column, .download-column { width: 16%; }
-.favorite-column { width: 8%; }
+.all-results-table table { width: 100%; min-width: 690px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; text-align: left; }
+.ip-column { width: 28%; }
+.location-column { width: 16%; }
+.outcome-column { width: 19%; }
+.tcp-column { width: 20%; }
+.download-column { width: 11%; }
+.favorite-column { width: 6%; }
+.all-results-table .initial-issues-table { min-width: 560px; }
+.initial-issues-table .ip-column { width: 36%; }
+.initial-issues-table .outcome-column { width: 29%; }
+.initial-issues-table .tcp-column { width: 27%; }
+.initial-issues-table .favorite-column { width: 8%; }
 .all-results-table th { position: sticky; top: 0; z-index: 1; height: 32px; padding: 5px 20px; border-bottom: 1px solid var(--line); background: linear-gradient(var(--bg), color-mix(in srgb, var(--bg) 65%, var(--panel))); color: var(--muted); font-size: 11px; line-height: 21px; font-weight: 500; white-space: nowrap; box-shadow: 0 1px 0 color-mix(in srgb, var(--panel) 70%, transparent); }
 .all-results-table td { height: 38px; padding: 3px 20px; border: 0; border-bottom: 1px solid var(--line); line-height: 20px; vertical-align: middle; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .all-results-table tbody tr:last-child td { border-bottom: 0; }
@@ -364,7 +523,7 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
 .all-results-table tbody tr { transition: background .12s; }
 .all-results-table tbody tr:hover, .all-results-table tbody tr:focus-within { background: color-mix(in srgb, var(--brand) 5%, var(--panel)); }
 .all-results-table tbody tr:hover td:first-child, .all-results-table tbody tr:focus-within td:first-child { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--brand) 55%, var(--line)); }
-.all-results-table th:nth-child(3), .all-results-table td:nth-child(3), .all-results-table th:nth-child(4), .all-results-table td:nth-child(4) { text-align: right; }
+.all-results-table .result-measurement-cell { padding-inline: 12px; text-align: right; }
 .all-results-table th:last-child, .all-results-table td:last-child { min-width: 0; max-width: none; padding-inline: 4px; text-align: center; white-space: nowrap; }
 .table-unit { display: inline-block; height: 15px; padding: 0 4px; margin-left: 3px; border: 1px solid color-mix(in srgb, var(--line) 85%, transparent); border-radius: 4px; background: color-mix(in srgb, var(--panel) 70%, transparent); font-weight: 400; font-size: 9px; line-height: 13px; vertical-align: 1px; }
 .result-ip { font-size: 13px; font-weight: 500; }
@@ -381,10 +540,16 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
 .result-copy:hover:not(:disabled) { color: var(--brand); background: color-mix(in srgb, var(--brand) 9%, transparent); }
 .result-copy:focus-visible { outline: 2px solid color-mix(in srgb, var(--brand) 65%, transparent); outline-offset: 1px; }
 .location-cell { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; vertical-align: middle; }
-.region-badge { display: inline-grid; flex: 0 0 20px; place-items: center; width: 20px; height: 20px; border: 1px solid color-mix(in srgb, var(--brand) 14%, var(--line)); border-radius: 6px; background: color-mix(in srgb, var(--brand) 5%, var(--panel)); color: color-mix(in srgb, var(--brand) 75%, var(--muted)); font-size: 10px; line-height: 1; font-weight: 650; letter-spacing: -.2px; }
 .location-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .result-pop { display: inline-block; flex: 0 0 auto; height: 17px; padding: 0 4px; border: 1px solid color-mix(in srgb, var(--line) 75%, transparent); border-radius: 4px; color: var(--muted); background: color-mix(in srgb, var(--bg) 70%, var(--panel)); font-size: 10px; font-weight: 500; line-height: 15px; letter-spacing: .2px; }
 .result-number { font-variant-numeric: tabular-nums; }
+.result-outcome { display: inline-block; max-width: 100%; padding: 1px 6px; overflow: hidden; border-radius: 4px; background: var(--bg); color: var(--muted); font-size: 11px; font-weight: 500; line-height: 17px; text-overflow: ellipsis; vertical-align: middle; }
+.result-outcome[data-tone="warning"] { background: var(--warn-bg); color: color-mix(in srgb, var(--warn) 72%, var(--text)); }
+.result-outcome[data-tone="good"] { background: var(--good-bg); color: color-mix(in srgb, var(--good) 78%, var(--text)); }
+.result-tcp-failures { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; line-height: 14px; font-variant-numeric: tabular-nums; }
+.result-tcp-value { display: inline-flex; align-items: baseline; gap: 6px; }
+.result-tcp-value small, .result-value-missing { color: var(--muted); font-size: 11px; }
+.result-value-missing { display: block; line-height: 16px; }
 .result-speed { color: var(--brand); font-weight: 600; }
 .speed-cell { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 0; }
 .speed-cell>.result-number { flex: 0 0 auto; min-width: 5ch; text-align: right; }
@@ -408,7 +573,8 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
 @media (hover: none) { .result-copy, .result-copy:disabled { opacity: .7; } }
 @media (max-width: 800px) {
   .all-results-heading { gap: 8px; }
-  .all-results-heading, .all-results-filters, .results-filter-toolbar, .all-results-footer { padding-inline: 16px; }
+  .all-results-heading, .all-results-filters, .results-filter-toolbar, .initial-issues-toolbar, .all-results-footer { padding-inline: 16px; }
+  .results-overview { margin-inline: 16px; }
   .additional-result-filters { right: 16px; width: min(600px,calc(100% - 32px)); }
   .run-summary-panel { right: 16px; width: min(540px,calc(100% - 32px)); }
   .all-results-filters { grid-template-columns: minmax(140px,1.3fr) minmax(98px,.9fr) minmax(82px,.7fr) minmax(152px,1.2fr) auto; gap: 6px; }
@@ -419,14 +585,14 @@ watch(() => props.run.id, () => { resetTransientFilters(); page.value = 1; expan
   .location-cell { gap: 5px; }
   .result-pop { padding-inline: 3px; }
   .speed-cell { gap: 6px; }
-  .ip-column { width: 33%; }
-  .location-column { width: 25%; }
-  .tcp-column, .download-column { width: 17%; }
+  .all-results-table .result-measurement-cell { padding-inline: 10px; }
 }
 @media (max-width: 640px) {
   .all-results-filters { grid-template-columns: minmax(130px,1.4fr) minmax(85px,1fr) minmax(80px,.8fr); }
   .results-sort { grid-column: span 2; }
-  .results-test-time { display: none; }
+  .results-overview { align-items: stretch; flex-direction: column; gap: 8px; }
+  .results-overview-counts { border-top: 1px solid var(--line); padding-top: 6px; }
+  .results-overview-counts>div:first-child { border-left: 0; }
   .all-results-thresholds { grid-template-columns: minmax(160px,1.3fr) repeat(2,minmax(110px,1fr)); min-width: 440px; }
 }
 </style>

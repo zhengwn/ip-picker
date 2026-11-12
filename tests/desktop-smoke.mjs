@@ -22,9 +22,26 @@ assert.ok(executable, 'desktop smoke executable not found')
 const directory = await mkdtemp(join(tmpdir(), 'ip-picker-smoke-'))
 const statePath = join(directory, 'state.json')
 try {
+  const config = { source: 'custom', customIps: '127.0.0.1', maxCandidates: 1, regions: ['HK', 'JP'] }
+  const oldTime = '2026-10-01T00:00:00Z'
   await writeFile(statePath, JSON.stringify({
-    config: { source: 'custom', customIps: '127.0.0.1', maxCandidates: 1, regions: ['HK', 'JP'] },
+    config,
     lastRun: null,
+    favoriteTest: {
+      favoriteIds: [],
+      run: {
+        id: 'previous-favorite-test', status: 'completed', startedAt: oldTime, finishedAt: oldTime, config,
+        progress: {
+          stage: 'completed', completed: 1, total: 1, downloadedBytes: 0, discoveredByRegion: { HK: 1 }, message: '收藏复测完成',
+          networkPath: { sampleIp: '127.0.0.1', interfaceName: 'en8', interfaceKind: 'wired', tunnelInterface: false, capturedAt: oldTime },
+        },
+        results: [{
+          ip: '127.0.0.1', regionCode: 'HK', city: '', colo: 'HKG', observedColos: ['HKG'],
+          tcpMs: 12, httpsMs: 0, jitterMs: 0, downloadMbps: 0, successCount: 1, attempts: 1,
+          downloadSamplesMbps: [], eligible: false, exclusionCode: 'stabilityIncomplete',
+        }],
+      },
+    },
   }))
 
   for (const phase of ['exercise', 'reopen']) {
@@ -43,7 +60,12 @@ try {
 
     const saved = JSON.parse(await readFile(statePath, 'utf8'))
     assert.equal(saved.lastRun.status, 'cancelled')
+    assert.equal(saved.lastRun.config.stabilityAttempts, 10)
+    assert.equal(saved.lastRun.config.downloadBudgetEnabled, true)
+    assert.equal(saved.lastRun.config.downloadBudgetMiB, 64)
     assert.deepEqual(saved.config.regions, ['HK'])
+    assert.equal(saved.config.stabilityAttempts, 100)
+    assert.equal(saved.config.downloadBudgetEnabled, false)
     assert.equal(saved.favorites.entries.length, 1)
     const [entry] = saved.favorites.entries
     assert.equal(entry.runId, saved.lastRun.id)

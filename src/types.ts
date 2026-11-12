@@ -37,6 +37,7 @@ export type ScanStage = 'connecting' | 'discovering' | 'verifying' | 'stabilizin
 export interface NetworkPathSnapshot {
   sampleIp: string
   interfaceName: string
+  interfaceKind?: 'wired' | 'wifi' | 'tunnel' | 'other'
   tunnelInterface: boolean
   capturedAt: string
 }
@@ -60,6 +61,16 @@ export type ExclusionCode =
   | 'downloadShortlist' | 'downloadBudget' | 'downloadFailure' | 'downloadIncomplete'
   | 'popRecheckIncomplete' | 'popRecheckFailure' | 'cancelled' | 'speedTarget' | 'unknown'
 
+export interface TcpConnectionFailure {
+  kind: 'timeout' | 'connect' | 'worker'
+  elapsedMs?: number
+  message?: string
+}
+
+export interface TcpProbeFailure extends TcpConnectionFailure {
+  attempt: number
+}
+
 export interface IpResult {
   ip: string
   regionCode: string
@@ -67,6 +78,7 @@ export interface IpResult {
   colo: string
   observedColos: string[]
   tcpMs: number
+  tcpConnectFailure?: TcpConnectionFailure
   httpsMs: number
   jitterMs: number
   downloadMbps: number
@@ -96,6 +108,7 @@ export interface TcpStability {
   p95Ms: number | null
   jitterMs: number | null
   probesMs: (number | null)[]
+  failureDetails?: TcpProbeFailure[]
   completed: boolean
   /** A proven rejection can settle this candidate before all probes are sent. */
   earlyRejection?: string | null
@@ -110,6 +123,29 @@ export interface ScanRun {
   progress: ScanProgress
   results: IpResult[]
   error?: string
+}
+
+export type ScanHistoryKind = 'scan' | 'favorite'
+
+export interface ScanHistoryEntry {
+  kind: ScanHistoryKind
+  id: string
+  status: ScanRun['status']
+  startedAt: string
+  finishedAt?: string | null
+  networkPath?: NetworkPathSnapshot | null
+  resultCount: number
+  targetUrl: string
+}
+
+export interface ScanHistory {
+  limit: number
+  entries: ScanHistoryEntry[]
+}
+
+export interface ScanHistoryMatch {
+  kind: ScanHistoryKind
+  run: ScanRun
 }
 
 export interface SavedState { config: ScanConfig; lastRun?: ScanRun; warning?: string; favorites?: FavoriteLibrary; favoriteTest?: FavoriteTestJob | null }
