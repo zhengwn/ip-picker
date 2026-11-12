@@ -3759,10 +3759,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_tcp_refusal_retains_elapsed_time_and_error() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+    async fn initial_tcp_failure_retains_diagnostics() {
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = reserved.local_addr().unwrap().port();
         let config = ScanConfig {
             target_url: format!("https://example.com:{port}/"),
             ..custom("127.0.0.1", 1)
@@ -3778,15 +3778,21 @@ mod tests {
             result.exclusion_reason.as_deref(),
             Some(failure.exclusion_reason().as_str())
         );
-        assert_eq!(failure.kind, TcpConnectFailureKind::Connect);
+        // A non-listening port can reach the probe deadline before the OS
+        // reports refusal. Both outcomes must reach the initial result.
+        assert!(matches!(
+            failure.kind,
+            TcpConnectFailureKind::Connect | TcpConnectFailureKind::Timeout
+        ));
         assert!(failure
             .elapsed_ms
             .is_some_and(|ms| ms.is_finite() && ms >= 0.0));
-        assert!(failure.message.is_some());
         let snapshot = serde_json::to_value(result).unwrap();
-        assert_eq!(snapshot["tcpConnectFailure"]["kind"], "connect");
+        assert!(snapshot["tcpConnectFailure"]["elapsedMs"].is_number());
         let restored: IpResult = serde_json::from_value(snapshot).unwrap();
-        assert!(restored.tcp_connect_failure.is_some());
+        let restored = restored.tcp_connect_failure.unwrap();
+        assert_eq!(restored.kind, failure.kind);
+        assert_eq!(restored.message, failure.message);
     }
 
     #[tokio::test]

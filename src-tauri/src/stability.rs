@@ -616,6 +616,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_refusal_preserves_the_socket_error_message() {
+        let error = io::Error::from(io::ErrorKind::ConnectionRefused);
+        let message = error.to_string();
+        let failure = time_connection(
+            std::future::ready(Err::<(), _>(error)),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(failure.kind, TcpConnectFailureKind::Connect);
+        assert_eq!(
+            failure.exclusion_reason(),
+            format!("TCP 连接失败：{message}")
+        );
+        let snapshot = serde_json::to_value(&failure).unwrap();
+        assert_eq!(snapshot["kind"], "connect");
+        assert_eq!(snapshot["message"], message);
+        assert!(snapshot["elapsedMs"].is_number());
+    }
+
+    #[tokio::test]
     async fn connection_timeout_records_observed_wait_without_a_success_sample() {
         let failure = time_connection(
             std::future::pending::<io::Result<()>>(),
@@ -628,13 +650,16 @@ mod tests {
             .elapsed_ms
             .is_some_and(|ms| ms.is_finite() && ms > 0.0));
         assert_eq!(failure.exclusion_reason(), "TCP 连接超时");
+        let snapshot = serde_json::to_value(&failure).unwrap();
+        assert_eq!(snapshot["kind"], "timeout");
+        assert!(snapshot.get("message").is_none());
     }
 
     #[tokio::test]
     async fn actual_tcp_worker_stops_after_two_real_failed_connections() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = reserved.local_addr().unwrap();
         let mut updates = Vec::new();
         let stats = probe_tcp_with_policy(
             addr,
@@ -660,9 +685,9 @@ mod tests {
 
     #[tokio::test]
     async fn current_tcp_worker_stops_at_two_failures_even_with_a_long_probe_plan() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = reserved.local_addr().unwrap();
         let stats = probe_tcp_with_failure_limit(
             addr,
             1000,
@@ -684,21 +709,26 @@ mod tests {
         assert_eq!(stats.failure_details.len(), 2);
         for (index, detail) in stats.failure_details.iter().enumerate() {
             assert_eq!(detail.attempt, index + 1);
-            assert_eq!(detail.failure.kind, TcpConnectFailureKind::Connect);
+            assert!(matches!(
+                detail.failure.kind,
+                TcpConnectFailureKind::Connect | TcpConnectFailureKind::Timeout
+            ));
             assert!(detail
                 .failure
                 .elapsed_ms
                 .is_some_and(|ms| ms.is_finite() && ms >= 0.0));
-            assert!(detail.failure.message.is_some());
         }
         let snapshot = serde_json::to_value(&stats).unwrap();
         let failure = &snapshot["failureDetails"][0];
         assert_eq!(failure["attempt"], 1);
-        assert_eq!(failure["kind"], "connect");
         assert!(failure["elapsedMs"].is_number());
-        assert!(failure["message"].is_string());
         let restored: TcpStability = serde_json::from_value(snapshot).unwrap();
         assert_eq!(restored.failure_details.len(), 2);
+        for (actual, expected) in restored.failure_details.iter().zip(&stats.failure_details) {
+            assert_eq!(actual.attempt, expected.attempt);
+            assert_eq!(actual.failure.kind, expected.failure.kind);
+            assert_eq!(actual.failure.message, expected.failure.message);
+        }
     }
 
     #[tokio::test]
