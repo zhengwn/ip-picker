@@ -65,6 +65,18 @@ test('pending user settings are saved when a favorite retest starts before debou
   assert.equal(saves[0].customIps, '')
 })
 
+test('shared latency selection stays aligned even before a scan result table exists', async context => {
+  const { state } = await fixture(context)
+  assert.equal(state.run.value, null)
+  state.resultPreferences.value.tcpDisplayMetric = 'average'
+  assert.equal(state.resultPreferences.value.sortBy, 'averageTcp')
+  state.resultPreferences.value.sortBy = 'peakTcp'
+  assert.equal(state.resultPreferences.value.tcpDisplayMetric, 'peak')
+  state.resultPreferences.value.sortBy = 'download'
+  state.resultPreferences.value.tcpDisplayMetric = 'median'
+  assert.equal(state.resultPreferences.value.sortBy, 'download')
+})
+
 test('debounced saving still coalesces edits and rejects invalid parameters', async context => {
   const { state, saves } = await fixture(context)
   state.config.value.maxTcpMs = 231
@@ -278,14 +290,14 @@ test('starting a scan displays a native validation issue on the field and editin
   assert.equal(state.validationIssue.value, null)
 })
 
-test('quick validation starts a bounded run with pending ordinary settings already saved', async context => {
+test('quick validation preserves an explicitly enabled budget and saves pending ordinary settings', async context => {
   const write = deferred()
   const starts = []
   const { state, saves } = await fixture(context, {
     save: () => write.promise,
     start(config, persistConfig) {
       starts.push({ config, persistConfig })
-      return { id: 'quick', status: 'running', config, results: [] }
+      return { id: 'quick', quickValidation: !persistConfig, status: 'running', config, results: [] }
     },
   })
   state.config.value.maxCandidates = 2000
@@ -309,4 +321,54 @@ test('quick validation starts a bounded run with pending ordinary settings alrea
   assert.equal(state.run.value.config.maxCandidates, 256)
   assert.equal(state.config.value.maxCandidates, 2000)
   assert.equal(state.config.value.stabilityAttempts, 100)
+  assert.equal(state.dirty.value, false, 'quick mode overrides are not user edits')
+  state.config.value.maxTcpMs = 300
+  assert.equal(state.dirty.value, true, 'a real change still prompts for the next run')
+})
+
+test('quick validation defaults to no budget and never caps an explicit budget at 64 MiB', async context => {
+  const starts = []
+  const { state } = await fixture(context, {
+    start(config, persistConfig) {
+      starts.push({ config, persistConfig })
+      return { id: `run-${starts.length}`, quickValidation: !persistConfig, status: 'completed', config, results: [] }
+    },
+  })
+  assert.equal(state.quickEstimate.value.download, '约 763 MiB')
+  await state.startScan(true)
+  assert.equal(starts[0].config.downloadBudgetEnabled, false)
+  assert.equal(state.dirty.value, false)
+
+  state.config.value.downloadBudgetEnabled = true
+  state.config.value.downloadBudgetMiB = 512
+  assert.equal(state.quickEstimate.value.download, '最多 512 MiB')
+  await state.startScan(true)
+  assert.equal(starts[1].config.downloadBudgetEnabled, true)
+  assert.equal(starts[1].config.downloadBudgetMiB, 512)
+
+  state.config.value.downloadBudgetEnabled = false
+  await state.startScan(true)
+  await state.startScan()
+  assert.equal(starts[2].config.downloadBudgetEnabled, false)
+  assert.equal(starts[3].config.downloadBudgetEnabled, false)
+  assert.equal(starts[3].config.stabilityAttempts, 100)
+})
+
+test('native config key order never creates a false settings-changed warning after restoring defaults', async context => {
+  let index = 0
+  const { state } = await fixture(context, {
+    start(config, persistConfig) {
+      return {
+        id: `reordered-${++index}`, quickValidation: !persistConfig, status: 'completed', results: [],
+        config: Object.fromEntries(Object.entries(config).reverse()),
+      }
+    },
+  })
+  state.resetParameters()
+  await state.startScan()
+  assert.equal(state.dirty.value, false)
+  await state.startScan(true)
+  assert.equal(state.dirty.value, false)
+  state.config.value.regions = ['HK']
+  assert.equal(state.dirty.value, true)
 })

@@ -116,6 +116,7 @@ export interface TcpStability {
 
 export interface ScanRun {
   id: string
+  quickValidation?: boolean | null
   status: 'running' | 'completed' | 'cancelled' | 'failed'
   startedAt: string
   finishedAt?: string
@@ -129,6 +130,7 @@ export type ScanHistoryKind = 'scan' | 'favorite'
 
 export interface ScanHistoryEntry {
   kind: ScanHistoryKind
+  quickValidation?: boolean | null
   id: string
   status: ScanRun['status']
   startedAt: string

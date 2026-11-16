@@ -10,6 +10,22 @@ use std::{collections::HashSet, net::Ipv4Addr};
 pub struct FavoriteTestJob {
     pub run: ScanRun,
     pub favorite_ids: Vec<String>,
+    #[serde(default)]
+    pub baselines: Vec<FavoriteTestBaseline>,
+}
+
+/// Retain only the evidence needed for before/after comparisons, not probe arrays.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteTestBaseline {
+    pub favorite_id: String,
+    pub tested_at: String,
+    pub config: ScanConfig,
+    pub network_path: Option<NetworkPath>,
+    pub colo: String,
+    pub measurement_passed: bool,
+    pub tcp_p95_ms: Option<f64>,
+    pub download_mbps: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -239,6 +255,46 @@ impl FavoriteLibrary {
         Ok(())
     }
 
+    pub fn add_manual_ip(
+        &mut self,
+        folder_id: &str,
+        ip: &str,
+        note: &str,
+        config: &ScanConfig,
+    ) -> Result<(), String> {
+        self.folder_index(folder_id)?;
+        let ip = checked_ipv4(ip)?;
+        let note = checked_note(note)?;
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.folder_id == folder_id && entry.result.ip == ip.to_string())
+        {
+            // Saving an existing address never discards its measured snapshot.
+            entry.note = note;
+            return Ok(());
+        }
+        let saved_at = chrono::Utc::now().to_rfc3339();
+        let mut config = config.clone();
+        config.source = "custom".into();
+        config.custom_ips = ip.to_string();
+        self.entries.push(FavoriteEntry {
+            id: uuid::Uuid::new_v4().to_string(),
+            folder_id: folder_id.into(),
+            saved_at: saved_at.clone(),
+            note,
+            run_id: String::new(),
+            run_status: "completed".into(),
+            run_started_at: saved_at,
+            run_finished_at: None,
+            config,
+            result: IpResult::new(ip),
+            targeted: true,
+            network_path: None,
+        });
+        Ok(())
+    }
+
     /// Resolve exact favorite IDs before launching. No discovery sampling or
     /// per-country shortlist is involved in a favorites test.
     pub fn prepare_test(
@@ -323,7 +379,57 @@ impl FavoriteLibrary {
             self.entries.last_mut().unwrap().targeted = true;
             favorite_ids.push(self.entries.last().unwrap().id.clone());
         }
-        Ok((FavoriteTestJob { run, favorite_ids }, ips))
+        let targeted_ids: HashSet<_> = favorite_ids.iter().collect();
+        let baselines = self
+            .entries
+            .iter()
+            .filter(|entry| targeted_ids.contains(&entry.id) && was_attempted(&entry.result))
+            .map(|entry| {
+                let mut config = entry.config.clone();
+                // Candidate sources do not affect a same-IP comparison.
+                config.custom_ips.clear();
+                FavoriteTestBaseline {
+                    favorite_id: entry.id.clone(),
+                    tested_at: entry
+                        .run_finished_at
+                        .clone()
+                        .unwrap_or_else(|| entry.run_started_at.clone()),
+                    config,
+                    network_path: entry.network_path.clone(),
+                    colo: entry.result.colo.clone(),
+                    measurement_passed: entry.result.measurement_passed,
+                    tcp_p95_ms: entry
+                        .result
+                        .tcp_stability
+                        .as_ref()
+                        .filter(|stats| {
+                            stats.completed
+                                && stats.early_rejection.is_none()
+                                && stats.attempted == stats.requested
+                                && stats.probes_ms.len() == stats.requested
+                        })
+                        .and_then(|stats| {
+                            crate::stability::latency_metric_ms(&stats.probes_ms, "p95")
+                        }),
+                    download_mbps: (entry.result.download_samples_mbps.len()
+                        >= entry.config.download_rounds
+                        && entry
+                            .result
+                            .download_samples_mbps
+                            .iter()
+                            .all(|speed| speed.is_finite() && *speed > 0.0))
+                    .then_some(entry.result.download_mbps),
+                }
+            })
+            .collect();
+        Ok((
+            FavoriteTestJob {
+                run,
+                favorite_ids,
+                baselines,
+            },
+            ips,
+        ))
     }
 
     /// Match by captured ID so edits/moves survive, deleted records stay
@@ -416,6 +522,7 @@ mod tests {
             vec![Some(20.0); 100],
         ));
         ScanRun {
+            quick_validation: Some(false),
             id: "original-run".into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),
@@ -434,6 +541,85 @@ mod tests {
             results: vec![result],
             error: None,
         }
+    }
+
+    #[test]
+    fn legacy_scan_mode_remains_unknown() {
+        let mut json = serde_json::to_value(sample_run()).unwrap();
+        json.as_object_mut().unwrap().remove("quickValidation");
+        let legacy: ScanRun = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.quick_validation, None);
+    }
+
+    #[test]
+    fn save_only_preserves_existing_evidence_and_rejects_invalid_addresses() {
+        let mut library = FavoriteLibrary::default();
+        let folder = library.folders[0].id.clone();
+        let run = sample_run();
+        let ip = run.results[0].ip.clone();
+        library
+            .add_manual_ip(&folder, &ip, "稍后测试", &run.config)
+            .unwrap();
+        assert!(!was_attempted(&library.entries[0].result));
+        assert!(library.entries[0].run_id.is_empty());
+        library.save_snapshot(&folder, &run, &ip, "已测").unwrap();
+        let before = serde_json::to_value(&library.entries[0].result).unwrap();
+        library
+            .add_manual_ip(&folder, &ip, "新备注", &run.config)
+            .unwrap();
+        assert_eq!(library.entries.len(), 1);
+        assert_eq!(library.entries[0].note, "新备注");
+        assert_eq!(
+            serde_json::to_value(&library.entries[0].result).unwrap(),
+            before
+        );
+        assert_eq!(library.entries[0].run_id, run.id);
+        let saved = serde_json::to_value(&library).unwrap();
+        assert!(library
+            .add_manual_ip(&folder, "bad-ip", "", &run.config)
+            .is_err());
+        assert_eq!(serde_json::to_value(&library).unwrap(), saved);
+    }
+
+    #[test]
+    fn retest_baseline_survives_serialization_and_note_changes() {
+        let mut library = FavoriteLibrary::default();
+        let folder = library.folders[0].id.clone();
+        let run = sample_run();
+        let ip = run.results[0].ip.clone();
+        library.save_snapshot(&folder, &run, &ip, "原备注").unwrap();
+        // Like the table, comparisons derive the full metric from saved probes.
+        library.entries[0]
+            .result
+            .tcp_stability
+            .as_mut()
+            .unwrap()
+            .p95_ms = Some(999.0);
+        let id = library.entries[0].id.clone();
+        let mut next_run = run.clone();
+        next_run.id = "retest".into();
+        next_run.status = "running".into();
+        let (mut job, _) = library
+            .prepare_test(next_run, None, Some(&id), None, None)
+            .unwrap();
+        assert_eq!(job.baselines.len(), 1);
+        assert_eq!(job.baselines[0].tcp_p95_ms, Some(20.0));
+        assert_eq!(job.baselines[0].download_mbps, Some(35.0));
+        assert!(job.baselines[0].config.custom_ips.is_empty());
+        library.update_entry(&id, &folder, "测速中修改").unwrap();
+        job.run.status = "completed".into();
+        job.run.results[0].tcp_ms = 50.0;
+        library.apply_test_results(&job);
+        assert_eq!(library.entries[0].note, "测速中修改");
+        let restored: FavoriteTestJob =
+            serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
+        assert_eq!(restored.baselines[0].tcp_p95_ms, Some(20.0));
+        let mut legacy = serde_json::to_value(job).unwrap();
+        legacy.as_object_mut().unwrap().remove("baselines");
+        assert!(serde_json::from_value::<FavoriteTestJob>(legacy)
+            .unwrap()
+            .baselines
+            .is_empty());
     }
 
     #[test]

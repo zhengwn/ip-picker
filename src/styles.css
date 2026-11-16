@@ -422,3 +422,37 @@ main>.banner, .results-column>.banner { flex: 0 0 auto; margin: 0; padding: 7px 
   .scan-estimate>[aria-hidden] { display: none; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none!important; transition: none!important; scroll-behavior: auto!important; } }
+
+/* Keep scan context and progress visible without overlapping the result table. */
+.scan-controls { flex: 0 0 auto; height: auto; }
+.configuration { height: auto; padding-bottom: 6px; }
+.configuration-secondary { height: auto; min-height: 26px; flex-wrap: wrap; gap: 6px 12px; }
+.configuration-plan { flex-wrap: wrap; gap: 6px 12px; }
+.config-context-label { color: var(--brand); font-size: 10px; white-space: nowrap; }
+.scan-mode-guide { display: flex; flex-wrap: wrap; gap: 4px 20px; padding: 4px 20px 0; color: var(--muted); font-size: 10px; }
+.scan-mode-guide strong { color: var(--text); font-weight: 500; }
+.quick-scan-button.primary span { color: inherit; opacity: .8; }
+.scan-status-slot { height: auto; min-height: 28px; }
+.scan-progress-disclosure>summary { flex-wrap: wrap; min-height: 28px; padding-block: 3px; row-gap: 2px; }
+.run-context { display: flex; flex: 0 0 auto; flex-wrap: wrap; align-items: center; gap: 3px 12px; padding: 5px 20px; border-bottom: 1px solid var(--line); background: var(--panel); color: var(--muted); font-size: 10px; }
+.run-context>strong { color: var(--brand); font-weight: 600; }
+.run-context>.text-button { margin-left: auto; min-height: 22px; font-size: 11px; padding: 0; }
+.scan-mode-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; width: min(600px,100%); margin-top: 8px; text-align: left; }
+.scan-mode-cards article { padding: 16px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.scan-mode-cards article.recommended { border-color: var(--selected-border); background: var(--soft); }
+.scan-mode-cards strong { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 13px; }
+.scan-mode-cards strong span { font-size: 10px; color: var(--brand); }
+.scan-mode-cards p { margin-top: 7px; }
+.scan-mode-cards small { display: block; margin-top: 8px; font-size: 10px; }
+.initial-empty { overflow: auto; }
+@media (max-width: 900px) {
+  .configuration-primary { flex-wrap: wrap; height: auto; min-height: 48px; }
+  .configuration-primary .configuration-actions { margin-left: auto; }
+  .configuration-secondary .configuration-plan { margin-left: 0; }
+  .scan-mode-guide { gap: 2px 12px; padding-inline: 16px; }
+}
+@media (max-width: 640px) {
+  .scan-mode-cards { gap: 8px; }
+  .scan-mode-cards article { padding: 10px; }
+  .run-context { padding-inline: 12px; }
+}

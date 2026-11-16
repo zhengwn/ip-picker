@@ -6,6 +6,7 @@ import { regionName, type IpResult, type ScanRun } from '../types'
 import { candidateMeasurementStatus, targetHost } from '../ui-state'
 import { favoriteDate, favoriteError, favoriteNumber, favoriteTcpSummary, type FavoriteLibrary } from '../favorites'
 import SelectControl from './SelectControl.vue'
+import { preferredFavoriteFolder, rememberFavoriteFolder } from '../favorite-preferences'
 
 const props = defineProps<{ library: FavoriteLibrary; run: ScanRun; result: IpResult; desktop: boolean; open: boolean }>()
 const emit = defineEmits<{
@@ -24,7 +25,7 @@ const entriesByFolder = computed(() => new Map(props.library.entries
   .filter(entry => entry.result.ip === props.result.ip)
   .map(entry => [entry.folderId, entry])))
 const defaultFolderId = computed(() => props.library.folders.find(folder => entriesByFolder.value.has(folder.id))?.id
-  ?? props.library.folders[0]?.id ?? '')
+  ?? preferredFavoriteFolder(props.library.folders))
 const folderId = ref(defaultFolderId.value)
 const note = ref('')
 const newFolderOpen = ref(!props.library.folders.length)
@@ -133,6 +134,7 @@ async function save() {
   try {
     const library = await invoke<FavoriteLibrary>('save_favorite', { folderId: folderId.value, runId: props.run.id, ip: props.result.ip, note: note.value.trim() })
     emit('saved', library)
+    rememberFavoriteFolder(folderId.value)
     emit('notify', updating ? '已更新收藏中的本次测试快照' : '已收藏 IP 和本次测试快照')
     pending.value = null
     close()
@@ -188,7 +190,7 @@ onBeforeUnmount(() => { dialog.value?.close(); restoreFocus() })
             <div class="favorite-save-metrics"><span><span>TCP {{ tcpSummary.label }}</span><strong>{{ favoriteNumber(tcpSummary.value) }} <small>ms</small></strong></span><span><span>下载速度</span><strong>{{ result.downloadSamplesMbps.length ? favoriteNumber(result.downloadMbps) : '—' }} <small>Mbps</small></strong></span></div>
             <div class="favorite-save-meta"><span :title="run.config.targetUrl">{{ targetHost(run.config.targetUrl) }}</span><time :datetime="run.startedAt" :title="`测试开始于 ${favoriteDate(run.startedAt)}`">{{ favoriteDate(run.startedAt) }}</time></div>
           </div>
-          <p id="favorite-snapshot-explanation" class="favorite-save-explanation">{{ run.status === 'running' ? '测试进行中，保存此刻已取得的数据、时间、目标与参数。' : '保存此 IP 的测试数据、时间、目标与本次参数。' }}后续测试不会自动覆盖此快照。</p>
+          <p id="favorite-snapshot-explanation" class="favorite-save-explanation">{{ run.status === 'running' ? '测试进行中，保存此刻已取得的数据、时间、目标与参数。' : '保存此 IP 的测试数据、时间、目标与本次参数。' }}普通地区优选不会覆盖收藏；在收藏夹复测会更新对应记录。</p>
           <p v-if="!desktop" class="favorite-save-error" role="status">浏览器预览不保存收藏，请在桌面应用中使用。</p>
           <div class="favorite-save-folder-label"><label for="favorite-save-folder">{{ entriesByFolder.size ? '收藏分类' : '收藏到' }}</label><button v-if="library.folders.length && !confirmingRemoval" class="text-button" type="button" :disabled="!!pending || !desktop" :aria-expanded="newFolderOpen" aria-controls="favorite-new-folder" @click="toggleNewFolder"><Plus :size="12" aria-hidden="true" />新建收藏夹</button></div>
           <SelectControl v-if="library.folders.length">

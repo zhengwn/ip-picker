@@ -882,6 +882,9 @@ pub fn compare_ip_results_with_metric(
 #[serde(rename_all = "camelCase")]
 pub struct ScanRun {
     pub id: String,
+    /// Explicit run identity; missing legacy mode must not be guessed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick_validation: Option<bool>,
     pub status: String,
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]

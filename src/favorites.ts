@@ -43,6 +43,72 @@ export function acceptsFavoriteLibrary(current: FavoriteLibrary, incoming: Favor
 export interface FavoriteTestJob {
   run: ScanRun
   favoriteIds: string[]
+  baselines?: FavoriteTestBaseline[]
+}
+
+export interface FavoriteTestBaseline {
+  favoriteId: string
+  testedAt: string
+  config: ScanConfig
+  networkPath?: NetworkPathSnapshot | null
+  colo: string
+  measurementPassed: boolean
+  tcpP95Ms: number | null
+  downloadMbps: number | null
+}
+
+const comparisonFields: (keyof ScanConfig)[] = ['targetUrl', 'connectTimeoutMs', 'requestTimeoutMs', 'tcpConcurrency', 'stabilityAttempts', 'stabilityIntervalMs', 'stabilityLatencyMetric', 'maxTcpMs', 'maxStabilityFailurePercent', 'tcpLatencyScreening', 'stabilityFirst', 'verificationAttempts', 'downloadRounds', 'downloadSeconds', 'downloadBudgetEnabled', 'downloadBudgetMiB']
+
+export function comparisonContextDifferences(before: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, after: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }): string[] {
+  const differences: string[] = []
+  if (comparisonFields.some(field => !(field === 'downloadBudgetMiB' && before.config.downloadBudgetEnabled === false && after.config.downloadBudgetEnabled === false) && before.config[field] !== after.config[field])) differences.push('测速参数不同')
+  if (!before.networkPath || !after.networkPath) differences.push('网络路径未完整记录')
+  else if (before.networkPath.interfaceName !== after.networkPath.interfaceName || before.networkPath.interfaceKind !== after.networkPath.interfaceKind || before.networkPath.tunnelInterface !== after.networkPath.tunnelInterface) differences.push('网络接口不同')
+  if (before.colo && after.colo && before.colo !== after.colo) differences.push('接入机房不同')
+  return differences
+}
+
+export function favoriteTestChange(entry: FavoriteEntry, job?: FavoriteTestJob | null) {
+  if (!job || job.run.status === 'running' || !job.favoriteIds.includes(entry.id)) return null
+  return compareFavoriteEntry(entry, job, job.baselines?.find(item => item.favoriteId === entry.id))
+}
+
+export function favoriteTestChanges(entries: FavoriteEntry[], job?: FavoriteTestJob | null) {
+  const changes = new Map<string, ReturnType<typeof compareFavoriteEntry>>()
+  if (!job || job.run.status === 'running') return changes
+  const targets = new Set(job.favoriteIds)
+  const baselines = new Map(job.baselines?.map(baseline => [baseline.favoriteId, baseline]))
+  for (const entry of entries) {
+    if (targets.has(entry.id)) changes.set(entry.id, compareFavoriteEntry(entry, job, baselines.get(entry.id)))
+  }
+  return changes
+}
+
+function compareFavoriteEntry(entry: FavoriteEntry, job: FavoriteTestJob, baseline?: FavoriteTestBaseline) {
+  // An explicit save after this job may replace the same favorite with another
+  // snapshot. Do not describe that newer snapshot as an untouched retest target.
+  if (entry.runId !== job.run.id && Date.parse(entry.savedAt) > Date.parse(job.run.startedAt)) return null
+  if (entry.runId !== job.run.id) return { label: '本轮未更新', detail: '保留上次测试记录', changed: false, differences: [] as string[] }
+  if (!baseline) return { label: '本轮已更新', detail: '可在测速历史查看已保留的记录', changed: true, differences: [] as string[] }
+  const differences = comparisonContextDifferences(baseline, { config: entry.config, networkPath: entry.networkPath, colo: entry.result.colo })
+  const parts: string[] = []
+  if (baseline.measurementPassed !== entry.result.measurementPassed) parts.push(entry.result.measurementPassed ? '本次完整通过' : '本次未通过完整测速')
+  const p95 = completedTcpMetricValue(entry.result, 'p95')
+  const speed = entry.result.downloadSamplesMbps.length >= entry.config.downloadRounds && entry.result.downloadSamplesMbps.every(value => Number.isFinite(value) && value > 0) ? entry.result.downloadMbps : null
+  const comparable = (baseline.tcpP95Ms != null && p95 != null) || (baseline.downloadMbps != null && speed != null)
+  for (const [label, before, after, unit] of [['P95', baseline.tcpP95Ms, p95, 'ms'], ['下载', baseline.downloadMbps, speed, 'Mbps']] as const) {
+    if (before != null && after != null && Math.abs(after - before) >= 0.1) parts.push(`${label} ${after > before ? '+' : '−'}${Math.abs(after - before).toFixed(1)} ${unit}`)
+    else if (before != null && after == null) parts.push(`${label}本次未测满`)
+    else if (before == null && after != null) parts.push(`${label}本次已测满`)
+  }
+  return { label: parts.join(' · ') || (comparable ? '未见明显数值变化' : '暂无可比较的完整测量'), detail: `对比 ${favoriteDate(baseline.testedAt)}；仅描述两次观测，不代表长期趋势。`, changed: parts.length > 0 || differences.some(difference => difference !== '网络路径未完整记录'), differences }
+}
+
+export function favoriteTestDate(entry: FavoriteEntry): string {
+  if (!favoriteHasTestData(entry)) return '尚未测速'
+  const value = entry.runFinishedAt || entry.runStartedAt
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '时间未记录' : date.toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
 export interface FavoriteTestStart {

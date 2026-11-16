@@ -83,6 +83,7 @@ impl RuntimeState {
         // Parse every custom entry and sample once before replacing the latest run.
         let prepared = prepare_scan(config.clone())?;
         let run = ScanRun {
+            quick_validation: Some(!persist_config),
             id: uuid::Uuid::new_v4().to_string(),
             status: "running".into(),
             started_at: chrono::Utc::now().to_rfc3339(),
@@ -195,6 +196,7 @@ impl RuntimeState {
         }
         let (job, ips) = next.favorites.prepare_test(
             ScanRun {
+                quick_validation: Some(false),
                 id: uuid::Uuid::new_v4().to_string(),
                 status: "running".into(),
                 started_at: chrono::Utc::now().to_rfc3339(),
@@ -617,6 +619,25 @@ fn save_favorite(
 }
 
 #[tauri::command]
+fn add_favorite_ip(
+    folder_id: String,
+    ip: String,
+    note: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<FavoriteLibrary, String> {
+    let favorites = state
+        .inner
+        .lock()
+        .map_err(|_| "应用状态不可用")?
+        .update_favorites(&state.storage_path, |saved, favorites| {
+            favorites.add_manual_ip(&folder_id, &ip, &note, &saved.config)
+        })?;
+    let _ = app.emit("favorites-update", favorites.clone());
+    Ok(favorites)
+}
+
+#[tauri::command]
 fn update_favorite(
     favorite_id: String,
     folder_id: String,
@@ -901,6 +922,7 @@ pub fn run() {
             rename_favorite_folder,
             delete_favorite_folder,
             save_favorite,
+            add_favorite_ip,
             update_favorite,
             delete_favorite,
             copy_text
@@ -956,6 +978,7 @@ mod lifecycle_tests {
 
     fn run(id: &str) -> ScanRun {
         ScanRun {
+            quick_validation: Some(false),
             id: id.into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),
@@ -1047,6 +1070,7 @@ mod lifecycle_tests {
         );
         let persisted = saved.last_run.unwrap();
         assert_eq!(persisted.id, started.id);
+        assert_eq!(persisted.quick_validation, Some(true));
         assert_eq!(persisted.config.max_candidates, 100);
     }
 
@@ -1146,6 +1170,7 @@ mod lifecycle_tests {
         let mut inner = RuntimeState {
             saved: SavedState {
                 favorite_test: Some(FavoriteTestJob {
+                    baselines: Vec::new(),
                     run: older,
                     favorite_ids: Vec::new(),
                 }),

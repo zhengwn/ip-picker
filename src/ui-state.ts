@@ -321,7 +321,7 @@ export function measuredTcpFailure(result: IpResult): number {
   return stability?.completed && stability.attempted === stability.requested && stability.attempted > 0 ? stability.failed / stability.attempted * 100 : Infinity
 }
 
-export function observedTcpMs(stability: TcpStability | undefined, metric: 'medianMs' | 'averageMs'): number | null {
+export function observedTcpMs(stability: TcpStability | undefined, metric: 'medianMs' | 'averageMs' | 'maxMs'): number | null {
   if (!stability || stability.attempted <= 0 || stability.succeeded <= 0) return null
   const value = stability[metric]
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null

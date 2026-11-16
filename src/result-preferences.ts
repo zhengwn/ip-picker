@@ -1,8 +1,15 @@
-const RESULT_SORT_VALUES = ['tcp', 'medianTcp', 'averageTcp', 'tcpFailure', 'download', 'initialTcp', 'ip'] as const
+const RESULT_SORT_VALUES = ['tcp', 'medianTcp', 'averageTcp', 'peakTcp', 'tcpFailure', 'download', 'initialTcp', 'ip'] as const
 const TCP_DISPLAY_METRICS = ['runMetric', 'median', 'average', 'peak'] as const
 
 export type ResultSortBy = typeof RESULT_SORT_VALUES[number]
 export type TcpDisplayMetric = typeof TCP_DISPLAY_METRICS[number]
+
+export const latencySortForDisplay: Record<TcpDisplayMetric, ResultSortBy> = {
+  runMetric: 'tcp', median: 'medianTcp', average: 'averageTcp', peak: 'peakTcp',
+}
+export const displayForLatencySort: Partial<Record<ResultSortBy, TcpDisplayMetric>> = {
+  tcp: 'runMetric', medianTcp: 'median', averageTcp: 'average', peakTcp: 'peak',
+}
 
 export interface ResultPreferences {
   completedDownloadOnly: boolean
@@ -30,10 +37,12 @@ function normalizeResultPreferences(value: unknown): ResultPreferences {
   const saved = value as Record<string, unknown>
   const sortBy = saved.sortBy === 'tcpJitter' ? 'averageTcp' : saved.sortBy
   const tcpDisplayMetric = saved.tcpDisplayMetric === 'jitter' ? 'average' : saved.tcpDisplayMetric
+  const order = isResultSortBy(sortBy) ? sortBy : defaults.sortBy
+  const display = isTcpDisplayMetric(tcpDisplayMetric) ? tcpDisplayMetric : displayForLatencySort[order] ?? defaults.tcpDisplayMetric
   return {
     completedDownloadOnly: typeof saved.completedDownloadOnly === 'boolean' ? saved.completedDownloadOnly : defaults.completedDownloadOnly,
-    sortBy: isResultSortBy(sortBy) ? sortBy : defaults.sortBy,
-    tcpDisplayMetric: isTcpDisplayMetric(tcpDisplayMetric) ? tcpDisplayMetric : defaults.tcpDisplayMetric,
+    sortBy: displayForLatencySort[order] ? latencySortForDisplay[display] : order,
+    tcpDisplayMetric: display,
   }
 }
 

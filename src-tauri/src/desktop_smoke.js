@@ -31,7 +31,7 @@ async function openHistory() {
 }
 
 async function exercise() {
-  await button('.start-button', '开始测速')
+  await button('.start-button', '开始完整优选')
   const { config } = await invoke('load_state')
   const invalid = { ...config, customIps: '127.0.0.1\nbad-ip' }
   for (const command of ['save_config', 'start_scan']) {
@@ -40,12 +40,63 @@ async function exercise() {
       throw new Error(`Unexpected field error from ${command}: ${JSON.stringify(issue)}`)
     }
   }
-  const quick = await button('.quick-scan-button', '快速验证 ≤ 64 MiB')
+  const quick = await button('.quick-scan-button', '快速验证')
   quick.click()
   await button('.start-button', '停止测速')
+  await waitFor('quick run context and visible stage progress', () => document.querySelector('.run-context')?.textContent.includes('快速验证') && document.querySelector('.scan-progress-disclosure summary')?.textContent.includes('阶段 3 / 5'))
   const completedOnly = await element('input[aria-describedby="completed-download-help"]')
   if (completedOnly.checked) completedOnly.click()
   await element('.all-results-table .favorite-button')
+  const metric = await element(`.all-results-table ${tcpMetricSelect}`)
+  metric.value = 'peak'
+  metric.dispatchEvent(new Event('change', { bubbles: true }))
+  await waitFor('peak column also sorts by peak', () => document.querySelector('select[aria-label="排序"]')?.value === 'peakTcp')
+  const sort = await element('select[aria-label="排序"]')
+  sort.value = 'averageTcp'
+  sort.dispatchEvent(new Event('change', { bubbles: true }))
+  await waitFor('average sorting updates the displayed column', () => metric.value === 'average')
+
+  // Organizing saved addresses must not interrupt the running measurement.
+  const scanBeforeOrganizing = await invoke('get_scan')
+  ;(await element('button[aria-controls="favorites-library"]')).click()
+  ;(await button('.favorite-top-actions .workspace-secondary-action', '新建收藏夹')).click()
+  const folderName = await element('.favorite-modal[open] input')
+  folderName.value = '冒烟分类'
+  folderName.dispatchEvent(new Event('input', { bubbles: true }))
+  ;(await button('.favorite-modal[open] button[type="submit"]', '新建收藏夹')).click()
+  await waitFor('new folder while scanning', () => document.querySelector('.favorite-folder-list')?.textContent.includes('冒烟分类'))
+  ;(await element('.favorite-job-summary>.text-button')).click()
+  const search = await element('.favorite-search input')
+  search.value = 'no-matching-address'
+  search.dispatchEvent(new Event('input', { bubbles: true }))
+  ;(await button('.favorite-top-actions .workspace-primary-action', '手动添加 IP')).click()
+  const manualIp = await element('.favorite-modal[open] input[placeholder="例如：104.16.0.1"]')
+  manualIp.value = '127.0.0.2'
+  manualIp.dispatchEvent(new Event('input', { bubbles: true }))
+  await waitFor('save-only enabled while retest is disabled', () => {
+    const actions = [...document.querySelectorAll('.favorite-modal[open] .favorite-modal-actions button')]
+    return actions.some(node => node.textContent.trim() === '收藏并测速' && node.disabled)
+  })
+  ;(await button('.favorite-modal[open] button[type="submit"]', '仅收藏')).click()
+  await waitFor('untested saved row', () => document.querySelector('.favorites-table')?.textContent.includes('尚未测速'))
+  if (search.value) throw new Error('The saved address is still hidden behind the previous search')
+  const savedToggle = await element('.favorite-row-toggle')
+  savedToggle.click()
+  await waitFor('save-only details never claim a test start', () =>
+    [...document.querySelectorAll('.favorite-detail-grid>div')].some(node => node.querySelector('dt')?.textContent === '测试开始' && node.querySelector('dd')?.textContent === '尚未测速'))
+  savedToggle.click()
+  ;(await element('button[title="编辑分类与备注"]')).click()
+  const editNote = await element('.favorite-modal[open] textarea')
+  editNote.value = '等待期间整理的备注'
+  editNote.dispatchEvent(new Event('input', { bubbles: true }))
+  ;(await button('.favorite-modal[open] button[type="submit"]', '保存修改')).click()
+  await waitFor('note editor closed', () => !document.querySelector('.favorite-modal[open]'))
+  const organized = await invoke('get_favorites')
+  const savedOnly = organized.entries.find(entry => entry.result.ip === '127.0.0.2')
+  const scanAfterOrganizing = await invoke('get_scan')
+  if (!savedOnly || savedOnly.runId || savedOnly.note !== '等待期间整理的备注' || scanAfterOrganizing.id !== scanBeforeOrganizing.id || scanAfterOrganizing.status !== 'running') {
+    throw new Error('Save-only or note editing changed the active scan or lost its metadata')
+  }
 
   await openHistory()
   const stop = await button('.header-stop', '停止测速')
@@ -75,9 +126,10 @@ async function exercise() {
 }
 
 async function reopen() {
-  await button('.start-button', '重新测速')
+  await button('.start-button', '重新完整优选')
   await waitFor('saved cancelled run', () =>
     document.querySelector('.all-results-heading .status-label')?.textContent.trim() === '已停止')
+  await waitFor('persisted quick run identity', () => document.querySelector('.run-context')?.textContent.includes('快速验证'))
   await waitFor('setting saved when closing', () =>
     [...document.querySelectorAll('.region-choice[aria-pressed="false"]')]
       .some(node => node.textContent.includes('日本')))

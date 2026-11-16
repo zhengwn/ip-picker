@@ -854,6 +854,7 @@ mod tests {
         unclassified.ip = "104.16.1.7".into();
         unclassified.exclusion_reason = None;
         ScanRun {
+            quick_validation: Some(false),
             id: "legacy-run".into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),
@@ -1434,6 +1435,7 @@ mod tests {
                 .unwrap();
         }
         state.favorite_test = Some(FavoriteTestJob {
+            baselines: Vec::new(),
             run,
             favorite_ids: state
                 .favorites

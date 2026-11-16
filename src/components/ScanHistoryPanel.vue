@@ -3,11 +3,12 @@ import { computed, nextTick, ref, shallowRef, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, History, LoaderCircle, Search } from '@lucide/vue'
 import { validManualIpv4 } from '../custom-ips'
-import { favoriteDate, favoriteNumber } from '../favorites'
+import { comparisonContextDifferences, favoriteDate, favoriteNumber } from '../favorites'
 import type { TcpDisplayMetric } from '../result-preferences'
 import { tcpLatencyChartScale } from '../result-row-display'
 import type { NetworkPathSnapshot, ScanConfig, ScanHistory, ScanHistoryKind, ScanHistoryMatch, ScanRun } from '../types'
 import { candidateExclusionReason, candidateMeasurementStatus, hasPrecisionMeasurement, observedFailurePercent, stabilityMetricLabel, targetHost } from '../ui-state'
+import { scanModeLabel } from '../scan-experience'
 import SelectControl from './SelectControl.vue'
 import TcpDiagnostics from './TcpDiagnostics.vue'
 import TcpLatencyCell from './TcpLatencyCell.vue'
@@ -172,6 +173,14 @@ const changedSettings = computed(() => {
   return new Set(settings[0]?.filter((field, index) => settings.some(fields => fields[index].value !== field.value)).map(field => field.label))
 })
 
+const comparisonWarnings = computed(() => {
+  const first = matches.value[0]?.run
+  if (!first) return []
+  return [...new Set(matches.value.slice(1).flatMap(({ run }) => comparisonContextDifferences(
+    { config: first.config, networkPath: first.progress.networkPath, colo: first.results[0]?.colo ?? '' },
+    { config: run.config, networkPath: run.progress.networkPath, colo: run.results[0]?.colo ?? '' },
+  )))]
+})
 const rows = computed(() => {
   const current = run.value
   const source = current
@@ -239,12 +248,13 @@ function interfaceDetail(path?: NetworkPathSnapshot | null) {
         <span v-if="changedSettings.size" class="small history-changes">各轮差异 · {{ [...changedSettings].join('、') }}</span>
       </template>
       <template v-else-if="run">
-        <strong>{{ kindText[view.kind] }}</strong>
+        <strong>{{ view.kind === 'scan' ? scanModeLabel(run) : kindText[view.kind] }}</strong>
         <time :datetime="run.startedAt">{{ favoriteDate(run.startedAt) }}</time>
         <span :class="['status-label', statusClass[run.status]]">{{ statusText[run.status] }}</span>
         <span class="history-network" :title="interfaceDetail(run.progress.networkPath)">{{ interfaceLabel(run.progress.networkPath) }}</span>
       </template>
     </div>
+    <p v-if="view.mode === 'compare' && matches.length > 1" class="history-comparison-note">{{ comparisonWarnings.length ? comparisonWarnings.join(' · ') + '；数值差异不能直接归因于网络质量。' : '以下为各次观测；接口相同也不保证网络环境相同，单次变化不代表长期趋势。' }}</p>
     <div v-if="run" class="history-run-meta small muted">
       <span :title="run.config.targetUrl">{{ targetHost(run.config.targetUrl) }}</span>
       <span>连接超时 {{ run.config.connectTimeoutMs }} ms</span>
@@ -298,7 +308,7 @@ function interfaceDetail(path?: NetworkPathSnapshot | null) {
         <tbody>
           <tr v-for="entry in history.entries" :key="entry.id">
             <td class="history-time"><time :datetime="entry.startedAt">{{ favoriteDate(entry.startedAt) }}</time></td>
-            <td>{{ kindText[entry.kind] }}</td>
+            <td>{{ entry.kind === 'scan' ? scanModeLabel(entry) : kindText[entry.kind] }}</td>
             <td><span class="history-network" :title="interfaceDetail(entry.networkPath)">{{ interfaceLabel(entry.networkPath) }}</span></td>
             <td><span :class="['status-label', statusClass[entry.status]]">{{ statusText[entry.status] }}</span></td>
             <td class="history-number">{{ entry.resultCount.toLocaleString('zh-CN') }}</td>
@@ -399,6 +409,7 @@ function interfaceDetail(path?: NetworkPathSnapshot | null) {
 </template>
 
 <style scoped>
+.history-comparison-note { margin: 0; padding: 8px 20px; font-size: 11px; color: var(--warn); background: var(--warn-bg); border-bottom: 1px solid var(--line); }
 .history-panel { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--panel); }
 .history-toolbar { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 8px 16px; padding: 12px var(--page-padding); border-bottom: 1px solid var(--line); }
 .history-heading, .history-search, .history-context, .history-run-meta, .history-pages { display: flex; align-items: center; gap: 8px; }

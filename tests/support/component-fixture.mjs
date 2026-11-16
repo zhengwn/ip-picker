@@ -7,7 +7,7 @@ import { build } from 'esbuild'
 
 // Exercise real Vue setup and lifecycle with a minimal renderer and mocked IPC.
 const sourceDirectory = fileURLToPath(new URL('../../src/', import.meta.url))
-const components = ['App.vue', 'components/FavoriteSaveDialog.vue', 'components/AllResultsPanel.vue', 'components/ScanHistoryPanel.vue']
+const components = ['App.vue', 'components/FavoriteSaveDialog.vue', 'components/AllResultsPanel.vue', 'components/ScanHistoryPanel.vue', 'components/FavoritesPanel.vue']
 const scripts = new Map(await Promise.all(components.map(async component => {
   const path = join(sourceDirectory, component)
   const { descriptor } = parse(await readFile(path, 'utf8'), { filename: path })
@@ -25,6 +25,11 @@ const { outputFiles } = await build({
       export { default as FavoriteSaveDialog } from './components/FavoriteSaveDialog.vue'
       export { default as AllResultsPanel } from './components/AllResultsPanel.vue'
       export { default as ScanHistoryPanel } from './components/ScanHistoryPanel.vue'
+      export { default as FavoritesPanel } from './components/FavoritesPanel.vue'
+      export { favoriteTestChange, comparisonContextDifferences } from './favorites'
+      export { preferredFavoriteFolder, rememberFavoriteFolder } from './favorite-preferences'
+      export { compactScanProgress, scanModeLabel } from './scan-experience'
+      export { readResultPreferences } from './result-preferences'
       export { defaultConfig } from './types'
       export { estimateScan } from './scan-estimate'
       export { stabilityFailureKind, summarizeScanResults } from './scan-result-summary'
@@ -85,5 +90,5 @@ try {
   fixture = await import(pathToFileURL(compiledPath).href)
 } finally { await rm(directory, { recursive: true, force: true }) }
 
-export const { App, AllResultsPanel, FavoriteSaveDialog, ScanHistoryPanel, defaultConfig, estimateScan, mountComponent, setInvokeHandler, setWindowFixture, stabilityFailureKind, summarizeScanResults, validateConfig } = fixture
+export const { App, AllResultsPanel, FavoriteSaveDialog, FavoritesPanel, ScanHistoryPanel, favoriteTestChange, comparisonContextDifferences, preferredFavoriteFolder, rememberFavoriteFolder, compactScanProgress, scanModeLabel, readResultPreferences, defaultConfig, estimateScan, mountComponent, setInvokeHandler, setWindowFixture, stabilityFailureKind, summarizeScanResults, validateConfig } = fixture
 export const { reactive } = fixture

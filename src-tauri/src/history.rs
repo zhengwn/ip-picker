@@ -25,6 +25,8 @@ pub struct HistoryEntry {
 #[serde(rename_all = "camelCase")]
 pub struct HistorySummary {
     kind: HistoryKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quick_validation: Option<bool>,
     id: String,
     status: String,
     started_at: String,
@@ -40,6 +42,7 @@ impl HistorySummary {
     pub fn new(kind: HistoryKind, run: &ScanRun) -> Self {
         Self {
             kind,
+            quick_validation: run.quick_validation,
             id: run.id.clone(),
             status: run.status.clone(),
             started_at: run.started_at.clone(),
@@ -95,6 +98,7 @@ pub fn compare_ip(runs: Vec<(HistoryKind, &ScanRun)>, ip: &str) -> Vec<HistoryEn
                 result.ip == ip && (run.status == "completed" || was_attempted(result))
             })?;
             let comparison = ScanRun {
+                quick_validation: run.quick_validation,
                 id: run.id.clone(),
                 status: run.status.clone(),
                 started_at: run.started_at.clone(),

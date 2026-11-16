@@ -17,7 +17,8 @@ import AllResultsPanel from './components/AllResultsPanel.vue'
 import FavoriteSaveDialog from './components/FavoriteSaveDialog.vue'
 import FavoritesPanel from './components/FavoritesPanel.vue'
 import { acceptsFavoriteLibrary, defaultFavoriteLibrary, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from './favorites'
-import { readResultPreferences, saveResultPreferences } from './result-preferences'
+import { displayForLatencySort, latencySortForDisplay, readResultPreferences, saveResultPreferences } from './result-preferences'
+import { compactScanProgress, sameScanConfig, scanModeLabel } from './scan-experience'
 
 const desktop = isTauri()
 const appWindow = desktop ? getCurrentWindow() : null
@@ -25,8 +26,17 @@ const appShell = ref<HTMLElement | null>(null)
 useDismissibleDetails(appShell, '.scan-progress-disclosure, .favorite-job-details, .favorite-test-settings')
 const config = ref<ScanConfig>(defaultConfig())
 const run = ref<ScanRun | null>(null)
+const resultsView = ref<InstanceType<typeof AllResultsPanel> | null>(null)
 const resultPreferences = ref(readResultPreferences())
 watch(resultPreferences, preferences => { saveResultPreferences(preferences) }, { deep: true, flush: 'sync' })
+// The column metric is shared with favorites/history, even without a scan table mounted.
+watch(() => resultPreferences.value.tcpDisplayMetric, metric => {
+  if (displayForLatencySort[resultPreferences.value.sortBy]) resultPreferences.value.sortBy = latencySortForDisplay[metric]
+}, { flush: 'sync' })
+watch(() => resultPreferences.value.sortBy, order => {
+  const metric = displayForLatencySort[order]
+  if (metric) resultPreferences.value.tcpDisplayMetric = metric
+}, { flush: 'sync' })
 const favorites = ref<FavoriteLibrary>(defaultFavoriteLibrary())
 type Workspace = 'scan' | 'favorites' | 'history'
 const workspace = ref<Workspace>('scan')
@@ -66,8 +76,8 @@ type SettingsSection = typeof settingsSections[number]['id']
 const settingsSection = ref<SettingsSection>('target')
 watch(settingsSection, () => { if (settingsBody.value) settingsBody.value.scrollTop = 0 }, { flush: 'post' })
 function sectionForField(field: keyof ScanConfig): SettingsSection {
-  if (['stabilityLatencyMetric', 'stabilityAttempts', 'stabilityIntervalMs', 'maxStabilityFailurePercent'].includes(field)) return 'stability'
-  if (['maxTcpMs', 'maxCandidates', 'tcpConcurrency', 'connectTimeoutMs', 'requestTimeoutMs', 'regionalCandidateLimit', 'precisionMode', 'candidatesPerRegion', 'verificationAttempts', 'downloadRounds', 'downloadSeconds'].includes(field)) return 'quality'
+  if (['maxTcpMs', 'stabilityLatencyMetric', 'stabilityAttempts', 'stabilityIntervalMs', 'maxStabilityFailurePercent'].includes(field)) return 'stability'
+  if (['maxCandidates', 'tcpConcurrency', 'connectTimeoutMs', 'requestTimeoutMs', 'regionalCandidateLimit', 'precisionMode', 'candidatesPerRegion', 'verificationAttempts', 'downloadRounds', 'downloadSeconds'].includes(field)) return 'quality'
   return 'target'
 }
 async function onSettingsTabKey(event: KeyboardEvent) {
@@ -86,7 +96,8 @@ async function onSettingsTabKey(event: KeyboardEvent) {
 const targetHost = computed(() => {
   try { return new URL(config.value.targetUrl).hostname } catch { return '请设置测速地址' }
 })
-const scanActionLabel = computed(() => loading.value ? '正在加载…' : starting.value ? '正在启动…' : run.value ? '重新测速' : '开始测速')
+const runTargetHost = computed(() => { try { return new URL(run.value?.config.targetUrl ?? '').hostname } catch { return '未知测速目标' } })
+const scanActionLabel = computed(() => loading.value ? '正在加载…' : starting.value ? '正在启动…' : run.value ? '重新完整优选' : '开始完整优选')
 watch(advancedOpen, open => {
   if (open && !settingsDialog.value?.open) settingsDialog.value?.showModal()
   if (!open && settingsDialog.value?.open) {
@@ -138,7 +149,8 @@ const activeDownloaded = computed(() => formatDownloadedMiB(activeMeasurement.va
 const measurementActive = computed(() => starting.value || !!activeMeasurement.value)
 const scanPhaseTitle = computed(() => run.value ? stageProgressText(run.value).title : '')
 const locked = computed(() => loading.value || starting.value || running.value || favoriteTesting.value || stopping.value || finishingSettings.value || windowClosing.value)
-const dirty = computed(() => !!run.value && JSON.stringify(config.value) !== JSON.stringify(run.value.config))
+const dirty = computed(() => !!run.value && !sameScanConfig(run.value.quickValidation ? quickConfig.value : config.value, run.value.config))
+const scanProgress = computed(() => run.value ? compactScanProgress(run.value) : null)
 const validationIssue = computed(() => validateConfig(config.value) ?? nativeValidationIssue.value)
 const validation = computed(() => validationIssue.value?.message ?? '')
 const scanEstimate = computed(() => loading.value || measurementActive.value || validationIssue.value
@@ -151,8 +163,6 @@ const quickConfig = computed<ScanConfig>(() => ({
   verificationAttempts: 2,
   downloadRounds: 2,
   downloadSeconds: 1,
-  downloadBudgetEnabled: true,
-  downloadBudgetMiB: config.value.downloadBudgetEnabled ? Math.min(config.value.downloadBudgetMiB, 64) : 64,
 }))
 const quickEstimate = computed(() => scanEstimate.value ? estimateScan(quickConfig.value) : null)
 const scanDownloaded = computed(() => formatDownloadedMiB(run.value?.progress.downloadedBytes ?? 0))
@@ -179,6 +189,18 @@ async function focusSetting(field: keyof ScanConfig) {
       ? target.querySelector<HTMLElement>('input:checked:not(:disabled)') ?? target.querySelector<HTMLElement>('input:not(:disabled)')
       : target
   focusTarget?.focus({ preventScroll: true })
+}
+async function handleResultAction(action: 'regions' | 'budget' | 'stability' | 'target' | 'expand') {
+  if (locked.value) return
+  if (action === 'expand') {
+    await focusSetting('maxCandidates')
+    notify('完整优选按此抽样上限执行；可调整后点击“重新完整优选”。')
+  } else if (action === 'budget') {
+    await focusSetting(config.value.downloadBudgetEnabled ? 'downloadBudgetMiB' : 'downloadBudgetEnabled')
+    if (run.value && run.value.config.downloadBudgetEnabled !== false) notify(`本轮下载预算为 ${run.value.config.downloadBudgetMiB} MiB；下次测速使用上方预算设置。`)
+  } else {
+    await focusSetting(action === 'regions' ? 'regions' : action === 'stability' ? 'maxTcpMs' : 'targetUrl')
+  }
 }
 function errorText(error: unknown) { return error instanceof Error ? error.message : String(error) }
 function receiveConfigRejection(error: unknown, snapshot: ScanConfig): boolean {
@@ -484,7 +506,7 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
 
 
       <div v-show="workspace === 'favorites'" id="favorites-library" ref="favoritesPanel" tabindex="-1" class="favorites-view">
-        <FavoritesPanel v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric" :library="favorites" :desktop="desktop" :loading="loading" :config="config" :test-job="favoriteTest" :scan-busy="!!running || starting || stopping || windowClosing" :stopping="stopping || windowClosing" @change="updateFavorites" @test-started="onFavoriteTestStarted" @stop-test="stopMeasurement" @compare-history="compareFavoriteHistory" @notify="notify" />
+        <FavoritesPanel v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric" :library="favorites" :desktop="desktop" :loading="loading" :config="config" :test-job="favoriteTest" :scan-busy="!!running || starting" :closing="windowClosing" :stopping="stopping || windowClosing" @change="updateFavorites" @test-started="onFavoriteTestStarted" @stop-test="stopMeasurement" @compare-history="compareFavoriteHistory" @notify="notify" />
       </div>
       <div v-show="workspace === 'history'" id="scan-history" ref="historyPanel" tabindex="-1" class="history-view">
         <ScanHistoryPanel ref="historyView" v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric" :desktop="desktop" :active="workspace === 'history'" :revision="historyRevision" />
@@ -494,25 +516,25 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         <div class="scan-controls">
         <section class="configuration" aria-label="测速配置" :aria-busy="loading">
           <div class="configuration-primary workspace-toolbar">
-            <div class="region-setting"><span class="toolbar-label">测试地区</span>
+            <div class="region-setting"><span class="toolbar-label">下次测速地区</span>
               <div id="region-choices" class="region-options" role="group" aria-label="选择目标国家或地区" :aria-invalid="fieldInvalid('regions')" :aria-describedby="fieldDescription('regions')">
                 <button v-for="region in selectableRegions" :key="region.code" class="region-choice" :class="{ selected: config.regions.includes(region.code) }" :aria-pressed="config.regions.includes(region.code)" :disabled="locked" @click="toggleRegion(region.code)"><span class="region-check"><Check v-if="config.regions.includes(region.code)" :size="10" /></span><span>{{ region.name }}</span><span class="region-code">{{ region.code }}</span></button>
               </div>
             </div>
             <div class="configuration-actions workspace-actions">
-              <button type="button" class="button quick-scan-button" :disabled="!desktop || locked || !!validation" :aria-describedby="quickEstimate ? 'quick-scan-detail' : undefined" :title="quickEstimate ? `满额参考 ${quickEstimate.duration}。${quickEstimate.detail}` : undefined" @click="startScan(true)">快速验证 <span>≤ {{ quickConfig.downloadBudgetMiB }} MiB</span></button>
+              <button type="button" class="button quick-scan-button" :class="{ primary: !run }" :disabled="!desktop || locked || !!validation" :aria-describedby="quickEstimate ? 'quick-scan-detail' : undefined" :title="quickEstimate ? `满额参考 ${quickEstimate.duration}。${quickEstimate.detail}` : undefined" @click="startScan(true)">快速验证<span v-if="quickConfig.downloadBudgetEnabled"> ≤ {{ quickConfig.downloadBudgetMiB }} MiB</span></button>
               <span v-if="quickEstimate" id="quick-scan-detail" class="visually-hidden">满额参考 {{ quickEstimate.duration }}。{{ quickEstimate.detail }}</span>
               <button ref="settingsTrigger" class="button advanced-trigger workspace-secondary-action" :aria-expanded="advancedOpen" aria-controls="advanced-settings" @click="advancedOpen = true"><Settings2 :size="14" />高级设置</button>
               <button v-if="running" class="button stop-button start-button workspace-primary-action" :disabled="stopping || windowClosing" @click="stopMeasurement"><LoaderCircle v-if="stopping" :size="14" class="spinning" /><Square v-else :size="12" />{{ stopping ? '正在停止…' : '停止测速' }}</button>
-              <button v-else class="button primary start-button workspace-primary-action" :disabled="!desktop || locked || !!validation" :aria-describedby="scanEstimate ? 'scan-estimate scan-estimate-detail scan-budget-state' : undefined" @click="startScan()"><LoaderCircle v-if="starting || loading" :size="14" class="spinning" /><Play v-else :size="12" fill="currentColor" />{{ scanActionLabel }}</button>
+              <button v-else class="button start-button workspace-primary-action" :class="{ primary: !!run }" :disabled="!desktop || locked || !!validation" :aria-describedby="scanEstimate ? 'scan-estimate scan-estimate-detail scan-budget-state' : undefined" @click="startScan()"><LoaderCircle v-if="starting || loading" :size="14" class="spinning" /><Play v-else :size="12" fill="currentColor" />{{ scanActionLabel }}</button>
             </div>
           </div>
           <div class="configuration-secondary" :class="{ 'has-scan-estimate': scanEstimate }">
-            <span class="target-summary" :title="config.targetUrl"><Globe2 :size="13" /><span>{{ targetHost }}</span></span><span class="config-divider" /><span class="config-meta">抽样 {{ Number(config.maxCandidates).toLocaleString('zh-CN') }}</span><span class="config-meta">TCP {{ stabilityMetricLabel(config.stabilityLatencyMetric) }} ≤ {{ config.maxTcpMs }} ms</span>
+            <span class="config-context-label">下次设置</span><span class="target-summary" :title="config.targetUrl"><Globe2 :size="13" /><span>{{ targetHost }}</span></span><span class="config-divider" /><span class="config-meta">抽样 {{ Number(config.maxCandidates).toLocaleString('zh-CN') }}</span><span class="config-meta">TCP {{ stabilityMetricLabel(config.stabilityLatencyMetric) }} ≤ {{ config.maxTcpMs }} ms</span>
             <div class="configuration-plan">
               <template v-if="scanEstimate">
                 <span id="scan-estimate" class="scan-estimate" :title="scanEstimate.detail">
-                  <span>满额参考 {{ scanEstimate.duration }}</span><span aria-hidden="true">·</span><span>下载正文 {{ scanEstimate.download }}</span>
+                  <span>完整优选 {{ scanEstimate.duration }}</span><span aria-hidden="true">·</span><span>下载正文 {{ scanEstimate.download }}</span>
                 </span>
                 <span id="scan-estimate-detail" class="visually-hidden">{{ scanEstimate.detail }}</span>
                 <span id="scan-budget-state" class="visually-hidden">{{ config.downloadBudgetEnabled ? `预算已启用，${config.downloadBudgetMiB} MiB` : '预算未启用' }}</span>
@@ -524,29 +546,47 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
               </div>
             </div>
           </div>
+          <div v-if="scanEstimate && quickEstimate" class="scan-mode-guide">
+            <span><strong>快速验证</strong> {{ quickEstimate.duration }} · 下载正文 {{ quickEstimate.download }} · 先检查当前网络</span>
+            <span><strong>完整优选</strong> 扩大候选覆盖 · 按上方耗时与流量计划执行</span>
+          </div>
         </section>
 
           <div class="scan-status-slot" :class="{ 'is-error': !measurementActive && (!!validationIssue || run?.status === 'failed'), 'is-warning': !measurementActive && dirty && !validationIssue, 'is-active': measurementActive }">
             <details v-if="run && running" ref="progressPanel" class="scan-progress-disclosure" aria-label="测速进度" tabindex="-1">
-              <summary><LoaderCircle :size="12" class="spinning" /><span>{{ scanPhaseTitle }}</span><span class="muted">{{ elapsed }}</span><span class="downloaded-total">累计下载 {{ scanDownloaded }}</span><span class="scan-progress-label">查看进度<ChevronDown :size="12" /></span></summary>
+              <summary><LoaderCircle :size="12" class="spinning" /><span>{{ scanProgress?.step }} · {{ scanPhaseTitle }}</span><span>{{ scanProgress?.caption }}</span><span>完整结果 {{ scanProgress?.complete }} 个</span><span class="muted">{{ elapsed }}</span><span class="downloaded-total">{{ scanDownloaded }}</span><span class="scan-progress-label">详情<ChevronDown :size="12" /></span></summary>
               <div class="scan-progress-popover"><ScanProgressPanel :run="run" :elapsed="elapsed" /></div>
             </details>
             <div v-else-if="favoriteTesting" class="scan-status-content"><LoaderCircle :size="12" class="spinning" /><span role="status">收藏复测进行中，结束后可开始优选。</span><strong class="downloaded-total">累计下载 {{ favoriteDownloaded }}</strong></div>
             <div v-else-if="validationIssue" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span id="config-validation" :title="validation">{{ validation }}</span><button class="text-button" @click="focusSetting(validationIssue.field)">定位问题<ArrowRight :size="12" /></button></div>
             <div v-else-if="starting" class="scan-status-content" role="status"><LoaderCircle :size="12" class="spinning" /><span>正在启动测速…</span></div>
             <div v-else-if="run?.status === 'failed'" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span :title="run.error || run.progress.message">{{ run.error || run.progress.message || '测试未完成，请检查网络和测速地址。' }}</span></div>
-            <div v-else-if="dirty && run" class="scan-status-content" role="status"><Info :size="13" /><span>当前设置与本轮测速参数不同。</span><button class="text-button" :disabled="locked" @click="config = normalizeActiveConfig(JSON.parse(JSON.stringify(run.config)))">沿用本轮参数</button></div>
+            <div v-else-if="dirty && run" class="scan-status-content" role="status"><Info :size="13" /><span>下次测速设置与本轮实际参数不同。</span><button class="text-button" :disabled="locked" @click="config = normalizeActiveConfig(JSON.parse(JSON.stringify(run.config)))">沿用本轮参数</button></div>
+            <span v-else-if="run?.quickValidation" class="scan-idle-note">本轮为快速验证；下次完整优选继续使用上方设置。</span>
             <span v-else class="scan-idle-note">{{ run ? '本次结果保留测速时的参数与记录' : '选择目标地区后开始测速' }}</span>
           </div>
         </div>
+        <div v-if="run" class="run-context" :title="run.config.targetUrl">
+          <strong>本轮：{{ scanModeLabel(run) }}</strong><span>抽样上限 {{ run.config.maxCandidates.toLocaleString('zh-CN') }} · TCP {{ run.config.stabilityAttempts ?? '未记录' }} 次 · {{ run.config.downloadBudgetEnabled !== false ? `预算 ${run.config.downloadBudgetMiB} MiB` : '不限下载流量' }}</span>
+          <span>{{ runTargetHost }}</span>
+          <button v-if="running" class="text-button" @click="resultsView?.showObservations()">查看已取得的记录<ArrowRight :size="12" /></button>
+        </div>
         <div class="results-column">
-          <AllResultsPanel v-if="run" :key="run.id"
+          <AllResultsPanel v-if="run" :key="run.id" ref="resultsView"
             v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric"
             v-model:sort-by="resultPreferences.sortBy"
             v-model:completed-download-only="resultPreferences.completedDownloadOnly"
             :run="run" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteTesting || windowClosing"
-            @favorite="openFavorite" @notify="notify" />
-          <section v-else class="initial-empty" aria-labelledby="welcome-title"><Network :size="32" :stroke-width="1.2" /><h1 id="welcome-title">开始一次地区优选</h1><p>选择目标地区并开始测速，完成后在这里查看、筛选和收藏 IP。</p><span class="small muted">TCP 连通性 → 稳定性复测 → 服务验证 → 下载测速</span></section>
+            @favorite="openFavorite" @notify="notify" @action="handleResultAction" />
+          <section v-else class="initial-empty" aria-labelledby="welcome-title">
+            <Network :size="32" :stroke-width="1.2" /><h1 id="welcome-title">先验证网络，再挑选合适的 IP</h1>
+            <p>首次使用建议快速验证；需要更广的候选覆盖时，选择完整优选。</p>
+            <div class="scan-mode-cards">
+              <article class="recommended"><strong>快速验证 <span>首次推荐</span></strong><p>少量抽样，每个 IP 探测 10 次。</p><p v-if="quickEstimate">{{ quickEstimate.duration }} · 下载正文 {{ quickEstimate.download }}</p><small>流量为满额参考；未找到结果不代表该地区没有可用 IP。</small></article>
+              <article><strong>完整优选</strong><p>按当前设置扩大候选覆盖、增加探测。</p><p v-if="scanEstimate">{{ scanEstimate.duration }} · 下载正文 {{ scanEstimate.download }}</p><small>参考值按满额计算，实际取决于网络与候选。</small></article>
+            </div>
+            <span class="small muted">选择地区后，使用右上角按钮开始测速</span>
+          </section>
         </div>
       </div>
     </main>
@@ -572,7 +612,6 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         <section v-show="settingsSection === 'quality'" id="settings-panel-quality" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-quality">
           <div class="settings-section-heading"><h3>筛选与下载</h3><p>设置候选规模、连接超时与下载复测。</p></div>
           <div class="settings-grid">
-            <label class="field"><span>稳定性延迟上限（ms）</span><input v-model.number="config.maxTcpMs" id="setting-maxTcpMs" :aria-invalid="fieldInvalid('maxTcpMs')" :aria-describedby="fieldDescription('maxTcpMs', 'max-tcp-help')" type="number" min="1" max="30000" step="0.1" :disabled="locked" /></label>
             <label class="field"><span>抽样 IP 上限</span><input v-model.number="config.maxCandidates" id="setting-maxCandidates" :aria-invalid="fieldInvalid('maxCandidates')" :aria-describedby="fieldDescription('maxCandidates')" type="number" min="1" max="10000" step="1" :disabled="locked" /></label>
             <label class="field"><span>TCP 连通性并发</span><input v-model.number="config.tcpConcurrency" id="setting-tcpConcurrency" :aria-invalid="fieldInvalid('tcpConcurrency')" :aria-describedby="fieldDescription('tcpConcurrency')" type="number" min="1" max="256" :disabled="locked" /></label>
             <label class="field"><span>连接等待超时（ms）</span><input v-model.number="config.connectTimeoutMs" id="setting-connectTimeoutMs" :aria-invalid="fieldInvalid('connectTimeoutMs')" :aria-describedby="fieldDescription('connectTimeoutMs', 'max-tcp-help')" type="number" min="100" max="30000" step="100" :disabled="locked" /></label>
@@ -596,6 +635,7 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
           <div class="settings-section-heading"><h3>TCP 稳定性</h3><p>用多次独立连接评估延迟与连接失败率。</p></div>
             <div class="settings-grid">
               <label class="field"><span>延迟判定指标</span><SelectControl><select v-model="config.stabilityLatencyMetric" id="setting-stabilityLatencyMetric" :aria-invalid="fieldInvalid('stabilityLatencyMetric')" :aria-describedby="fieldDescription('stabilityLatencyMetric', 'tcp-stability-help')" :disabled="locked"><option value="p95">P95 延迟（95 分位）</option><option value="average">平均延迟</option><option value="max">每次最大延迟</option></select></SelectControl></label>
+              <label class="field"><span>稳定性延迟上限（ms）</span><input v-model.number="config.maxTcpMs" id="setting-maxTcpMs" :aria-invalid="fieldInvalid('maxTcpMs')" :aria-describedby="fieldDescription('maxTcpMs', 'tcp-stability-help')" type="number" min="1" max="30000" step="0.1" :disabled="locked" /></label>
               <label class="field"><span>连续探测次数</span><input v-model.number="config.stabilityAttempts" id="setting-stabilityAttempts" :aria-invalid="fieldInvalid('stabilityAttempts')" :aria-describedby="fieldDescription('stabilityAttempts', 'tcp-stability-help')" type="number" min="10" max="1000" step="1" :disabled="locked" /></label>
               <label class="field"><span>探测间隔（ms）</span><input v-model.number="config.stabilityIntervalMs" id="setting-stabilityIntervalMs" :aria-invalid="fieldInvalid('stabilityIntervalMs')" :aria-describedby="fieldDescription('stabilityIntervalMs', 'tcp-stability-help')" type="number" min="50" max="5000" step="1" :disabled="locked" /></label>
               <label class="field"><span>允许连接失败率（%）</span><input v-model.number="config.maxStabilityFailurePercent" id="setting-maxStabilityFailurePercent" :aria-invalid="fieldInvalid('maxStabilityFailurePercent')" :aria-describedby="fieldDescription('maxStabilityFailurePercent', 'tcp-stability-help')" type="number" min="0" max="100" step="0.1" :disabled="locked" /></label>

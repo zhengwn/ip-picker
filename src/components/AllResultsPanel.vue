@@ -5,6 +5,7 @@ import { Activity, BarChart3, ChevronDown, ChevronLeft, ChevronRight, Copy, Sear
 import { regionName, type IpResult, type ScanRun } from '../types'
 import { candidateExclusionReason, candidateMeasurementStatus, completeMeasurement, completedTcpMetricValue, hasPrecisionMeasurement, initialTcpFailureReason, isDownloadShortlistExclusion, observedFailurePercent, observedTcpMs, regionalPrecisionLimit, stabilityMetricLabel, stabilityVerdict, summarizeExclusions } from '../ui-state'
 import type { ResultSortBy, TcpDisplayMetric } from '../result-preferences'
+import { displayForLatencySort, latencySortForDisplay } from '../result-preferences'
 import { describeResultRow, tcpLatencyChartScale } from '../result-row-display'
 import { summarizeScanResults } from '../scan-result-summary'
 import { useDismissiblePopover } from '../popovers'
@@ -15,7 +16,7 @@ import TcpLatencyCell from './TcpLatencyCell.vue'
 import TcpLatencyHeader from './TcpLatencyHeader.vue'
 
 const props = defineProps<{ run: ScanRun; savedIps: Set<string>; favoriteDisabled: boolean }>()
-const emit = defineEmits<{ favorite: [result: IpResult, event: MouseEvent]; notify: [text: string, error?: boolean] }>()
+const emit = defineEmits<{ favorite: [result: IpResult, event: MouseEvent]; notify: [text: string, error?: boolean]; action: [action: 'regions' | 'budget' | 'stability' | 'target' | 'expand'] }>()
 const desktop = isTauri()
 const copyingIp = ref<string | null>(null)
 
@@ -35,6 +36,15 @@ const statusFilter = ref('all')
 const sortBy = defineModel<ResultSortBy>('sortBy', { default: 'tcp' })
 const completedDownloadOnly = defineModel<boolean>('completedDownloadOnly', { default: true })
 const tcpDisplayMetric = defineModel<TcpDisplayMetric>('tcpDisplayMetric', { default: 'runMetric' })
+// A latency-ordered table must be ordered by the latency actually on display.
+watch(tcpDisplayMetric, display => {
+  if (displayForLatencySort[sortBy.value]) sortBy.value = latencySortForDisplay[display]
+}, { flush: 'sync' })
+watch(sortBy, order => {
+  const display = displayForLatencySort[order]
+  if (display) tcpDisplayMetric.value = display
+}, { flush: 'sync' })
+const observationsOpen = ref(false)
 const initialIssuesOpen = ref(false)
 const initialIssueQuery = ref('')
 const initialIssuesTrigger = ref<HTMLButtonElement | null>(null)
@@ -131,6 +141,7 @@ function sortValue(entry: ReturnType<typeof record>, order: ResultSortBy): numbe
     case 'tcp': return entry.tcp
     case 'medianTcp': return observedTcpMs(entry.result.tcpStability, 'medianMs')
     case 'averageTcp': return observedTcpMs(entry.result.tcpStability, 'averageMs')
+    case 'peakTcp': return observedTcpMs(entry.result.tcpStability, 'maxMs')
     case 'tcpFailure': return entry.tcpFailurePercent
     case 'initialTcp': return initialTcp(entry.result)
     case 'download': return downloadValue(entry.result)
@@ -173,8 +184,14 @@ function downloadDescription(result: IpResult) {
 }
 const downloadedCount = computed(() => precisionRecords.value.filter(record => record.download != null).length)
 const roundSummary = computed(() => props.run.status === 'running' ? null : summarizeScanResults(props.run, downloadedCount.value))
+const qualifiedCount = computed(() => precisionRecords.value.filter(record => record.status === 'qualified').length)
+const hasBudgetExclusions = computed(() => props.run.results.some(result => result.exclusionCode === 'downloadBudget'))
+const identifiedRegions = computed(() => [...new Set([
+  ...Object.entries(props.run.progress.discoveredByRegion).filter(([, count]) => count > 0).map(([code]) => code),
+  ...props.run.results.filter(result => result.colo && /^[A-Z]{2}$/.test(result.regionCode)).map(result => result.regionCode),
+])].map(location).join('、'))
 const canFilterDownloads = computed(() => props.run.status === 'running' || downloadedCount.value > 0)
-const downloadFilterActive = computed(() => !initialIssuesOpen.value && canFilterDownloads.value && completedDownloadOnly.value)
+const downloadFilterActive = computed(() => !observationsOpen.value && !initialIssuesOpen.value && canFilterDownloads.value && completedDownloadOnly.value)
 function count(value: number) { return value.toLocaleString('zh-CN') }
 const regionOptions = computed(() => [...new Set(precisionRecords.value.map(record => record.result.regionCode))]
   .sort((a, b) => location(a).localeCompare(location(b), 'zh-CN')))
@@ -255,6 +272,26 @@ async function includeIncompleteDownloads() {
   await nextTick()
   statusSelect.value?.focus({ preventScroll: true })
 }
+function showObservations() {
+  initialIssuesOpen.value = false
+  resetTransientFilters()
+  observationsOpen.value = true
+}
+function chooseDownloadFilter(event: Event) {
+  observationsOpen.value = false
+  completedDownloadOnly.value = (event.target as HTMLInputElement).checked
+}
+function showQualified(order?: ResultSortBy) {
+  initialIssuesOpen.value = false
+  resetTransientFilters()
+  statusFilter.value = 'qualified'
+  if (order) sortBy.value = order
+}
+function showStabilityFailures() {
+  showObservations()
+  statusFilter.value = 'rejected'
+}
+defineExpose({ showObservations })
 
 watch(popOptions, options => {
   if (popFilter.value !== 'all' && !options.includes(popFilter.value)) popFilter.value = 'all'
@@ -263,9 +300,9 @@ watch(() => props.run.status, status => {
   if (status !== 'running' && statusFilter.value === 'pendingSummary') statusFilter.value = 'all'
 })
 async function resetTableScroll() { await nextTick(); if (resultsTable.value) resultsTable.value.scrollTop = 0 }
-watch([query, regionFilter, popFilter, statusFilter, sortBy, completedDownloadOnly, minDownloadMbps, maxTcpMs, initialIssuesOpen, initialIssueQuery], () => { page.value = 1; expandedIp.value = null; void resetTableScroll() })
+watch([query, regionFilter, popFilter, statusFilter, sortBy, completedDownloadOnly, observationsOpen, minDownloadMbps, maxTcpMs, initialIssuesOpen, initialIssueQuery], () => { page.value = 1; expandedIp.value = null; void resetTableScroll() })
 watch(currentPage, () => { expandedIp.value = null; void resetTableScroll() })
-watch(() => props.run.id, () => { initialIssuesOpen.value = false; initialIssueQuery.value = ''; resetTransientFilters(); page.value = 1; expandedIp.value = null; summaryOpen.value = false })
+watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesOpen.value = false; initialIssueQuery.value = ''; resetTransientFilters(); page.value = 1; expandedIp.value = null; summaryOpen.value = false })
 </script>
 
 <template>
@@ -308,6 +345,17 @@ watch(() => props.run.id, () => { initialIssuesOpen.value = false; initialIssueQ
       <div class="results-overview-outcome">
         <p class="results-overview-title">{{ roundSummary.headline }}</p>
         <p v-if="roundSummary.detail" class="results-overview-detail">{{ roundSummary.detail }}</p>
+        <p v-if="downloadedCount" class="results-overview-detail">其中 {{ qualifiedCount }} 个完整测速达标；下载完成不等同于所有条件达标。</p>
+        <p v-if="!roundSummary.precisionCount" class="results-overview-detail">{{ identifiedRegions ? `本轮识别地区：${identifiedRegions}` : '本轮尚未识别到接入地区，请检查当前网络与测速目标。' }}</p>
+        <p v-if="run.quickValidation && !qualifiedCount" class="results-overview-detail">快速验证抽样较少，未找到结果不代表所选地区没有可用 IP。</p>
+        <div class="result-next-actions" aria-label="本轮结果的下一步操作">
+          <template v-if="qualifiedCount"><button class="text-button" @click="showQualified()">查看达标 IP（{{ qualifiedCount }}）</button><button class="text-button" @click="showQualified('tcp')">优先低延迟</button><button class="text-button" @click="showQualified('download')">优先下载速度</button></template>
+          <button v-if="hasBudgetExclusions" class="text-button" @click="emit('action', 'budget')">调整预算后重测</button>
+          <template v-if="roundSummary.stabilityFailures"><button class="text-button" @click="showStabilityFailures">查看稳定性失败</button><button class="text-button" @click="emit('action', 'stability')">检查判定条件</button></template>
+          <template v-if="!roundSummary.precisionCount"><button class="text-button" @click="emit('action', 'regions')">调整目标地区</button><button class="text-button" @click="emit('action', 'target')">检查测速目标</button></template>
+          <button v-if="run.quickValidation && !qualifiedCount" class="text-button" @click="emit('action', 'expand')">扩大抽样做完整优选</button>
+          <button v-if="!qualifiedCount && roundSummary.precisionCount" class="text-button" @click="showObservations">查看已有精测记录</button>
+        </div>
       </div>
       <dl class="results-overview-counts" aria-label="本轮各阶段的 IP 数量">
         <div>
@@ -333,8 +381,9 @@ watch(() => props.run.id, () => { initialIssuesOpen.value = false; initialIssueQ
     </div>
     <div v-else-if="canFilterDownloads || transientFilterCount || (!roundSummary && initialIssueResults.length)" class="results-filter-toolbar">
       <label v-if="canFilterDownloads" class="check-field">
-        <input v-model="completedDownloadOnly" type="checkbox" aria-describedby="completed-download-help" /><span>仅完成下载</span>
+        <input :checked="downloadFilterActive" type="checkbox" aria-describedby="completed-download-help" @change="chooseDownloadFilter" /><span>仅完成下载</span>
       </label>
+      <span v-if="observationsOpen" class="muted small">临时显示本轮记录，保留默认筛选偏好</span>
       <span v-if="canFilterDownloads" id="completed-download-help" class="visually-hidden">只显示取得全部有效下载样本的 IP；此选择会自动保存。</span>
       <button v-if="!roundSummary && initialIssueResults.length" ref="initialIssuesTrigger" type="button" class="text-button" @click="setInitialIssuesOpen(true)">查看 {{ count(initialIssueResults.length) }} 个初筛异常<ChevronRight :size="12" aria-hidden="true" /></button>
       <button v-if="transientFilterCount" class="text-button clear-result-filters" @click="resetTransientFilters">清除筛选</button>
@@ -349,6 +398,7 @@ watch(() => props.run.id, () => { initialIssuesOpen.value = false; initialIssueQ
           <option value="tcp">复测延迟（{{ metricName }}）升序</option>
           <option value="medianTcp">中位延迟从低到高</option>
           <option value="averageTcp">样本平均延迟从低到高</option>
+          <option value="peakTcp">样本峰值延迟从低到高</option>
           <option value="tcpFailure">连接失败率从低到高</option>
           <option value="download">下载速度从高到低</option>
           <option value="initialTcp">初筛延迟从低到高</option>
@@ -433,7 +483,7 @@ watch(() => props.run.id, () => { initialIssuesOpen.value = false; initialIssueQ
         </tbody>
       </table>
     </div>
-    <div v-else class="all-results-empty"><span class="results-empty-icon"><Activity v-if="run.status === 'running' && !records.length" :size="24" /><SearchX v-else :size="24" /></span><h3>{{ emptyTitle }}</h3><p v-if="emptyDescription">{{ emptyDescription }}</p><div v-if="!initialIssuesOpen && records.length && (transientFilterCount || downloadFilterActive)" class="results-empty-actions"><button v-if="transientFilterCount" class="button" @click="resetTransientFilters">清除筛选</button><button v-if="downloadFilterActive" class="text-button" @click="completedDownloadOnly = false">查看全部精测结果<ChevronRight :size="14" /></button></div></div>
+    <div v-else class="all-results-empty"><span class="results-empty-icon"><Activity v-if="run.status === 'running' && !records.length" :size="24" /><SearchX v-else :size="24" /></span><h3>{{ emptyTitle }}</h3><p v-if="emptyDescription">{{ emptyDescription }}</p><div v-if="!initialIssuesOpen && records.length && (transientFilterCount || downloadFilterActive)" class="results-empty-actions"><button v-if="transientFilterCount" class="button" @click="resetTransientFilters">清除筛选</button><button v-if="downloadFilterActive" class="text-button" @click="showObservations">查看已取得的记录<ChevronRight :size="14" /></button></div></div>
     <div class="all-results-footer">
       <span class="muted small" role="status" aria-live="polite">{{ hasFilters ? `显示 ${count(filtered.length)} / ${count(records.length)} 个 IP` : `共 ${count(records.length)} 个 IP` }}{{ filtered.length > pageSize ? ` · 当前 ${count(firstRow + 1)}–${count(firstRow + visibleRows.length)}` : '' }}</span>
       <nav v-if="pageCount > 1" class="all-results-pagination" :aria-label="initialIssuesOpen ? '初筛异常分页' : '精测结果分页'"><span class="muted small">{{ currentPage }} / {{ pageCount }} 页</span><button class="icon-button" :disabled="currentPage <= 1" aria-label="上一页" @click="page = currentPage - 1"><ChevronLeft :size="15" aria-hidden="true" /></button><button class="icon-button" :disabled="currentPage >= pageCount" aria-label="下一页" @click="page = currentPage + 1"><ChevronRight :size="15" aria-hidden="true" /></button></nav>
@@ -442,6 +492,8 @@ watch(() => props.run.id, () => { initialIssuesOpen.value = false; initialIssueQ
 </template>
 
 <style scoped>
+.result-next-actions { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 4px; }
+.result-next-actions .text-button { font-size: 11px; min-height: 24px; padding: 0; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
 .all-results-panel { display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; box-shadow: none; background: var(--panel); }
 .all-results-controls { position: relative; z-index: 3; display: flex; flex-direction: column; flex: 0 0 auto; padding-bottom: 8px; overflow: visible; }
