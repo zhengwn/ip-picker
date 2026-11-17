@@ -40,13 +40,31 @@ async function exercise() {
       throw new Error(`Unexpected field error from ${command}: ${JSON.stringify(issue)}`)
     }
   }
+  ;(await element('.advanced-trigger')).click()
+  ;(await element('#settings-tab-quality')).click()
+  await waitFor('budget controls moved into advanced settings', () => {
+    const budget = document.querySelector('#setting-downloadBudgetEnabled')
+    return budget?.closest('#settings-panel-quality') && budget.offsetParent !== null && !budget.checked
+  })
+  ;(await element('button[aria-label="关闭高级设置"]')).click()
   const quick = await button('.quick-scan-button', '快速验证')
   quick.click()
   await button('.start-button', '停止测速')
-  await waitFor('quick run context and visible stage progress', () => document.querySelector('.run-context')?.textContent.includes('快速验证') && document.querySelector('.scan-progress-disclosure summary')?.textContent.includes('阶段 3 / 5'))
+  await waitFor('quick run context and visible stage progress', () => document.querySelector('.run-mode-label')?.textContent.includes('快速验证') && document.querySelector('.scan-progress-disclosure summary')?.textContent.includes('阶段 3 / 5'))
   const completedOnly = await element('input[aria-describedby="completed-download-help"]')
   if (completedOnly.checked) completedOnly.click()
   await element('.all-results-table .favorite-button')
+  const tableBeforeDetails = document.querySelector('.all-results-table').getBoundingClientRect()
+  if (tableBeforeDetails.top > 230 || tableBeforeDetails.height < window.innerHeight * .55) {
+    throw new Error('Auxiliary controls occupy too much of the results viewport')
+  }
+  ;(await element('.run-summary-button')).click()
+  await waitFor('actual run context available on demand', () => document.querySelector('.run-summary-panel')?.textContent.includes('10 次'))
+  if (document.querySelector('.all-results-table').getBoundingClientRect().top !== tableBeforeDetails.top) {
+    throw new Error('Opening run details moved the result table')
+  }
+  document.querySelector('.run-summary-button').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  await waitFor('run details close and restore focus', () => !document.querySelector('.run-summary-panel') && document.activeElement === document.querySelector('.run-summary-button'))
   const metric = await element(`.all-results-table ${tcpMetricSelect}`)
   metric.value = 'peak'
   metric.dispatchEvent(new Event('change', { bubbles: true }))
@@ -129,7 +147,7 @@ async function reopen() {
   await button('.start-button', '重新完整优选')
   await waitFor('saved cancelled run', () =>
     document.querySelector('.all-results-heading .status-label')?.textContent.trim() === '已停止')
-  await waitFor('persisted quick run identity', () => document.querySelector('.run-context')?.textContent.includes('快速验证'))
+  await waitFor('persisted quick run identity', () => document.querySelector('.run-mode-label')?.textContent.includes('快速验证'))
   await waitFor('setting saved when closing', () =>
     [...document.querySelectorAll('.region-choice[aria-pressed="false"]')]
       .some(node => node.textContent.includes('日本')))

@@ -18,7 +18,7 @@ import FavoriteSaveDialog from './components/FavoriteSaveDialog.vue'
 import FavoritesPanel from './components/FavoritesPanel.vue'
 import { acceptsFavoriteLibrary, defaultFavoriteLibrary, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from './favorites'
 import { displayForLatencySort, latencySortForDisplay, readResultPreferences, saveResultPreferences } from './result-preferences'
-import { compactScanProgress, sameScanConfig, scanModeLabel } from './scan-experience'
+import { compactScanProgress, sameScanConfig } from './scan-experience'
 
 const desktop = isTauri()
 const appWindow = desktop ? getCurrentWindow() : null
@@ -77,7 +77,7 @@ const settingsSection = ref<SettingsSection>('target')
 watch(settingsSection, () => { if (settingsBody.value) settingsBody.value.scrollTop = 0 }, { flush: 'post' })
 function sectionForField(field: keyof ScanConfig): SettingsSection {
   if (['maxTcpMs', 'stabilityLatencyMetric', 'stabilityAttempts', 'stabilityIntervalMs', 'maxStabilityFailurePercent'].includes(field)) return 'stability'
-  if (['maxCandidates', 'tcpConcurrency', 'connectTimeoutMs', 'requestTimeoutMs', 'regionalCandidateLimit', 'precisionMode', 'candidatesPerRegion', 'verificationAttempts', 'downloadRounds', 'downloadSeconds'].includes(field)) return 'quality'
+  if (['maxCandidates', 'tcpConcurrency', 'connectTimeoutMs', 'requestTimeoutMs', 'regionalCandidateLimit', 'precisionMode', 'candidatesPerRegion', 'verificationAttempts', 'downloadRounds', 'downloadSeconds', 'downloadBudgetEnabled', 'downloadBudgetMiB'].includes(field)) return 'quality'
   return 'target'
 }
 async function onSettingsTabKey(event: KeyboardEvent) {
@@ -96,7 +96,6 @@ async function onSettingsTabKey(event: KeyboardEvent) {
 const targetHost = computed(() => {
   try { return new URL(config.value.targetUrl).hostname } catch { return '请设置测速地址' }
 })
-const runTargetHost = computed(() => { try { return new URL(run.value?.config.targetUrl ?? '').hostname } catch { return '未知测速目标' } })
 const scanActionLabel = computed(() => loading.value ? '正在加载…' : starting.value ? '正在启动…' : run.value ? '重新完整优选' : '开始完整优选')
 watch(advancedOpen, open => {
   if (open && !settingsDialog.value?.open) settingsDialog.value?.showModal()
@@ -178,7 +177,7 @@ function fieldId(field: keyof ScanConfig) { return field === 'regions' ? 'region
 function fieldInvalid(field: keyof ScanConfig) { return validationIssue.value?.field === field || undefined }
 function fieldDescription(field: keyof ScanConfig, helpId?: string) { return [fieldInvalid(field) ? (advancedOpen.value ? 'settings-validation' : 'config-validation') : '', helpId ?? ''].filter(Boolean).join(' ') || undefined }
 async function focusSetting(field: keyof ScanConfig) {
-  if (['regions', 'downloadBudgetEnabled', 'downloadBudgetMiB'].includes(field)) advancedOpen.value = false
+  if (field === 'regions') advancedOpen.value = false
   else { settingsSection.value = sectionForField(field); advancedOpen.value = true }
   await nextTick()
   const target = document.getElementById(fieldId(field))
@@ -189,6 +188,9 @@ async function focusSetting(field: keyof ScanConfig) {
       ? target.querySelector<HTMLElement>('input:checked:not(:disabled)') ?? target.querySelector<HTMLElement>('input:not(:disabled)')
       : target
   focusTarget?.focus({ preventScroll: true })
+}
+function reuseRunConfig() {
+  if (run.value && !locked.value) config.value = normalizeActiveConfig(JSON.parse(JSON.stringify(run.value.config)))
 }
 async function handleResultAction(action: 'regions' | 'budget' | 'stability' | 'target' | 'expand') {
   if (locked.value) return
@@ -516,68 +518,41 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         <div class="scan-controls">
         <section class="configuration" aria-label="测速配置" :aria-busy="loading">
           <div class="configuration-primary workspace-toolbar">
-            <div class="region-setting"><span class="toolbar-label">下次测速地区</span>
+            <div class="region-setting"><span class="toolbar-label">测速地区</span>
               <div id="region-choices" class="region-options" role="group" aria-label="选择目标国家或地区" :aria-invalid="fieldInvalid('regions')" :aria-describedby="fieldDescription('regions')">
                 <button v-for="region in selectableRegions" :key="region.code" class="region-choice" :class="{ selected: config.regions.includes(region.code) }" :aria-pressed="config.regions.includes(region.code)" :disabled="locked" @click="toggleRegion(region.code)"><span class="region-check"><Check v-if="config.regions.includes(region.code)" :size="10" /></span><span>{{ region.name }}</span><span class="region-code">{{ region.code }}</span></button>
               </div>
             </div>
             <div class="configuration-actions workspace-actions">
-              <button type="button" class="button quick-scan-button" :class="{ primary: !run }" :disabled="!desktop || locked || !!validation" :aria-describedby="quickEstimate ? 'quick-scan-detail' : undefined" :title="quickEstimate ? `满额参考 ${quickEstimate.duration}。${quickEstimate.detail}` : undefined" @click="startScan(true)">快速验证<span v-if="quickConfig.downloadBudgetEnabled"> ≤ {{ quickConfig.downloadBudgetMiB }} MiB</span></button>
-              <span v-if="quickEstimate" id="quick-scan-detail" class="visually-hidden">满额参考 {{ quickEstimate.duration }}。{{ quickEstimate.detail }}</span>
-              <button ref="settingsTrigger" class="button advanced-trigger workspace-secondary-action" :aria-expanded="advancedOpen" aria-controls="advanced-settings" @click="advancedOpen = true"><Settings2 :size="14" />高级设置</button>
+              <button type="button" class="button quick-scan-button" :class="{ primary: !run }" :disabled="!desktop || locked || !!validation" :aria-describedby="quickEstimate ? 'quick-scan-detail' : undefined" :title="quickEstimate ? `快速验证：${quickEstimate.duration}，下载正文 ${quickEstimate.download}。${quickEstimate.detail}` : undefined" @click="startScan(true)">快速验证<span v-if="quickConfig.downloadBudgetEnabled"> ≤ {{ quickConfig.downloadBudgetMiB }} MiB</span></button>
+              <span v-if="quickEstimate" id="quick-scan-detail" class="visually-hidden">快速验证：{{ quickEstimate.duration }}，下载正文 {{ quickEstimate.download }}。{{ quickEstimate.detail }}</span>
+              <button ref="settingsTrigger" class="button advanced-trigger workspace-secondary-action" :aria-expanded="advancedOpen" :title="`下次测速设置：${targetHost} · 抽样 ${config.maxCandidates} · TCP ${stabilityMetricLabel(config.stabilityLatencyMetric)} ≤ ${config.maxTcpMs} ms`" aria-controls="advanced-settings" @click="advancedOpen = true"><Settings2 :size="14" />高级设置</button>
               <button v-if="running" class="button stop-button start-button workspace-primary-action" :disabled="stopping || windowClosing" @click="stopMeasurement"><LoaderCircle v-if="stopping" :size="14" class="spinning" /><Square v-else :size="12" />{{ stopping ? '正在停止…' : '停止测速' }}</button>
-              <button v-else class="button start-button workspace-primary-action" :class="{ primary: !!run }" :disabled="!desktop || locked || !!validation" :aria-describedby="scanEstimate ? 'scan-estimate scan-estimate-detail scan-budget-state' : undefined" @click="startScan()"><LoaderCircle v-if="starting || loading" :size="14" class="spinning" /><Play v-else :size="12" fill="currentColor" />{{ scanActionLabel }}</button>
+              <button v-else class="button start-button workspace-primary-action" :class="{ primary: !!run }" :disabled="!desktop || locked || !!validation" :aria-describedby="scanEstimate ? 'scan-estimate-detail' : undefined" :title="scanEstimate ? `完整优选：${scanEstimate.duration}，下载正文 ${scanEstimate.download}。${scanEstimate.detail}` : undefined" @click="startScan()"><LoaderCircle v-if="starting || loading" :size="14" class="spinning" /><Play v-else :size="12" fill="currentColor" />{{ scanActionLabel }}</button>
             </div>
           </div>
-          <div class="configuration-secondary" :class="{ 'has-scan-estimate': scanEstimate }">
-            <span class="config-context-label">下次设置</span><span class="target-summary" :title="config.targetUrl"><Globe2 :size="13" /><span>{{ targetHost }}</span></span><span class="config-divider" /><span class="config-meta">抽样 {{ Number(config.maxCandidates).toLocaleString('zh-CN') }}</span><span class="config-meta">TCP {{ stabilityMetricLabel(config.stabilityLatencyMetric) }} ≤ {{ config.maxTcpMs }} ms</span>
-            <div class="configuration-plan">
-              <template v-if="scanEstimate">
-                <span id="scan-estimate" class="scan-estimate" :title="scanEstimate.detail">
-                  <span>完整优选 {{ scanEstimate.duration }}</span><span aria-hidden="true">·</span><span>下载正文 {{ scanEstimate.download }}</span>
-                </span>
-                <span id="scan-estimate-detail" class="visually-hidden">{{ scanEstimate.detail }}</span>
-                <span id="scan-budget-state" class="visually-hidden">{{ config.downloadBudgetEnabled ? `预算已启用，${config.downloadBudgetMiB} MiB` : '预算未启用' }}</span>
-              </template>
-              <div class="budget-settings" aria-label="下载流量预算">
-                <label class="check-field budget-toggle"><input id="setting-downloadBudgetEnabled" v-model="config.downloadBudgetEnabled" type="checkbox" :disabled="locked" aria-label="限制下载流量预算" aria-describedby="budget-help" /><span>{{ config.downloadBudgetEnabled ? '预算已启用' : '预算未启用' }}</span></label>
-                <label v-if="config.downloadBudgetEnabled" class="budget-amount"><input id="setting-downloadBudgetMiB" v-model.number="config.downloadBudgetMiB" type="number" min="1" max="4096" step="10" :disabled="locked" :aria-invalid="fieldInvalid('downloadBudgetMiB')" :aria-describedby="fieldDescription('downloadBudgetMiB', 'budget-help')" aria-label="全局下载数据预算（MiB）" /><span>MiB</span></label>
-                <span id="budget-help" class="visually-hidden">所有下载共用预算，不含协议开销；关闭时不限制下载流量。</span>
-              </div>
-            </div>
-          </div>
-          <div v-if="scanEstimate && quickEstimate" class="scan-mode-guide">
-            <span><strong>快速验证</strong> {{ quickEstimate.duration }} · 下载正文 {{ quickEstimate.download }} · 先检查当前网络</span>
-            <span><strong>完整优选</strong> 扩大候选覆盖 · 按上方耗时与流量计划执行</span>
-          </div>
+          <span v-if="scanEstimate" id="scan-estimate-detail" class="visually-hidden">完整优选：{{ scanEstimate.duration }}，下载正文 {{ scanEstimate.download }}。{{ scanEstimate.detail }}</span>
         </section>
 
-          <div class="scan-status-slot" :class="{ 'is-error': !measurementActive && (!!validationIssue || run?.status === 'failed'), 'is-warning': !measurementActive && dirty && !validationIssue, 'is-active': measurementActive }">
+          <div v-if="measurementActive || validationIssue || run?.status === 'failed'" class="scan-status-slot" :class="{ 'is-error': !measurementActive && (!!validationIssue || run?.status === 'failed'), 'is-active': measurementActive }">
             <details v-if="run && running" ref="progressPanel" class="scan-progress-disclosure" aria-label="测速进度" tabindex="-1">
-              <summary><LoaderCircle :size="12" class="spinning" /><span>{{ scanProgress?.step }} · {{ scanPhaseTitle }}</span><span>{{ scanProgress?.caption }}</span><span>完整结果 {{ scanProgress?.complete }} 个</span><span class="muted">{{ elapsed }}</span><span class="downloaded-total">{{ scanDownloaded }}</span><span class="scan-progress-label">详情<ChevronDown :size="12" /></span></summary>
+              <summary><LoaderCircle :size="12" class="spinning" /><span>{{ scanProgress?.step }} · {{ scanPhaseTitle }}</span><span>{{ scanProgress?.caption }}</span><span class="progress-result-count">完整结果 {{ scanProgress?.complete }} 个</span><span class="muted">{{ elapsed }}</span><span class="downloaded-total">{{ scanDownloaded }}</span><span class="scan-progress-label">详情<ChevronDown :size="12" /></span></summary>
               <div class="scan-progress-popover"><ScanProgressPanel :run="run" :elapsed="elapsed" /></div>
             </details>
             <div v-else-if="favoriteTesting" class="scan-status-content"><LoaderCircle :size="12" class="spinning" /><span role="status">收藏复测进行中，结束后可开始优选。</span><strong class="downloaded-total">累计下载 {{ favoriteDownloaded }}</strong></div>
             <div v-else-if="validationIssue" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span id="config-validation" :title="validation">{{ validation }}</span><button class="text-button" @click="focusSetting(validationIssue.field)">定位问题<ArrowRight :size="12" /></button></div>
             <div v-else-if="starting" class="scan-status-content" role="status"><LoaderCircle :size="12" class="spinning" /><span>正在启动测速…</span></div>
             <div v-else-if="run?.status === 'failed'" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span :title="run.error || run.progress.message">{{ run.error || run.progress.message || '测试未完成，请检查网络和测速地址。' }}</span></div>
-            <div v-else-if="dirty && run" class="scan-status-content" role="status"><Info :size="13" /><span>下次测速设置与本轮实际参数不同。</span><button class="text-button" :disabled="locked" @click="config = normalizeActiveConfig(JSON.parse(JSON.stringify(run.config)))">沿用本轮参数</button></div>
-            <span v-else-if="run?.quickValidation" class="scan-idle-note">本轮为快速验证；下次完整优选继续使用上方设置。</span>
-            <span v-else class="scan-idle-note">{{ run ? '本次结果保留测速时的参数与记录' : '选择目标地区后开始测速' }}</span>
+            <button v-if="running" class="text-button progress-records-button" @click="resultsView?.showObservations()">查看记录</button>
           </div>
-        </div>
-        <div v-if="run" class="run-context" :title="run.config.targetUrl">
-          <strong>本轮：{{ scanModeLabel(run) }}</strong><span>抽样上限 {{ run.config.maxCandidates.toLocaleString('zh-CN') }} · TCP {{ run.config.stabilityAttempts ?? '未记录' }} 次 · {{ run.config.downloadBudgetEnabled !== false ? `预算 ${run.config.downloadBudgetMiB} MiB` : '不限下载流量' }}</span>
-          <span>{{ runTargetHost }}</span>
-          <button v-if="running" class="text-button" @click="resultsView?.showObservations()">查看已取得的记录<ArrowRight :size="12" /></button>
         </div>
         <div class="results-column">
           <AllResultsPanel v-if="run" :key="run.id" ref="resultsView"
             v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric"
             v-model:sort-by="resultPreferences.sortBy"
             v-model:completed-download-only="resultPreferences.completedDownloadOnly"
-            :run="run" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteTesting || windowClosing"
-            @favorite="openFavorite" @notify="notify" @action="handleResultAction" />
+            :run="run" :settings-differ="dirty" :settings-disabled="locked" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteTesting || windowClosing"
+            @favorite="openFavorite" @notify="notify" @action="handleResultAction" @reuse-config="reuseRunConfig" />
           <section v-else class="initial-empty" aria-labelledby="welcome-title">
             <Network :size="32" :stroke-width="1.2" /><h1 id="welcome-title">先验证网络，再挑选合适的 IP</h1>
             <p>首次使用建议快速验证；需要更广的候选覆盖时，选择完整优选。</p>
@@ -611,6 +586,12 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         </section>
         <section v-show="settingsSection === 'quality'" id="settings-panel-quality" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-quality">
           <div class="settings-section-heading"><h3>筛选与下载</h3><p>设置候选规模、连接超时与下载复测。</p></div>
+          <div class="settings-budget" aria-label="下载流量预算">
+            <label class="check-field"><input id="setting-downloadBudgetEnabled" v-model="config.downloadBudgetEnabled" type="checkbox" :disabled="locked" aria-describedby="budget-help" /><span>限制下载流量预算</span></label>
+            <label v-if="config.downloadBudgetEnabled" class="field"><span>本轮下载上限（MiB）</span><input id="setting-downloadBudgetMiB" v-model.number="config.downloadBudgetMiB" type="number" min="1" max="4096" step="10" :disabled="locked" :aria-invalid="fieldInvalid('downloadBudgetMiB')" :aria-describedby="fieldDescription('downloadBudgetMiB', 'budget-help')" /></label>
+            <p id="budget-help" class="field-note">默认不限流量。开启后所有下载共用预算，不含协议开销；快速验证和完整优选沿用同一设置。</p>
+            <p v-if="scanEstimate && quickEstimate" class="field-note">满额参考：完整优选 {{ scanEstimate.duration }} / {{ scanEstimate.download }}；快速验证 {{ quickEstimate.duration }} / {{ quickEstimate.download }}。实际耗时和流量取决于网络与候选。</p>
+          </div>
           <div class="settings-grid">
             <label class="field"><span>抽样 IP 上限</span><input v-model.number="config.maxCandidates" id="setting-maxCandidates" :aria-invalid="fieldInvalid('maxCandidates')" :aria-describedby="fieldDescription('maxCandidates')" type="number" min="1" max="10000" step="1" :disabled="locked" /></label>
             <label class="field"><span>TCP 连通性并发</span><input v-model.number="config.tcpConcurrency" id="setting-tcpConcurrency" :aria-invalid="fieldInvalid('tcpConcurrency')" :aria-describedby="fieldDescription('tcpConcurrency')" type="number" min="1" max="256" :disabled="locked" /></label>

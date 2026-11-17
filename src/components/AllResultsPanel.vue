@@ -8,6 +8,7 @@ import type { ResultSortBy, TcpDisplayMetric } from '../result-preferences'
 import { displayForLatencySort, latencySortForDisplay } from '../result-preferences'
 import { describeResultRow, tcpLatencyChartScale } from '../result-row-display'
 import { summarizeScanResults } from '../scan-result-summary'
+import { scanModeLabel } from '../scan-experience'
 import { useDismissiblePopover } from '../popovers'
 import FavoriteButton from './FavoriteButton.vue'
 import SelectControl from './SelectControl.vue'
@@ -15,8 +16,9 @@ import TcpDiagnostics from './TcpDiagnostics.vue'
 import TcpLatencyCell from './TcpLatencyCell.vue'
 import TcpLatencyHeader from './TcpLatencyHeader.vue'
 
-const props = defineProps<{ run: ScanRun; savedIps: Set<string>; favoriteDisabled: boolean }>()
-const emit = defineEmits<{ favorite: [result: IpResult, event: MouseEvent]; notify: [text: string, error?: boolean]; action: [action: 'regions' | 'budget' | 'stability' | 'target' | 'expand'] }>()
+type ResultAction = 'regions' | 'budget' | 'stability' | 'target' | 'expand'
+const props = defineProps<{ run: ScanRun; savedIps: Set<string>; favoriteDisabled: boolean; settingsDiffer?: boolean; settingsDisabled?: boolean }>()
+const emit = defineEmits<{ favorite: [result: IpResult, event: MouseEvent]; notify: [text: string, error?: boolean]; action: [action: ResultAction]; 'reuse-config': [] }>()
 const desktop = isTauri()
 const copyingIp = ref<string | null>(null)
 
@@ -47,7 +49,6 @@ watch(sortBy, order => {
 const observationsOpen = ref(false)
 const initialIssuesOpen = ref(false)
 const initialIssueQuery = ref('')
-const initialIssuesTrigger = ref<HTMLButtonElement | null>(null)
 const initialIssueSearchInput = ref<HTMLInputElement | null>(null)
 const minDownloadMbps = ref<number | ''>('')
 const maxTcpMs = ref<number | ''>('')
@@ -262,9 +263,10 @@ function resetTransientFilters() {
 }
 async function setInitialIssuesOpen(open: boolean) {
   moreFiltersOpen.value = false
+  summaryOpen.value = false
   initialIssuesOpen.value = open
   await nextTick()
-  const target = initialIssuesOpen.value ? initialIssueSearchInput.value : initialIssuesTrigger.value
+  const target = initialIssuesOpen.value ? initialIssueSearchInput.value : summaryTrigger.value
   target?.focus({ preventScroll: true })
 }
 async function includeIncompleteDownloads() {
@@ -273,6 +275,7 @@ async function includeIncompleteDownloads() {
   statusSelect.value?.focus({ preventScroll: true })
 }
 function showObservations() {
+  closeSummaryForResults()
   initialIssuesOpen.value = false
   resetTransientFilters()
   observationsOpen.value = true
@@ -282,6 +285,7 @@ function chooseDownloadFilter(event: Event) {
   completedDownloadOnly.value = (event.target as HTMLInputElement).checked
 }
 function showQualified(order?: ResultSortBy) {
+  closeSummaryForResults()
   initialIssuesOpen.value = false
   resetTransientFilters()
   statusFilter.value = 'qualified'
@@ -290,6 +294,21 @@ function showQualified(order?: ResultSortBy) {
 function showStabilityFailures() {
   showObservations()
   statusFilter.value = 'rejected'
+}
+function closeSummaryForResults() {
+  const wasOpen = summaryOpen.value
+  summaryOpen.value = false
+  if (wasOpen) void nextTick(() => (resultsTable.value ?? summaryTrigger.value)?.focus({ preventScroll: true }))
+}
+function requestAction(action: ResultAction) {
+  summaryOpen.value = false
+  emit('action', action)
+}
+function reuseSettings() {
+  if (props.settingsDisabled) return
+  summaryOpen.value = false
+  emit('reuse-config')
+  void nextTick(() => summaryTrigger.value?.focus({ preventScroll: true }))
 }
 defineExpose({ showObservations })
 
@@ -311,63 +330,74 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
     <div class="all-results-heading">
       <h2 id="all-results-title">测试结果</h2>
       <span class="status-label" :class="{ active: run.status === 'running', good: run.status === 'completed' && downloadedCount > 0, quiet: run.status === 'cancelled' || run.status === 'completed' && !downloadedCount, error: run.status === 'failed' }" role="status" aria-live="polite">{{ runStatus }}</span>
+      <span v-if="run.quickValidation" class="run-mode-label">快速验证</span>
       <time v-if="testTime" class="results-test-time muted" :datetime="run.startedAt" title="本轮开始时间">{{ testTime }}</time>
-      <template v-if="run.status !== 'running'">
-        <button ref="summaryTrigger" type="button" class="button more-filters-button run-summary-button" :class="{ 'is-active': summaryOpen }" :aria-expanded="summaryOpen" aria-controls="run-summary" @click="summaryOpen = !summaryOpen">
-          <BarChart3 :size="13" aria-hidden="true" />各地区详情<ChevronDown :size="12" :class="{ 'is-open': summaryOpen }" aria-hidden="true" />
-        </button>
-        <section v-if="summaryOpen" id="run-summary" ref="summaryPanel" class="run-summary-panel" aria-labelledby="run-summary-title" tabindex="0">
-          <h3 id="run-summary-title">各地区测速详情</h3>
-          <p v-if="run.error">{{ run.error }}</p>
-          <table>
-            <thead><tr><th scope="col">目标地区</th><th scope="col">识别到的 IP</th><th scope="col">入围复测</th><th scope="col">稳定性通过</th><th scope="col">完成下载</th></tr></thead>
-            <tbody>
-              <tr v-for="region in regionalStats" :key="region.code">
-                <th scope="row">{{ location(region.code) }}</th>
-                <td>{{ region.identified }}</td>
-                <td>{{ region.admitted ?? '—' }}</td>
-                <td>{{ region.stabilityPassed }}</td>
-                <td>{{ region.downloaded }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <p>统计涵盖本轮所有观测。<template v-if="regionalStats.some(region => region.admitted == null)"> — 表示入围数无法确认。</template></p>
-          <h4>本轮排除或未完成原因</h4>
-          <ul v-if="exclusions.length">
-            <li v-for="item in exclusions" :key="item.key"><span>{{ item.label }}</span><strong>{{ item.count }}</strong></li>
-          </ul>
-          <p v-else>暂无已记录的排除或未完成原因。</p>
-        </section>
-      </template>
-    </div>
+      <p v-if="roundSummary" class="results-heading-summary" :title="[roundSummary.headline, roundSummary.detail].filter(Boolean).join('：')">{{ roundSummary.headline }}</p>
+      <button ref="summaryTrigger" type="button" class="button more-filters-button run-summary-button" :class="{ 'is-active': summaryOpen }" :aria-expanded="summaryOpen" aria-controls="run-summary" :title="settingsDiffer ? '查看本轮结果、实际参数与下次设置的差异' : '查看本轮参数、地区统计和处理建议'" @click="summaryOpen = !summaryOpen">
+        <BarChart3 :size="13" aria-hidden="true" />本轮详情<span v-if="settingsDiffer" class="settings-differ-indicator" aria-label="下次设置与本轮不同" /><ChevronDown :size="12" :class="{ 'is-open': summaryOpen }" aria-hidden="true" />
+      </button>
+      <section v-if="summaryOpen" id="run-summary" ref="summaryPanel" class="run-summary-panel" aria-labelledby="run-summary-title" tabindex="0">
+        <h3 id="run-summary-title">本轮详情</h3>
+        <p>{{ scanModeLabel(run) }} · {{ runStatus }} · {{ testTime }}</p>
+        <dl class="run-parameters" aria-label="本轮实际测速参数">
+          <div class="run-target"><dt>测速目标</dt><dd>{{ run.config.targetUrl }}</dd></div>
+          <div><dt>抽样上限</dt><dd>{{ count(run.config.maxCandidates) }} 个</dd></div>
+          <div><dt>TCP 探测</dt><dd>{{ run.config.stabilityAttempts == null ? '未记录稳定性计划' : `${run.config.stabilityAttempts} 次` }} · {{ run.config.maxTcpMs == null ? '未设延迟上限' : `${metricName} ≤ ${run.config.maxTcpMs} ms` }}</dd></div>
+          <div><dt>下载计划</dt><dd>{{ run.config.downloadRounds }} 轮 × {{ run.config.downloadSeconds }} 秒</dd></div>
+          <div><dt>下载预算</dt><dd>{{ run.config.downloadBudgetEnabled !== false ? `${run.config.downloadBudgetMiB} MiB` : '不限下载流量' }}</dd></div>
+        </dl>
+        <div v-if="settingsDiffer" class="run-settings-difference"><span>下次测速设置与本轮不同，已有结果仍按本轮参数解释。</span><button class="text-button" :disabled="settingsDisabled" @click="reuseSettings">沿用本轮参数</button></div>
+        <div v-if="roundSummary" class="run-overview">
+          <div class="results-overview-outcome">
+            <p class="results-overview-title">{{ roundSummary.headline }}</p>
+            <p v-if="roundSummary.detail" class="results-overview-detail">{{ roundSummary.detail }}</p>
+            <p v-if="downloadedCount" class="results-overview-detail">其中 {{ qualifiedCount }} 个完整测速达标；下载完成不等同于所有条件达标。</p>
+            <p v-if="!roundSummary.precisionCount" class="results-overview-detail">{{ identifiedRegions ? `本轮识别地区：${identifiedRegions}` : '本轮尚未识别到接入地区，请检查当前网络与测速目标。' }}</p>
+            <p v-if="run.quickValidation && !qualifiedCount" class="results-overview-detail">快速验证抽样较少，未找到结果不代表所选地区没有可用 IP。</p>
+            <div class="result-next-actions" aria-label="本轮结果的下一步操作">
+              <template v-if="qualifiedCount"><button class="text-button" @click="showQualified()">查看达标 IP（{{ qualifiedCount }}）</button><button class="text-button" @click="showQualified('tcp')">优先低延迟</button><button class="text-button" @click="showQualified('download')">优先下载速度</button></template>
+              <button v-if="hasBudgetExclusions" class="text-button" @click="requestAction('budget')">调整预算后重测</button>
+              <template v-if="roundSummary.stabilityFailures"><button class="text-button" @click="showStabilityFailures">查看稳定性失败</button><button class="text-button" @click="requestAction('stability')">检查判定条件</button></template>
+              <template v-if="!roundSummary.precisionCount"><button class="text-button" @click="requestAction('regions')">调整目标地区</button><button class="text-button" @click="requestAction('target')">检查测速目标</button></template>
+              <button v-if="run.quickValidation && !qualifiedCount" class="text-button" @click="requestAction('expand')">扩大抽样做完整优选</button>
+              <button v-if="!qualifiedCount && roundSummary.precisionCount" class="text-button" @click="showObservations">查看已有精测记录</button>
+            </div>
+          </div>
+          <dl class="results-overview-counts" aria-label="本轮各阶段的 IP 数量">
+            <div>
+              <dt>已做初筛</dt>
+              <dd>
+                {{ count(roundSummary.checkedCandidates) }}<span v-if="roundSummary.checkedCandidates < roundSummary.totalCandidates" title="已初筛 / 抽样数"> / {{ count(roundSummary.totalCandidates) }}</span>
+                <button v-if="initialIssueResults.length && !initialIssuesOpen" type="button" class="text-button initial-issues-link" @click="setInitialIssuesOpen(true)">查看初筛异常（{{ count(initialIssueResults.length) }}）<ChevronRight :size="11" aria-hidden="true" /></button>
+              </dd>
+            </div>
+            <div><dt>有精测记录</dt><dd>{{ count(roundSummary.precisionCount) }}</dd></div>
+            <div><dt>完成下载</dt><dd>{{ count(roundSummary.downloadedCount) }}</dd></div>
+          </dl>
+        </div>
 
-    <div v-if="roundSummary" class="results-overview">
-      <div class="results-overview-outcome">
-        <p class="results-overview-title">{{ roundSummary.headline }}</p>
-        <p v-if="roundSummary.detail" class="results-overview-detail">{{ roundSummary.detail }}</p>
-        <p v-if="downloadedCount" class="results-overview-detail">其中 {{ qualifiedCount }} 个完整测速达标；下载完成不等同于所有条件达标。</p>
-        <p v-if="!roundSummary.precisionCount" class="results-overview-detail">{{ identifiedRegions ? `本轮识别地区：${identifiedRegions}` : '本轮尚未识别到接入地区，请检查当前网络与测速目标。' }}</p>
-        <p v-if="run.quickValidation && !qualifiedCount" class="results-overview-detail">快速验证抽样较少，未找到结果不代表所选地区没有可用 IP。</p>
-        <div class="result-next-actions" aria-label="本轮结果的下一步操作">
-          <template v-if="qualifiedCount"><button class="text-button" @click="showQualified()">查看达标 IP（{{ qualifiedCount }}）</button><button class="text-button" @click="showQualified('tcp')">优先低延迟</button><button class="text-button" @click="showQualified('download')">优先下载速度</button></template>
-          <button v-if="hasBudgetExclusions" class="text-button" @click="emit('action', 'budget')">调整预算后重测</button>
-          <template v-if="roundSummary.stabilityFailures"><button class="text-button" @click="showStabilityFailures">查看稳定性失败</button><button class="text-button" @click="emit('action', 'stability')">检查判定条件</button></template>
-          <template v-if="!roundSummary.precisionCount"><button class="text-button" @click="emit('action', 'regions')">调整目标地区</button><button class="text-button" @click="emit('action', 'target')">检查测速目标</button></template>
-          <button v-if="run.quickValidation && !qualifiedCount" class="text-button" @click="emit('action', 'expand')">扩大抽样做完整优选</button>
-          <button v-if="!qualifiedCount && roundSummary.precisionCount" class="text-button" @click="showObservations">查看已有精测记录</button>
-        </div>
-      </div>
-      <dl class="results-overview-counts" aria-label="本轮各阶段的 IP 数量">
-        <div>
-          <dt>已做初筛</dt>
-          <dd>
-            {{ count(roundSummary.checkedCandidates) }}<span v-if="roundSummary.checkedCandidates < roundSummary.totalCandidates" title="已初筛 / 抽样数"> / {{ count(roundSummary.totalCandidates) }}</span>
-            <button v-if="initialIssueResults.length && !initialIssuesOpen" ref="initialIssuesTrigger" type="button" class="text-button initial-issues-link" @click="setInitialIssuesOpen(true)">查看初筛异常（{{ count(initialIssueResults.length) }}）<ChevronRight :size="11" aria-hidden="true" /></button>
-          </dd>
-        </div>
-        <div><dt>有精测记录</dt><dd>{{ count(roundSummary.precisionCount) }}</dd></div>
-        <div><dt>完成下载</dt><dd>{{ count(roundSummary.downloadedCount) }}</dd></div>
-      </dl>
+        <button v-if="!roundSummary && initialIssueResults.length && !initialIssuesOpen" type="button" class="text-button" @click="setInitialIssuesOpen(true)">查看初筛异常（{{ count(initialIssueResults.length) }}）<ChevronRight :size="11" /></button>
+        <h4>各地区统计</h4>
+        <p v-if="run.error">{{ run.error }}</p>
+        <table>
+          <thead><tr><th scope="col">目标地区</th><th scope="col">识别到的 IP</th><th scope="col">入围复测</th><th scope="col">稳定性通过</th><th scope="col">完成下载</th></tr></thead>
+          <tbody>
+            <tr v-for="region in regionalStats" :key="region.code">
+              <th scope="row">{{ location(region.code) }}</th>
+              <td>{{ region.identified }}</td>
+              <td>{{ region.admitted ?? '—' }}</td>
+              <td>{{ region.stabilityPassed }}</td>
+              <td>{{ region.downloaded }}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p>统计涵盖本轮所有观测。<template v-if="regionalStats.some(region => region.admitted == null)"> — 表示入围数无法确认。</template></p>
+        <h4>本轮排除或未完成原因</h4>
+        <ul v-if="exclusions.length">
+          <li v-for="item in exclusions" :key="item.key"><span>{{ item.label }}</span><strong>{{ item.count }}</strong></li>
+        </ul>
+        <p v-else>暂无已记录的排除或未完成原因。</p>
+      </section>
     </div>
 
     <div v-if="initialIssuesOpen" class="initial-issues-toolbar">
@@ -379,17 +409,7 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
       </label>
       <button v-if="transientFilterCount" class="text-button" @click="resetTransientFilters">清除搜索</button>
     </div>
-    <div v-else-if="canFilterDownloads || transientFilterCount || (!roundSummary && initialIssueResults.length)" class="results-filter-toolbar">
-      <label v-if="canFilterDownloads" class="check-field">
-        <input :checked="downloadFilterActive" type="checkbox" aria-describedby="completed-download-help" @change="chooseDownloadFilter" /><span>仅完成下载</span>
-      </label>
-      <span v-if="observationsOpen" class="muted small">临时显示本轮记录，保留默认筛选偏好</span>
-      <span v-if="canFilterDownloads" id="completed-download-help" class="visually-hidden">只显示取得全部有效下载样本的 IP；此选择会自动保存。</span>
-      <button v-if="!roundSummary && initialIssueResults.length" ref="initialIssuesTrigger" type="button" class="text-button" @click="setInitialIssuesOpen(true)">查看 {{ count(initialIssueResults.length) }} 个初筛异常<ChevronRight :size="12" aria-hidden="true" /></button>
-      <button v-if="transientFilterCount" class="text-button clear-result-filters" @click="resetTransientFilters">清除筛选</button>
-    </div>
-
-    <div v-if="!initialIssuesOpen" class="all-results-filters">
+    <div v-if="!initialIssuesOpen" class="all-results-filters" :class="{ 'has-download-toggle': canFilterDownloads }">
       <label class="field results-search"><span class="visually-hidden">搜索 IP、地区或机房</span><span class="results-search-control"><Search :size="14" aria-hidden="true" /><input v-model="query" type="search" placeholder="搜索 IP、地区或机房" aria-label="搜索 IP、地区或机房" /></span></label>
       <label class="field"><span class="visually-hidden">地区</span><SelectControl compact><select v-model="regionFilter" aria-label="地区"><option value="all">全部地区</option><option v-if="regionFilter !== 'all' && !regionOptions.includes(regionFilter)" :value="regionFilter">{{ location(regionFilter) }}</option><option v-for="code in regionOptions" :key="code" :value="code">{{ location(code) }}{{ /^[A-Z]{2}$/.test(code) ? ` · ${code}` : '' }}</option></select></SelectControl></label>
       <label class="field"><span class="visually-hidden">机房（POP）</span><SelectControl compact><select v-model="popFilter" aria-label="机房（POP）"><option value="all">全部机房</option><option v-if="popFilter !== 'all' && !popOptions.includes(popFilter)" :value="popFilter">{{ popFilter }}</option><option v-for="code in popOptions" :key="code" :value="code">{{ code }}</option></select></SelectControl></label>
@@ -405,7 +425,11 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
           <option value="ip">IP 地址排序</option>
         </select>
       </SelectControl></label>
-      <button ref="moreFiltersTrigger" class="button more-filters-button" :class="{ 'is-active': moreFiltersOpen || moreFilterCount }" :aria-expanded="moreFiltersOpen" aria-controls="additional-result-filters" @click="moreFiltersOpen = !moreFiltersOpen"><SlidersHorizontal :size="13" />更多筛选<span v-if="moreFilterCount" class="filter-count">{{ moreFilterCount }}</span><ChevronDown :size="12" :class="{ 'is-open': moreFiltersOpen }" /></button>
+      <button ref="moreFiltersTrigger" class="button more-filters-button" :class="{ 'is-active': moreFiltersOpen || moreFilterCount }" :aria-expanded="moreFiltersOpen" aria-controls="additional-result-filters" aria-label="更多筛选" title="更多筛选" @click="moreFiltersOpen = !moreFiltersOpen"><SlidersHorizontal :size="13" /><span class="filter-button-label">更多筛选</span><span v-if="moreFilterCount" class="filter-count">{{ moreFilterCount }}</span><ChevronDown :size="12" :class="{ 'is-open': moreFiltersOpen }" /></button>
+      <label v-if="canFilterDownloads" class="check-field completed-download-toggle" :title="observationsOpen ? '本轮临时显示全部记录，默认筛选偏好保持不变' : '只显示取得全部有效下载样本的 IP'">
+        <input :checked="downloadFilterActive" type="checkbox" aria-describedby="completed-download-help" @change="chooseDownloadFilter" /><span>仅完成下载</span>
+      </label>
+      <span v-if="canFilterDownloads" id="completed-download-help" class="visually-hidden">{{ observationsOpen ? '本轮临时显示全部记录，默认筛选偏好保持不变。' : '此筛选选择会自动保存。' }}</span>
     </div>
     <div v-if="moreFiltersOpen && !initialIssuesOpen" id="additional-result-filters" ref="moreFiltersPanel" class="additional-result-filters">
       <div class="all-results-thresholds">
@@ -486,6 +510,7 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
     <div v-else class="all-results-empty"><span class="results-empty-icon"><Activity v-if="run.status === 'running' && !records.length" :size="24" /><SearchX v-else :size="24" /></span><h3>{{ emptyTitle }}</h3><p v-if="emptyDescription">{{ emptyDescription }}</p><div v-if="!initialIssuesOpen && records.length && (transientFilterCount || downloadFilterActive)" class="results-empty-actions"><button v-if="transientFilterCount" class="button" @click="resetTransientFilters">清除筛选</button><button v-if="downloadFilterActive" class="text-button" @click="showObservations">查看已取得的记录<ChevronRight :size="14" /></button></div></div>
     <div class="all-results-footer">
       <span class="muted small" role="status" aria-live="polite">{{ hasFilters ? `显示 ${count(filtered.length)} / ${count(records.length)} 个 IP` : `共 ${count(records.length)} 个 IP` }}{{ filtered.length > pageSize ? ` · 当前 ${count(firstRow + 1)}–${count(firstRow + visibleRows.length)}` : '' }}</span>
+      <button v-if="!initialIssuesOpen && transientFilterCount" class="text-button clear-result-filters" @click="resetTransientFilters">清除筛选</button>
       <nav v-if="pageCount > 1" class="all-results-pagination" :aria-label="initialIssuesOpen ? '初筛异常分页' : '精测结果分页'"><span class="muted small">{{ currentPage }} / {{ pageCount }} 页</span><button class="icon-button" :disabled="currentPage <= 1" aria-label="上一页" @click="page = currentPage - 1"><ChevronLeft :size="15" aria-hidden="true" /></button><button class="icon-button" :disabled="currentPage >= pageCount" aria-label="下一页" @click="page = currentPage + 1"><ChevronRight :size="15" aria-hidden="true" /></button></nav>
     </div>
   </section>
@@ -498,22 +523,34 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
 .all-results-panel { display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; box-shadow: none; background: var(--panel); }
 .all-results-controls { position: relative; z-index: 3; display: flex; flex-direction: column; flex: 0 0 auto; padding-bottom: 8px; overflow: visible; }
 .all-results-heading { display: flex; flex: 0 0 42px; align-items: center; gap: 10px; height: 42px; min-height: 0; padding: 0 20px; }
-.all-results-heading h2 { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; line-height: 20px; font-weight: 600; letter-spacing: -.15px; white-space: nowrap; }
+.all-results-heading h2 { flex: none; display: inline-flex; align-items: center; gap: 8px; font-size: 14px; line-height: 20px; font-weight: 600; letter-spacing: -.15px; white-space: nowrap; }
 .all-results-heading h2::before { content: ""; width: 3px; height: 13px; border-radius: 2px; background: var(--brand); opacity: .8; }
-.all-results-heading .status-label { min-height: 20px; padding: 0 7px; font-size: 11px; line-height: 20px; border-radius: 5px; border: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
-.results-test-time { font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.run-summary-button { margin-left: auto; }
-.results-overview { display: flex; align-items: center; gap: 16px; justify-content: space-between; margin: 0 20px 8px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-sunken); }
+.all-results-heading .status-label { flex: none; min-height: 20px; padding: 0 7px; font-size: 11px; line-height: 20px; border-radius: 5px; border: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+.results-test-time { flex: none; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.run-summary-button { flex: none; margin-left: auto; }
+.results-heading-summary { flex: 1; min-width: 0; margin: 0; color: var(--muted); font-size: 12px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.run-mode-label { flex: none; padding: 0 5px; color: var(--brand); background: var(--soft); border-radius: 4px; font-size: 10px; line-height: 20px; white-space: nowrap; }
+.settings-differ-indicator { flex: none; width: 5px; height: 5px; border-radius: 50%; background: var(--warn); }
+.run-parameters { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px 16px; margin: 10px 0; }
+.run-parameters>div { min-width: 0; }
+.run-parameters dt { color: var(--muted); font-size: 11px; }
+.run-parameters dd { margin: 2px 0 0; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.run-parameters .run-target { grid-column: 1/-1; }
+.run-settings-difference { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 11px; color: var(--muted); }
+.run-overview { margin: 8px 0 12px; padding: 10px 0; border-block: 1px solid var(--line); }
 .results-overview-outcome { min-width: 0; }
 .results-overview-title { margin: 0; font-size: 13px; font-weight: 650; line-height: 19px; }
 .results-overview-detail { margin: 3px 0 0; color: var(--muted); font-size: 11px; line-height: 16px; overflow-wrap: anywhere; }
-.results-overview-counts { display: grid; grid-template-columns: repeat(3,minmax(70px,auto)); flex: 0 0 auto; margin: 0; text-align: center; font-variant-numeric: tabular-nums; }
+.results-overview-counts { display: grid; grid-template-columns: repeat(3,minmax(70px,auto)); flex: 0 0 auto; margin: 10px 0 0; text-align: center; font-variant-numeric: tabular-nums; }
 .results-overview-counts>div { padding: 0 12px; border-left: 1px solid var(--line); }
 .results-overview-counts dt { color: var(--muted); font-size: 10px; line-height: 14px; white-space: nowrap; }
 .results-overview-counts dd { margin: 2px 0 0; font-size: 16px; font-weight: 650; line-height: 20px; }
 .results-overview-counts dd>span { color: var(--muted); font-size: 11px; font-weight: 400; }
 .initial-issues-link { display: flex; min-height: 18px; gap: 2px; margin: 0 auto; padding: 0; color: var(--brand); font-size: 11px; line-height: 16px; white-space: nowrap; }
-.all-results-filters { display: grid; flex: 0 0 auto; grid-template-columns: minmax(160px,1.7fr) minmax(108px,1fr) minmax(90px,.8fr) minmax(160px,1.15fr) auto; gap: 8px; padding: 0 20px; }
+.all-results-filters { display: grid; flex: 0 0 auto; grid-template-columns: minmax(130px,1.5fr) minmax(92px,.8fr) minmax(84px,.7fr) minmax(155px,1fr) auto; gap: 8px; padding: 0 20px; }
+.all-results-filters.has-download-toggle { grid-template-columns: minmax(130px,1.5fr) minmax(92px,.8fr) minmax(84px,.7fr) minmax(155px,1fr) auto auto; }
+.completed-download-toggle { align-self: center; white-space: nowrap; font-size: 11px; gap: 5px; }
+.completed-download-toggle input { width: 14px; height: 14px; }
 .all-results-filters .field { gap: 0; }
 .all-results-filters :deep(select), .all-results-filters input[type=search], .more-filters-button { border-color: color-mix(in srgb, var(--line) 88%, var(--muted)); background: linear-gradient(var(--panel), color-mix(in srgb, var(--bg) 38%, var(--panel))); box-shadow: 0 1px 1px color-mix(in srgb, var(--text) 3%, transparent); transition: border-color .15s, box-shadow .15s, background .15s; }
 .all-results-filters :deep(select:hover:not(:disabled)), .all-results-filters input[type=search]:hover { border-color: var(--line-hover); }
@@ -523,11 +560,6 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
 .results-search-control>svg { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); color: var(--muted); pointer-events: none; }
 .results-search-control>input[type=search] { padding-left: 29px; }
 .results-search-control:focus-within>svg { color: var(--brand); }
-.results-filter-toolbar { display: flex; flex: 0 0 auto; align-items: center; flex-wrap: wrap; gap: 6px 12px; min-height: 34px; padding: 0 20px; margin-bottom: 6px; }
-.results-filter-toolbar .check-field { min-height: 28px; font-size: 12px; transition: color .15s; }
-.results-filter-toolbar .check-field:hover { color: var(--brand); }
-.results-filter-toolbar .check-field input { width: 14px; height: 14px; }
-.results-filter-toolbar .text-button { min-height: 26px; padding: 0; font-size: 11px; }
 .initial-issues-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; min-height: 34px; padding: 0 20px; }
 .initial-issues-toolbar h3 { font-size: 13px; font-weight: 600; }
 .initial-issues-back { padding: 0; white-space: nowrap; }
@@ -545,7 +577,7 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
 .additional-result-filters>p { margin-top: 7px; font-size: 11px; }
 .filter-conflict { color: var(--text); }
 .filter-conflict .text-button { min-height: 24px; margin-left: 5px; }
-.run-summary-panel { top: 41px; width: min(540px,calc(100% - 40px)); max-height: 48vh; font-size: 12px; }
+.run-summary-panel { top: 41px; width: min(540px,calc(100% - 40px)); max-height: min(64vh,520px); font-size: 12px; }
 .run-summary-panel h3, .run-summary-panel h4 { font-size: 12px; }
 .run-summary-panel p { margin: 4px 0 8px; color: var(--muted); overflow-wrap: anywhere; }
 .run-summary-panel table { width: 100%; margin: 6px 0; border-collapse: collapse; font-variant-numeric: tabular-nums; text-align: right; }
@@ -623,16 +655,19 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
 .all-results-pagination .icon-button { width: 26px; height: 26px; min-height: 26px; border: 1px solid transparent; border-radius: 5px; }
 .all-results-pagination .icon-button:hover:not(:disabled) { color: var(--brand); border-color: var(--line); background: var(--soft); }
 @media (hover: none) { .result-copy, .result-copy:disabled { opacity: .7; } }
+@media (max-width: 940px) {
+  .all-results-filters>.more-filters-button .filter-button-label, .all-results-filters>.more-filters-button>svg:last-child { display: none; }
+  .all-results-filters>.more-filters-button { padding-inline: 8px; }
+}
 @media (max-width: 800px) {
   .all-results-heading { gap: 8px; }
-  .all-results-heading, .all-results-filters, .results-filter-toolbar, .initial-issues-toolbar, .all-results-footer { padding-inline: 16px; }
-  .results-overview { margin-inline: 16px; }
+  .all-results-heading, .all-results-filters, .initial-issues-toolbar, .all-results-footer { padding-inline: 16px; }
   .additional-result-filters { right: 16px; width: min(600px,calc(100% - 32px)); }
   .run-summary-panel { right: 16px; width: min(540px,calc(100% - 32px)); }
-  .all-results-filters { grid-template-columns: minmax(140px,1.3fr) minmax(98px,.9fr) minmax(82px,.7fr) minmax(152px,1.2fr) auto; gap: 6px; }
+  .all-results-filters { gap: 6px; }
   .all-results-filters :deep(.select-control>select), .all-results-filters input[type=search] { font-size: 11px; }
   .more-filters-button { gap: 4px; font-size: 11px; padding-inline: 6px; }
-  .more-filters-button>svg:first-child { display: none; }
+  .run-summary-button>svg:first-child { display: none; }
   .all-results-table th, .all-results-table td { padding-inline: 16px; }
   .location-cell { gap: 5px; }
   .result-pop { padding-inline: 3px; }
@@ -640,9 +675,8 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
   .all-results-table .result-measurement-cell { padding-inline: 10px; }
 }
 @media (max-width: 640px) {
-  .all-results-filters { grid-template-columns: minmax(130px,1.4fr) minmax(85px,1fr) minmax(80px,.8fr); }
+  .all-results-filters, .all-results-filters.has-download-toggle { grid-template-columns: minmax(130px,1.4fr) minmax(85px,1fr) minmax(80px,.8fr); }
   .results-sort { grid-column: span 2; }
-  .results-overview { align-items: stretch; flex-direction: column; gap: 8px; }
   .results-overview-counts { border-top: 1px solid var(--line); padding-top: 6px; }
   .results-overview-counts>div:first-child { border-left: 0; }
   .all-results-thresholds { grid-template-columns: minmax(160px,1.3fr) repeat(2,minmax(110px,1fr)); min-width: 440px; }
