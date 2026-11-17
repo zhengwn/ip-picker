@@ -187,12 +187,26 @@ async function reopen() {
       !comparison.textContent.includes('有线 · en8') || !comparison.textContent.includes('Wi‑Fi · en0')) {
     throw new Error('The same-IP history did not restore both interface observations')
   }
+  const comparisonBounds = comparison.getBoundingClientRect()
+  if (comparisonBounds.top > 150 || comparisonBounds.height < window.innerHeight * .65 ||
+      [...comparison.querySelectorAll('.history-data-row')].some(row => row.getBoundingClientRect().height > 56)) {
+    throw new Error('History comparison is crowded by always-visible metadata')
+  }
+  ;(await element('.history-info-trigger')).click()
+  await waitFor('comparison conditions available on demand', () => document.querySelector('#history-info-panel')?.textContent.includes('网络接口不同'))
+  if (comparison.getBoundingClientRect().top !== comparisonBounds.top) throw new Error('History conditions moved the comparison table')
+  document.querySelector('.history-info-trigger').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  await waitFor('history conditions close and restore focus', () => !document.querySelector('#history-info-panel') && document.activeElement === document.querySelector('.history-info-trigger'))
   const wifi = [...comparison.querySelectorAll('tbody tr')].find(row => row.textContent.includes('Wi‑Fi · en0'))
   if (comparison.querySelector(tcpMetricSelect)?.value !== 'average' ||
       !wifi.querySelector('.tcp-probe-chart') || comparison.querySelectorAll('.tcp-probe-chart').length !== 1) {
     throw new Error('The TCP comparison did not share the metric and chart only saved samples')
   }
   wifi.querySelector('.history-result-toggle').click()
+  const historyDetails = await element('#history-tcp-detail')
+  if (!historyDetails.textContent.includes('TCP 初筛') || !historyDetails.textContent.includes('采样 IP') || !historyDetails.textContent.includes('测速目标')) {
+    throw new Error('Compact history rows lost their original parameters or network evidence')
+  }
   const tcp = await element('#history-tcp-detail [aria-label="TCP 诊断明细"]')
   if (!tcp.textContent.includes('412.0 ms') || tcp.textContent.includes('测满后的 P95')) {
     throw new Error('The history did not display the partial TCP latency correctly')
@@ -204,6 +218,7 @@ async function reopen() {
   }
   comparison.querySelector('tbody button').click()
   const detail = await element('[aria-label="本轮 IP 测速记录"]')
+  if (detail.getBoundingClientRect().top > 180) throw new Error('Single-run history controls leave too little room for IP records')
   if (!detail.textContent.includes('127.0.0.1') || detail.querySelector(tcpMetricSelect)?.value !== 'average' ||
       !detail.querySelector('.tcp-probe-chart')) {
     throw new Error('The saved run did not reopen with the shared TCP column')

@@ -63,6 +63,8 @@ test('history compares the exact requested IP and scales TCP charts across match
   ])
   assert.equal(state.rows.value[1].run.progress.networkPath.sampleIp, oldIp)
   assert.deepEqual([...state.changedSettings.value], ['测速目标', 'TCP 探测'])
+  assert.equal(state.infoLabel.value, '对比条件有差异')
+  assert.deepEqual(state.comparisonWarnings.value, ['测速参数不同', '网络接口不同', '部分接口来自其他 IP 的采样'])
   assert.equal(state.rows.value[1].settings.find(setting => setting.label === '测速目标').value, wifi.run.config.targetUrl)
   assert.match(state.rows.value[1].settings.find(setting => setting.label === 'TCP 探测').value, /间隔 300 ms/)
   assert.ok(state.tcpScale.value >= 400)
@@ -112,10 +114,13 @@ test('a historical run starts with precision records and applies IP, POP and sta
   const mounted = mountComponent(ScanHistoryPanel, { desktop: true, active: true, revision: 0 })
   context.after(() => mounted.unmount())
   const { state } = mounted
+  state.infoOpen.value = true
   state.openRun(run.id, 'scan')
   await setImmediate()
 
   assert.deepEqual(state.rows.value.map(row => row.result.ip), [primaryIp, secondaryIp])
+  assert.equal(state.infoOpen.value, false)
+  assert.equal(state.rows.value[0].settings.find(setting => setting.label === '测速目标').value, run.config.targetUrl)
   assert.equal(state.pageCount.value, 1)
   state.runScope.value = 'all'
   await setImmediate()
@@ -137,4 +142,22 @@ test('a historical run starts with precision records and applies IP, POP and sta
   await setImmediate()
   assert.equal(state.runScope.value, 'all')
   assert.equal(state.filteredRunRows.value.length, 53)
+})
+
+
+test('an indirect route sample remains visible as uncertainty after comparison metadata is collapsed', async context => {
+  const ip = '104.16.0.1'
+  const first = match(ip, 'en0')
+  const second = match(ip, 'en0')
+  second.run.id = 'second-run'
+  second.run.progress.networkPath.sampleIp = '104.16.0.2'
+  setInvokeHandler(async command => command === 'get_scan_history' ? { limit: 10, entries: [] } : [first, second])
+  const mounted = mountComponent(ScanHistoryPanel, { desktop: true, active: true, revision: 0 })
+  context.after(mounted.unmount)
+  mounted.state.openComparison(ip)
+  await setImmediate()
+  assert.equal(mounted.state.changedSettings.value.size, 0)
+  assert.deepEqual(mounted.state.comparisonWarnings.value, ['部分接口来自其他 IP 的采样'])
+  assert.equal(mounted.state.infoLabel.value, '对比条件待确认')
+  assert.equal(mounted.state.rows.value[1].run.progress.networkPath.sampleIp, '104.16.0.2')
 })
