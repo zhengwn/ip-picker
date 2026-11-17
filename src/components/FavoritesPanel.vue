@@ -7,6 +7,7 @@ import { validManualIpv4 } from '../custom-ips'
 import { candidateExclusionReason, candidateMeasurementStatus, precisionPolicyLabel, targetHost } from '../ui-state'
 import { favoriteDate, favoriteError, favoriteHasTestData, favoriteNumber, favoriteRunStatus, favoriteSnapshotRun, favoriteTestDate, favoriteTestChanges, favoriteTestPhase, type FavoriteEntry, type FavoriteFolder, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from '../favorites'
 import { preferredFavoriteFolder, rememberFavoriteFolder } from '../favorite-preferences'
+import { useDismissiblePopover } from '../popovers'
 import type { TcpDisplayMetric } from '../result-preferences'
 import { tcpLatencyChartScale } from '../result-row-display'
 import SelectControl from './SelectControl.vue'
@@ -29,6 +30,10 @@ const selectedFolderId = ref('')
 const search = ref('')
 const showChangesOnly = ref(false)
 const table = ref<HTMLElement | null>(null)
+const moreOpen = ref(false)
+const moreTrigger = ref<HTMLButtonElement | null>(null)
+const morePanel = ref<HTMLElement | null>(null)
+useDismissiblePopover(moreOpen, morePanel, moreTrigger)
 const expandedEntryId = ref<string | null>(null)
 const dialog = ref<HTMLDialogElement | null>(null)
 const firstInput = ref<HTMLInputElement | HTMLSelectElement | null>(null)
@@ -71,7 +76,7 @@ const disabled = computed(() => !props.desktop || props.loading || pending.value
 const measurementBusy = computed(() => !!props.scanBusy || testRunning.value || props.stopping)
 const testDisabled = computed(() => disabled.value || measurementBusy.value)
 const changes = computed(() => favoriteTestChanges(props.library.entries, job.value))
-const changedCount = computed(() => [...changes.value.values()].filter(change => change?.changed).length)
+const changedCount = computed(() => entries.value.filter(entry => changes.value.get(entry.id)?.changed).length)
 watch(() => job.value?.run.id, () => { showChangesOnly.value = false })
 const formInvalid = computed(() => folderAction.value ? invalidName.value : action.value === 'editEntry' ? !folderId.value || duplicateEntry.value || note.value.length > 500 : action.value === 'addIp' ? !folderId.value || !validManualIpv4(manualIp.value) || note.value.length > 500 : false)
 const currentSettings = computed(() => `${targetHost(props.config.targetUrl)} · TCP ${props.config.stabilityAttempts ?? '默认'} 次 · HTTPS ${props.config.verificationAttempts} 次 · 下载 ${props.config.downloadRounds} 轮 × ${props.config.downloadSeconds} 秒 · ${downloadBudgetLabel(props.config)}`)
@@ -94,6 +99,13 @@ function entryState(entry: FavoriteEntry) {
 function detailId(id: string) { return `favorite-detail-${encodeURIComponent(id)}` }
 function toggleId(id: string) { return `favorite-toggle-${encodeURIComponent(id)}` }
 function toggleEntry(entry: FavoriteEntry) { expandedEntryId.value = expandedEntryId.value === entry.id ? null : entry.id }
+async function showEntryChange(entry: FavoriteEntry) {
+  expandedEntryId.value = entry.id
+  await nextTick()
+  const comparison = document.getElementById(detailId(entry.id))?.querySelector<HTMLElement>('.favorite-comparison')
+  comparison?.scrollIntoView({ block: 'nearest' })
+  comparison?.focus({ preventScroll: true })
+}
 async function collapseEntry() {
   const id = expandedEntryId.value
   expandedEntryId.value = null
@@ -104,6 +116,7 @@ watch(visibleEntries, list => {
   if (expandedEntryId.value && !list.some(entry => entry.id === expandedEntryId.value)) expandedEntryId.value = null
 })
 watch([search, selectedFolderId, showChangesOnly], async () => { await nextTick(); if (table.value) table.value.scrollTop = 0 })
+watch(selectedFolderId, () => { moreOpen.value = false })
 
 
 watch(() => props.testJob, value => { if (value) localJob.value = value }, { immediate: true })
@@ -119,7 +132,8 @@ watch(() => props.library.folders, folders => {
 
 async function showDialog(kind: NonNullable<typeof action.value>, folder: FavoriteFolder | null = null, entry: FavoriteEntry | null = null) {
   if (disabled.value || ((kind === 'deleteEntry' || kind === 'deleteFolder') && measurementBusy.value)) return
-  returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+  returnFocus = moreOpen.value ? moreTrigger.value : document.activeElement instanceof HTMLElement ? document.activeElement : null
+  moreOpen.value = false
   action.value = kind
   actionFolder.value = folder
   actionEntry.value = entry
@@ -231,38 +245,52 @@ onBeforeUnmount(() => {
 <template>
   <section ref="panel" class="panel favorites-panel" aria-labelledby="favorites-title" :aria-busy="loading || pending || starting">
     <div class="favorite-top-controls">
-    <div class="favorites-toolbar workspace-toolbar">
-      <div class="favorites-identity"><span class="favorites-symbol"><Star :size="15" aria-hidden="true" /></span><div><h2 id="favorites-title" class="favorites-heading">IP 收藏夹<span class="favorite-total">{{ library.entries.length }}</span></h2><p class="muted small favorites-intro">按场景整理，查看最近实测</p></div></div>
-      <div class="favorite-search"><Search :size="14" aria-hidden="true" /><input v-model="search" type="search" aria-label="搜索收藏 IP、POP、备注或分类" placeholder="搜索 IP、POP、备注或分类" /><button v-if="search" class="icon-button" type="button" aria-label="清除收藏搜索" @click="search = ''"><X :size="12" aria-hidden="true" /></button></div>
-      <div class="actions favorite-top-actions workspace-actions"><button class="button workspace-secondary-action" :disabled="disabled" @click="showDialog('createFolder')"><FolderOpen :size="13" aria-hidden="true" />新建收藏夹</button><button class="button primary workspace-primary-action" :disabled="disabled || !library.folders.length" @click="showDialog('addIp')"><Plus :size="13" aria-hidden="true" />手动添加 IP</button></div>
-    </div>
-    <p v-if="loading" class="favorites-empty" role="status">正在读取收藏…</p>
-    <template v-else>
-
-      <div v-if="job" class="favorite-test-job" :class="{ 'is-running': testRunning }">
-        <div class="favorite-job-summary" role="status" aria-live="polite">
-          <strong class="favorite-job-status"><LoaderCircle v-if="testRunning" :size="13" class="spinning" aria-hidden="true" /><Check v-else-if="job.run.status === 'completed'" :size="13" aria-hidden="true" />{{ testRunning ? '收藏复测中' : favoriteRunStatus(job.run.status) }}</strong>
-          <span class="favorite-job-target" :title="testTargetFolders">{{ testRunning ? favoriteTestPhase(job) : `${testTargetFolders || '收藏 IP'} · ${testTargetCount} 个 IP` }}</span>
-          <span class="favorite-job-numbers">完整通过 <strong>{{ testPassedCount }} / {{ testTargetCount }}</strong><span>·</span>{{ (job.run.progress.downloadedBytes / 1024 / 1024).toFixed(1) }} MiB</span>
-          <button v-if="testRunning" class="button stop-button favorite-compact" :disabled="stopping" @click="emit('stop-test')"><LoaderCircle v-if="stopping" :size="12" class="spinning" aria-hidden="true" /><Square v-else :size="11" aria-hidden="true" />{{ stopping ? '正在停止…' : '停止复测' }}</button>
-          <button v-if="!testRunning" class="text-button" :aria-pressed="showChangesOnly" @click="showChangesOnly = !showChangesOnly">{{ showChangesOnly ? '显示全部收藏' : `查看本次变化（${changedCount}）` }}</button>
-          <details class="favorite-job-details"><summary><span>记录详情</span><ChevronDown :size="12" aria-hidden="true" /></summary><div class="favorite-job-detail-body"><strong>{{ testTargetFolders || '收藏 IP' }} · {{ testTargetCount }} 个 IP</strong><p>测试于 {{ favoriteDate(job.run.startedAt) }} · {{ favoriteRunStatus(job.run.status) }}</p><p>{{ favoriteTestPhase(job) }} · {{ downloadBudgetLabel(job.run.config) }}</p><p v-if="testRunning && job.run.progress.total">当前阶段 {{ job.run.progress.completed }} / {{ job.run.progress.total }}</p><p v-if="job.run.error" class="favorite-form-error">{{ job.run.error }}</p><p v-if="job.run.progress.message">{{ job.run.progress.message }}</p><p>{{ testRunning ? '复测期间保留上次测试快照，结束后更新取得的结果。' : job.run.status === 'cancelled' ? '已停止；收藏列表显示最近成功保存的记录，未开始测试的 IP 保留原结果。' : job.run.status === 'failed' ? '本次测试未完成；收藏列表显示最近成功保存的记录，可重新测速。' : '本次测试已结束；收藏列表显示最近成功保存的记录。' }}</p></div></details>
+      <div class="favorites-toolbar workspace-toolbar">
+        <div class="favorites-identity"><h2 id="favorites-title" class="favorites-heading">IP 收藏夹<span class="favorite-total">{{ library.entries.length }}</span></h2></div>
+        <div class="favorite-search"><Search :size="14" aria-hidden="true" /><input v-model="search" type="search" aria-label="搜索收藏 IP、POP、备注或分类" placeholder="搜索 IP、POP、备注或分类" /><button v-if="search" class="icon-button" type="button" aria-label="清除收藏搜索" @click="search = ''"><X :size="12" aria-hidden="true" /></button></div>
+        <div class="actions favorite-top-actions workspace-actions"><button class="button workspace-secondary-action" :disabled="disabled" @click="showDialog('createFolder')"><FolderOpen :size="13" aria-hidden="true" />新建收藏夹</button><button class="button primary workspace-primary-action" :disabled="disabled || !library.folders.length" @click="showDialog('addIp')"><Plus :size="13" aria-hidden="true" />手动添加 IP</button></div>
+      </div>
+      <p v-if="loading" class="favorite-loading" role="status">正在读取收藏…</p>
+      <template v-else>
+        <div v-if="testRunning && job" class="favorite-active-task" role="status" aria-live="polite">
+          <LoaderCircle :size="12" class="spinning" aria-hidden="true" /><strong>{{ favoriteTestPhase(job) }}</strong>
+          <span v-if="job.run.progress.total">当前阶段 {{ job.run.progress.completed }} / {{ job.run.progress.total }}</span>
+          <span>完整通过 {{ testPassedCount }} / {{ testTargetCount }}</span><span>{{ (job.run.progress.downloadedBytes / 1024 / 1024).toFixed(1) }} MiB</span>
+          <button class="button stop-button favorite-active-stop" :disabled="stopping" @click="emit('stop-test')"><Square :size="11" aria-hidden="true" />{{ stopping ? '正在停止…' : '停止复测' }}</button>
+          <div v-if="job.run.progress.total" class="progress-track favorite-test-track" role="progressbar" aria-label="收藏复测当前阶段进度" :aria-valuenow="testPercent" aria-valuemin="0" aria-valuemax="100"><span :style="{ width: `${testPercent}%` }" /></div>
         </div>
-        <div v-if="testRunning && job.run.progress.total" class="progress-track favorite-test-track" role="progressbar" aria-label="收藏复测当前阶段进度" :aria-valuenow="testPercent" aria-valuemin="0" aria-valuemax="100"><span :style="{ width: `${testPercent}%` }" /></div>
-        <p v-if="job.run.error" class="favorite-form-error" role="alert" :title="job.run.error">{{ job.run.error }}</p>
-      </div>
-      <nav class="favorite-folder-list" aria-label="选择收藏夹">
-        <button class="favorite-folder" :class="{ selected: !selectedFolderId }" :aria-pressed="!selectedFolderId" @click="selectedFolderId = ''"><Star :size="14" aria-hidden="true" />全部收藏<span class="favorite-folder-count">{{ library.entries.length }}</span></button>
-        <button v-for="folder in library.folders" :key="folder.id" class="favorite-folder" :title="folder.name" :class="{ selected: selectedFolderId === folder.id }" :aria-pressed="selectedFolderId === folder.id" @click="selectedFolderId = folder.id"><FolderOpen :size="14" aria-hidden="true" /><span class="favorite-folder-name">{{ folder.name }}</span><span class="favorite-folder-count">{{ folderEntryCount(folder.id) }}</span></button>
-      </nav>
-      <div class="favorite-context-row">
-        <span v-if="testError" class="favorite-context-message is-error" role="alert" :title="testError">{{ testError }}</span><span v-else-if="scanBusy" class="favorite-context-message" role="status" title="分区优选正在进行；可保存地址、编辑备注或新建收藏夹，结束后可复测。">优选中 · 可整理收藏，稍后复测</span><span v-else-if="!desktop" class="favorite-context-message" role="status">界面预览 · 请在桌面应用保存收藏</span>
-        <span v-if="!testError && !scanBusy && desktop" class="favorite-result-count muted small" aria-live="polite">{{ search.trim() || showChangesOnly ? `找到 ${visibleEntries.length} / ${entries.length} 个收藏` : `${entries.length} 个 IP · 按收藏时间排列` }}</span>
-        <div v-if="selectedFolder" class="actions favorite-folder-actions"><button class="text-button" :disabled="testDisabled || !entries.length" :aria-label="`一键复测本夹 ${selectedFolder.name}（${entries.length} 个 IP）`" @click="startTest({ folderId: selectedFolder.id })"><RotateCcw :size="12" aria-hidden="true" />复测本夹（{{ entries.length }}）</button><button class="icon-button" :disabled="disabled" :aria-label="`重命名收藏夹 ${selectedFolder.name}`" title="重命名收藏夹" @click="showDialog('renameFolder', selectedFolder)"><Pencil :size="12" aria-hidden="true" /></button><button class="icon-button favorite-danger" :disabled="testDisabled" :aria-label="`删除收藏夹 ${selectedFolder.name}`" title="删除收藏夹" @click="showDialog('deleteFolder', selectedFolder)"><Trash2 :size="12" aria-hidden="true" /></button></div>
-        <span v-else-if="library.entries.length && !testRunning" class="favorite-folder-hint muted small">选择分类可整夹复测</span><span v-if="testRunning" class="favorite-table-live-note">复测中 · 表格暂显示上次记录，未取得数据记为 —</span>
-        <details class="favorite-test-settings"><summary><Settings2 :size="12" aria-hidden="true" /><span>复测参数</span><ChevronDown :size="12" aria-hidden="true" /></summary><div class="favorite-test-settings-body"><strong class="small">{{ targetHost(config.targetUrl) }}</strong><p class="small" :title="config.targetUrl">{{ currentSettings }}</p><p class="muted small">收藏夹复测会测试指定的全部 IP，不按地区或前 10 名筛选。{{ config.downloadBudgetEnabled !== false ? '下载预算用尽时，未完成的下载会标明原因。' : '不限制流量，全部 IP 测完或主动停止时结束。' }}</p></div></details>
-      </div>
-    </template>
+        <div v-if="testError || job?.run.error" class="favorite-feedback" role="alert"><CircleAlert :size="13" aria-hidden="true" /><span :title="testError || job?.run.error">{{ testError || job?.run.error }}</span></div>
+        <div class="favorite-folder-bar">
+          <nav class="favorite-folder-list" aria-label="选择收藏夹">
+            <button class="favorite-folder" :class="{ selected: !selectedFolderId }" :aria-pressed="!selectedFolderId" @click="selectedFolderId = ''"><Star :size="14" aria-hidden="true" />全部收藏<span class="favorite-folder-count">{{ library.entries.length }}</span></button>
+            <button v-for="folder in library.folders" :key="folder.id" class="favorite-folder" :title="folder.name" :class="{ selected: selectedFolderId === folder.id }" :aria-pressed="selectedFolderId === folder.id" @click="selectedFolderId = folder.id"><FolderOpen :size="14" aria-hidden="true" /><span class="favorite-folder-name">{{ folder.name }}</span><span class="favorite-folder-count">{{ folderEntryCount(folder.id) }}</span></button>
+          </nav>
+          <div class="favorite-folder-tools">
+            <label v-if="job && !testRunning" class="check-field favorite-change-filter"><input v-model="showChangesOnly" type="checkbox" aria-label="仅看复测变化" /><span>仅看变化<span class="favorite-filter-count">{{ changedCount }}</span></span></label>
+            <button class="button favorite-retest-folder" :disabled="testDisabled || !selectedFolder || !entries.length" :title="!selectedFolder ? '先选择一个收藏夹，再测试其中全部 IP' : measurementBusy ? '等待当前测试结束后可复测' : `复测本夹全部 ${entries.length} 个 IP，搜索和变化筛选不影响测试范围`" :aria-label="selectedFolder ? `一键复测本夹 ${selectedFolder.name}（${entries.length} 个 IP）` : '复测本夹（先选择收藏夹）'" @click="selectedFolder && startTest({ folderId: selectedFolder.id })"><RotateCcw :size="12" aria-hidden="true" />复测本夹</button>
+            <button ref="moreTrigger" class="button favorite-more-trigger" :class="{ 'is-active': moreOpen }" :disabled="closing" :aria-expanded="moreOpen" aria-controls="favorite-more-panel" title="查看复测记录、参数和收藏夹管理" @click="moreOpen = !moreOpen"><Settings2 :size="13" aria-hidden="true" />更多<ChevronDown :size="12" aria-hidden="true" /></button>
+          </div>
+          <section v-if="moreOpen" id="favorite-more-panel" ref="morePanel" class="favorite-more-panel" aria-labelledby="favorite-more-title" tabindex="0">
+            <h3 id="favorite-more-title">收藏详情与管理</h3><p v-if="testError" class="favorite-form-error">{{ testError }}</p>
+            <div v-if="selectedFolder" class="favorite-more-section">
+              <h4>{{ selectedFolder.name }}</h4>
+              <div class="favorite-manage-actions"><button class="text-button" :disabled="disabled" :aria-label="`重命名收藏夹 ${selectedFolder.name}`" @click="showDialog('renameFolder', selectedFolder)"><Pencil :size="12" aria-hidden="true" />重命名收藏夹</button><button class="text-button favorite-danger" :disabled="testDisabled" :aria-label="`删除收藏夹 ${selectedFolder.name}`" @click="showDialog('deleteFolder', selectedFolder)"><Trash2 :size="12" aria-hidden="true" />删除收藏夹</button></div>
+            </div>
+            <p v-else>选择一个收藏夹后，可整夹复测、重命名或删除。</p>
+            <div v-if="job" class="favorite-more-section">
+              <h4><Check v-if="job.run.status === 'completed'" :size="12" aria-hidden="true" />{{ testRunning ? '当前复测' : '最近一次复测' }} · {{ favoriteRunStatus(job.run.status) }}</h4>
+              <p>{{ testTargetFolders || '收藏 IP' }} · {{ testTargetCount }} 个 IP · {{ favoriteDate(job.run.startedAt) }}</p>
+              <p>完整通过 {{ testPassedCount }} / {{ testTargetCount }} · 下载正文 {{ (job.run.progress.downloadedBytes / 1024 / 1024).toFixed(1) }} MiB · {{ downloadBudgetLabel(job.run.config) }}</p>
+              <p v-if="job.run.error" class="favorite-form-error">{{ job.run.error }}</p><p v-if="job.run.progress.message">{{ job.run.progress.message }}</p>
+              <p>{{ testRunning ? '复测期间显示上次快照，结束后更新取得的结果。' : job.run.status === 'cancelled' ? '已保留停止前取得的结果；尚未开始的 IP 保留原快照。' : '列表显示最近保存的快照；点击行内“变化”可查看复测差值。' }}</p>
+            </div>
+            <div class="favorite-more-section"><h4>下次复测参数</h4><p :title="config.targetUrl">{{ currentSettings }}</p><p>复测本夹会测试其中全部 IP；搜索和变化筛选不影响测试范围。不按地区或前 10 名筛选。</p></div>
+            <p v-if="measurementBusy">测试期间仍可保存地址、编辑备注和新建收藏夹。</p>
+            <p v-if="!desktop">界面预览，请在桌面应用中保存或复测收藏。</p>
+            <p>普通地区优选保留收藏快照；收藏复测更新记录。切换网络后建议复测。</p>
+          </section>
+        </div>
+      </template>
     </div>
     <template v-if="!loading">
       <div v-if="!entries.length" class="favorites-empty"><FolderOpen :size="26" aria-hidden="true" /><strong>{{ !library.folders.length ? '还没有收藏夹' : selectedFolder ? '这个收藏夹还没有 IP' : '还没有收藏 IP' }}</strong><p>{{ !library.folders.length ? '新建一个收藏夹，按运营商或使用场景整理。' : '可以先保存 IP，也可以收藏并立即测速。' }}</p></div>
@@ -279,7 +307,10 @@ onBeforeUnmount(() => {
                 <td><span class="favorite-table-location" :title="`${entry.result.city || '城市未识别'} · ${roleLabel(entry)}`"><span>{{ favoriteHasTestData(entry) ? regionName(entry.result.regionCode) || '地区未识别' : '待测速' }}</span><span v-if="entry.result.colo" class="favorite-pop">{{ entry.result.colo }}</span></span></td>
                 <td class="favorite-tcp-cell"><TcpLatencyCell :result="entry.result" :display-metric="tcpDisplayMetric" :scale-max-ms="tcpScaleMaxMs" :run-metric="entry.config.stabilityLatencyMetric ?? 'max'" label-run-metric /></td>
                 <td class="favorite-speed-cell"><span class="favorite-table-speed" :class="{ measured: entry.result.downloadSamplesMbps.length > 0 }">{{ entry.result.downloadSamplesMbps.length ? favoriteNumber(entry.result.downloadMbps) : '—' }}</span></td>
-                <td class="favorite-freshness" :title="favoriteHasTestData(entry) ? favoriteDate(entry.runFinishedAt || entry.runStartedAt) : '保存后尚未测试'"><span>{{ favoriteTestDate(entry) }}</span><small v-if="favoriteHasTestData(entry) || isEntryTesting(entry)">{{ entryState(entry) }}</small><span v-if="changes.get(entry.id)" class="favorite-change" :title="`${changes.get(entry.id)?.label}；${changes.get(entry.id)?.detail}`">{{ changes.get(entry.id)?.label }}</span><small v-if="changes.get(entry.id)?.differences.length" class="favorite-change-context">{{ changes.get(entry.id)?.differences.join(' · ') }}</small></td>
+                <td class="favorite-freshness" :title="favoriteHasTestData(entry) ? favoriteDate(entry.runFinishedAt || entry.runStartedAt) : '保存后尚未测试'">
+                  <div class="favorite-freshness-main"><span class="favorite-last-tested">{{ favoriteTestDate(entry) }}</span><button v-if="changes.get(entry.id)?.changed" class="text-button favorite-change-link" :class="{ 'has-context-difference': changes.get(entry.id)?.differences.length }" :title="`${changes.get(entry.id)?.label}；${changes.get(entry.id)?.differences.join(' · ') || '点击查看完整变化'}`" :aria-label="`查看 ${entry.result.ip} 在${folderName(entry.folderId)}中的复测变化`" :aria-expanded="expandedEntryId === entry.id" :aria-controls="expandedEntryId === entry.id ? detailId(entry.id) : undefined" @click="showEntryChange(entry)">变化</button></div>
+                  <small v-if="favoriteHasTestData(entry) || isEntryTesting(entry)" :title="entryState(entry)">{{ entryState(entry) }}</small>
+                </td>
                 <td><div class="favorite-row-actions">
                   <button class="icon-button" :disabled="!desktop" :aria-label="`复制收藏的 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="复制 IP" @click="copyIp(entry.result.ip)"><Clipboard :size="13" aria-hidden="true" /></button>
                   <button class="icon-button" :disabled="!desktop" :aria-label="`对比 IP ${entry.result.ip} 的测速历史（${folderName(entry.folderId)}）`" title="对比该 IP 历史" @click="emit('compare-history', entry.result.ip)"><History :size="13" aria-hidden="true" /></button>
@@ -289,7 +320,7 @@ onBeforeUnmount(() => {
                 </div></td>
               </tr>
               <tr v-if="expandedEntryId === entry.id" class="favorite-detail-row"><td colspan="7"><section :id="detailId(entry.id)" class="favorite-inline-detail" :aria-label="`${entry.result.ip} 在${folderName(entry.folderId)}中的测试详情`"><div class="favorite-detail-heading"><div><strong class="mono">{{ entry.result.ip }}</strong><span class="favorite-detail-status" :class="{ passed: entry.result.measurementPassed && !isEntryTesting(entry) }">{{ entryState(entry) }}</span><span>{{ folderName(entry.folderId) }}</span></div><button class="text-button" :aria-label="`收起 ${entry.result.ip} 的详情`" @click="collapseEntry">收起<ChevronDown :size="12" class="favorite-collapse-icon" /></button></div>
-            <div v-if="changes.get(entry.id)" class="favorite-comparison"><strong>{{ changes.get(entry.id)?.label }}</strong><p>{{ changes.get(entry.id)?.detail }}</p><p v-if="changes.get(entry.id)?.differences.length">{{ changes.get(entry.id)?.differences.join(' · ') }}；数值差异不能直接归因于网络质量。</p></div>
+            <div v-if="changes.get(entry.id)" class="favorite-comparison" tabindex="-1" :aria-label="`${entry.result.ip} 的复测变化`"><strong>{{ changes.get(entry.id)?.label }}</strong><p>{{ changes.get(entry.id)?.detail }}</p><p v-if="changes.get(entry.id)?.differences.length">{{ changes.get(entry.id)?.differences.join(' · ') }}；数值差异不能直接归因于网络质量。</p></div>
             <div class="favorite-tcp-diagnostics"><TcpDiagnostics :result="entry.result" :config="entry.config" /></div>
             <dl class="favorite-detail-grid">
               <div><dt>收藏时间</dt><dd>{{ favoriteDate(entry.savedAt) }}</dd></div><div><dt>最近测试</dt><dd>{{ favoriteHasTestData(entry) ? `${favoriteDate(entry.runFinishedAt || entry.runStartedAt)} · ${favoriteRunStatus(entry.runStatus)}` : '尚无测试记录' }}</dd></div>
@@ -314,7 +345,7 @@ onBeforeUnmount(() => {
       </div>
 
     </template>
-    <div class="favorite-table-footer"><span>{{ search.trim() || showChangesOnly ? `显示 ${visibleEntries.length} / ${entries.length} 条收藏` : `共 ${entries.length} 条收藏` }}</span><span>普通优选保留快照；收藏复测更新记录。切换网络后建议复测。</span></div>
+    <div class="favorite-table-footer"><span>{{ search.trim() || showChangesOnly ? `显示 ${visibleEntries.length} / ${entries.length} 条收藏` : `共 ${entries.length} 条收藏` }}</span><button v-if="search.trim() || showChangesOnly" class="text-button" @click="search = ''; showChangesOnly = false">清除筛选</button><span v-else class="muted">按收藏时间排列</span></div>
     <Teleport to="body">
       <dialog ref="dialog" class="favorite-modal" aria-labelledby="favorite-maintain-title" @cancel.prevent="closeDialog" @click.self="closeDialog">
         <form @submit.prevent="submit()">
@@ -347,16 +378,15 @@ onBeforeUnmount(() => {
 .favorites-panel>div:not(.favorites-table):not(.favorites-empty), .favorites-panel>nav, .favorites-panel>p { flex: 0 0 auto; }
 .favorite-top-controls { flex: 0 0 auto; height: auto; min-height: 0; display: flex; flex-direction: column; position: relative; z-index: 3; overflow: visible; }
 .favorite-top-controls>* { flex-shrink: 0; }
-.favorites-identity { display: flex; align-items: center; gap: 9px; min-width: 170px; margin-right: auto; }
-.favorites-symbol, .favorite-modal-symbol { display: inline-grid; place-items: center; flex: 0 0 auto; width: 30px; height: 30px; color: var(--brand); background: var(--soft); border: 1px solid var(--selected-border); border-radius: 8px; box-shadow: inset 0 1px 0 color-mix(in srgb,var(--panel) 70%,transparent); }
+.favorites-identity { display: flex; align-items: center; flex: none; min-width: 130px; }
+.favorite-modal-symbol { display: inline-grid; place-items: center; flex: 0 0 auto; width: 30px; height: 30px; color: var(--brand); background: var(--soft); border: 1px solid var(--selected-border); border-radius: 8px; box-shadow: inset 0 1px 0 color-mix(in srgb,var(--panel) 70%,transparent); }
 .favorites-heading { display: flex; align-items: center; gap: 8px; line-height: 20px; font-size: 14px; }
 .favorite-total { display: inline-grid; place-items: center; min-width: 19px; height: 17px; padding: 0 5px; border-radius: 5px; color: var(--brand); background: var(--soft); font-size: 10px; font-variant-numeric: tabular-nums; font-weight: 500; }
-.favorites-intro { margin-top: 2px; }
-.favorite-search { position: relative; display: flex; align-items: center; width: clamp(190px,25vw,280px); }
+.favorite-search { position: relative; display: flex; flex: 1; align-items: center; min-width: 0; max-width: 360px; }
 .favorite-search>svg { position: absolute; left: 10px; color: var(--muted); pointer-events: none; }
 .favorite-search>input[type=search] { height: 30px; padding-left: 31px; padding-right: 29px; font-size: 11px; background: var(--surface-raised); border-color: var(--line); box-shadow: var(--control-shadow); }
 .favorite-search>.icon-button { position: absolute; right: 2px; width: 24px; height: 24px; min-height: 24px; }
-.favorite-folder-list { display: flex; flex-wrap: nowrap; align-items: center; gap: 6px; margin: 0; padding: 4px 20px 8px; overflow-x: auto; scrollbar-width: thin; border-bottom: 1px solid var(--line); }
+.favorite-folder-list { display: flex; flex: 1; min-width: 0; flex-wrap: nowrap; align-items: center; gap: 6px; margin: 0; padding: 0; overflow-x: auto; scrollbar-width: thin; }
 .favorite-folder { display: inline-flex; align-items: center; gap: 6px; min-height: 29px; padding: 0 9px; border: 1px solid var(--line); border-radius: 7px; color: var(--muted); background: var(--surface-raised); font-size: 11px; flex: 0 0 auto; max-width: 260px; white-space: nowrap; box-shadow: var(--control-shadow); transition: border-color .14s,background .14s; }
 .favorite-folder-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .favorite-folder>.favorite-folder-count { flex: 0 0 auto; }
@@ -364,40 +394,33 @@ onBeforeUnmount(() => {
 .favorite-folder>.favorite-folder-count { display: inline-grid; place-items: center; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 4px; color: var(--muted); background: var(--surface-sunken); font-size: 10px; font-variant-numeric: tabular-nums; }
 .favorite-folder.selected { color: var(--brand); border-color: var(--selected-border); background: var(--soft); box-shadow: inset 0 1px 0 color-mix(in srgb,var(--panel) 75%,transparent),var(--control-shadow); }
 .favorite-folder.selected>.favorite-folder-count { color: var(--brand); background: color-mix(in srgb,var(--brand) 10%,var(--panel)); }
-.favorite-context-row { margin-top: auto; display: flex; align-items: center; gap: 12px; min-height: 34px; padding: 0 20px; font-size: 11px; }
-.favorite-folder-actions { gap: 3px; }
-.favorite-folder-actions>.icon-button { width: 24px; height: 24px; min-height: 24px; padding: 6px; color: var(--muted); }
-.favorite-folder-actions>.text-button { margin-right: 4px; }
-.favorite-folder-hint { color: color-mix(in srgb,var(--muted) 75%,var(--line-hover)); }
-.favorite-test-settings { position: relative; margin-left: auto; }
-.favorite-test-settings>summary { display: flex; align-items: center; gap: 5px; min-height: 26px; padding: 0 7px; border: 1px solid transparent; border-radius: 6px; color: var(--muted); list-style: none; cursor: pointer; font-size: 11px; white-space: nowrap; }
-.favorite-test-settings>summary:hover, .favorite-test-settings[open]>summary { color: var(--brand); border-color: var(--selected-border); background: var(--soft); }
-.favorite-test-settings-body { max-height: 50vh; overflow-y: auto; position: absolute; top: calc(100% + 4px); right: 0; z-index: 4; width: min(380px,calc(100vw - 60px)); padding: 12px; color: var(--text); background: var(--surface-raised); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 8px 24px #23284918; overflow-wrap: anywhere; }
-.favorite-test-settings-body>p { margin-top: 5px; }
-.favorite-test-job { position: relative; margin: 0 20px 10px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface-raised); }
-.favorite-job-summary { display: flex; align-items: center; gap: 12px; min-height: 22px; }
-.favorite-job-status { display: inline-flex; align-items: center; flex: 0 0 auto; gap: 6px; font-size: 11px; font-weight: 500; line-height: 20px; }
-.favorite-job-status>svg { color: var(--brand); }
-.favorite-job-target { min-width: 0; max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
-.favorite-job-numbers { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.favorite-job-numbers>strong { color: var(--text); font-weight: 500; }
-.favorite-job-numbers>span { color: var(--line-hover); }
-.favorite-job-summary>.stop-button { min-height: 26px; font-size: 10px; }
-.favorite-job-details { position: relative; flex: 0 0 auto; margin-left: auto; }
-.favorite-job-details>summary { display: flex; align-items: center; gap: 5px; min-height: 22px; color: var(--muted); font-size: 10px; list-style: none; }
-.favorite-job-details>summary:hover { color: var(--brand); }
-.favorite-job-detail-body { position: absolute; top: calc(100% + 8px); right: -1px; z-index: 5; width: min(380px,calc(100vw - 60px)); max-height: 55vh; overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: var(--surface-raised); box-shadow: 0 8px 24px #23284918; font-size: 11px; line-height: 20px; overflow-wrap: anywhere; }
-.favorite-job-detail-body>strong { color: var(--text); font-size: 11px; font-weight: 500; }
-.favorite-job-detail-body>p { margin-top: 5px; }
-@media (max-width: 800px) { .favorite-job-summary { gap: 8px; flex-wrap: wrap; } .favorite-job-target { max-width: 180px; } }
-.favorite-test-job>.favorite-form-error { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 4px; font-size: 10px; line-height: 16px; }
-.favorite-test-job.is-running { border-color: var(--selected-border); background: var(--soft); }
-.favorite-test-track { position: absolute; inset: auto 0 0; height: 2px; margin: 0; border-radius: 0 0 7px 7px; }
+/* Keep folders and common actions on one rail; secondary content floats over the table. */
+.favorite-folder-bar { display: flex; position: relative; align-items: center; gap: 12px; min-width: 0; padding: 4px 20px 8px; }
+.favorite-folder-tools { display: flex; flex: none; align-items: center; gap: 8px; }
+.favorite-folder-tools>.button { min-height: 30px; height: 30px; padding: 0 8px; gap: 5px; font-size: 11px; }
+.favorite-change-filter { font-size: 11px; gap: 5px; white-space: nowrap; }
+.favorite-change-filter input { width: 14px; height: 14px; }
+.favorite-filter-count { display: inline-block; min-width: 16px; margin-left: 4px; padding: 0 3px; color: var(--brand); background: var(--soft); border-radius: 4px; font-size: 10px; line-height: 16px; text-align: center; font-variant-numeric: tabular-nums; }
+.favorite-more-trigger.is-active { color: var(--brand); background: var(--soft); border-color: var(--selected-border); }
+.favorite-more-panel { position: absolute; top: calc(100% - 1px); right: 20px; z-index: 8; width: min(480px,calc(100% - 40px)); max-height: min(62vh,480px); overflow: auto; overscroll-behavior: contain; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-raised); box-shadow: 0 10px 28px #2328491c; font-size: 12px; line-height: 20px; overflow-wrap: anywhere; }
+.favorite-more-panel h3 { margin: 0; font-size: 13px; }
+.favorite-more-panel h4 { display: flex; align-items: center; gap: 5px; margin: 0; font-size: 12px; }
+.favorite-more-panel p { margin-top: 5px; color: var(--muted); }
+.favorite-more-panel .favorite-form-error { color: var(--error); }
+.favorite-more-section { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.favorite-manage-actions { display: flex; flex-wrap: wrap; gap: 4px 18px; margin-top: 4px; }
+.favorite-active-task { display: flex; position: relative; align-items: center; gap: 10px; min-height: 32px; padding: 3px 20px; background: var(--soft); color: var(--brand); font-size: 11px; font-variant-numeric: tabular-nums; }
+.favorite-active-task>strong { font-size: 11px; font-weight: 500; }
+.favorite-active-task>span { white-space: nowrap; }
+.favorite-active-task>.favorite-active-stop { margin-left: auto; min-height: 26px; font-size: 11px; }
+.favorite-test-track { position: absolute; inset: auto 0 0; height: 2px; margin: 0; border-radius: 0; }
+.favorite-loading { margin: 0; padding: 7px 20px; color: var(--muted); font-size: 11px; }
+.favorite-feedback { display: flex; align-items: center; gap: 7px; min-height: 28px; padding: 4px 20px; color: var(--error); background: var(--error-bg); font-size: 11px; }
+.favorite-feedback>span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .favorites-empty { flex: 1; min-height: 0; overflow: auto; justify-content: center; display: flex; flex-direction: column; align-items: center; gap: 8px; text-align: center; padding: 36px 16px; color: var(--muted); }
 .favorites-empty>svg { color: var(--brand); opacity: .65; }
 .favorites-empty>strong { color: var(--text); font-weight: 500; }
 .favorites-empty>p { max-width: 400px; font-size: 12px; }
-.favorite-compact { min-height: 27px; padding: 0 9px; font-size: 11px; }
 .favorite-danger { color: var(--error); }
 .favorite-danger:hover:not(:disabled) { color: var(--error); background: var(--error-bg); }
 .favorites-table { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--panel); scrollbar-gutter: stable; }
@@ -411,10 +434,11 @@ onBeforeUnmount(() => {
 .favorite-comparison { padding: 8px 10px; margin-block: 8px; background: var(--soft); border-radius: 6px; font-size: 11px; }
 .favorite-comparison>p { margin-top: 4px; color: var(--muted); white-space: normal; }
 .favorite-col-freshness { width: 20%; }
-.favorite-freshness>span, .favorite-freshness>small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.favorite-freshness>small { color: var(--muted); font-size: 10px; line-height: 16px; }
-.favorite-freshness .favorite-change { font-size: 10px; color: var(--brand); }
-.favorite-freshness .favorite-change-context { color: var(--warn); }
+.favorite-freshness-main { display: flex; align-items: center; gap: 5px; min-width: 0; height: 16px; line-height: 16px; }
+.favorite-last-tested { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.favorite-freshness>small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; line-height: 14px; }
+.favorite-change-link { flex: none; min-height: 16px; height: 16px; padding: 0; font-size: 10px; line-height: 16px; }
+.favorite-change-link.has-context-difference { color: var(--warn); }
 .favorite-save-only-hint { padding: 8px 16px; }
 .favorite-col-actions { width: 15%; }
 .favorites-table th { position: sticky; top: 0; z-index: 2; height: 32px; padding: 5px 20px; border-bottom: 1px solid var(--line); background: linear-gradient(var(--bg),color-mix(in srgb,var(--bg) 65%,var(--panel))); color: var(--muted); font-size: 11px; font-weight: 500; line-height: 21px; white-space: nowrap; }
@@ -493,8 +517,6 @@ onBeforeUnmount(() => {
 .favorite-manual-settings { margin-top: 12px; padding: 9px 10px; background: var(--soft); border: 1px solid var(--selected-border); border-radius: 6px; line-height: 18px; overflow-wrap: anywhere; }
 .favorite-manual-settings .small { font-size: 10px; }
 .favorite-manual-settings>p+p { margin-top: 3px; }
-.favorite-context-message { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 10px; }
-.favorite-context-message.is-error { color: var(--error); }
 .favorite-table-footer { display: flex; flex: 0 0 30px; height: 30px; align-items: center; justify-content: space-between; gap: 12px; padding: 0 20px; background: var(--panel); color: var(--muted); font-size: 11px; }
 .favorite-table-footer>span:last-child { font-size: 10px; }
 .favorite-form-error { color: var(--error); font-size: 11px; margin-top: 7px; overflow-wrap: anywhere; }
@@ -502,10 +524,10 @@ onBeforeUnmount(() => {
 .favorite-delete-copy>svg { flex: 0 0 auto; margin-top: 2px; color: var(--warn); }
 .favorite-delete-button { color: var(--error-ink); background: var(--error); border-color: var(--error); }
 .favorite-delete-button:hover:not(:disabled) { color: var(--error-ink); background: var(--error); border-color: var(--error); }
-@media (max-width: 900px) { .favorites-identity { min-width: 150px; } .favorites-symbol { display: none; } .favorite-search { flex: 1; width: auto; } }
-@media (max-width: 800px) { .favorite-table-footer { padding-inline: 16px; } .favorite-folder-list, .favorite-context-row { padding-inline: 16px; } .favorite-test-job { margin-inline: 16px; } .favorites-table th, .favorite-data-row>td { padding-inline: 16px; } .favorite-data-row>td:last-child { padding-inline: 4px; } .favorite-row-toggle { gap: 5px; font-size: 12px; } .favorite-row-actions { gap: 0; } .favorite-row-actions>.icon-button { width: 24px; height: 26px; } .favorite-inline-detail { padding-inline: 16px; } .favorite-heading-hint { display: none; } .favorite-table-location { gap: 4px; font-size: 11px; } }
-@media (max-width: 650px) { .favorites-identity { flex: 1; } .favorite-search { order: 3; flex: 1 1 100%; } .favorite-folder-hint { display: none; } .favorite-context-row { gap: 7px; } .favorite-table-live-note { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; } }
-@media (max-width: 440px) { .favorite-detail-grid { grid-template-columns: minmax(0,1fr); } .favorite-folder-actions>.text-button { font-size: 10px; } }
+@media (max-width: 900px) { .favorites-identity { min-width: 110px; } }
+@media (max-width: 800px) { .favorite-table-footer { padding-inline: 16px; } .favorite-folder-bar, .favorite-active-task, .favorite-feedback { padding-inline: 16px; } .favorites-table th, .favorite-data-row>td { padding-inline: 16px; } .favorite-data-row>td:last-child { padding-inline: 4px; } .favorite-row-toggle { gap: 5px; font-size: 12px; } .favorite-row-actions { gap: 0; } .favorite-row-actions>.icon-button { width: 24px; height: 26px; } .favorite-inline-detail { padding-inline: 16px; } .favorite-heading-hint { display: none; } .favorite-table-location { gap: 4px; font-size: 11px; } }
+@media (max-width: 650px) { .favorite-folder-bar { flex-wrap: wrap; } .favorite-folder-list { flex-basis: 100%; } .favorite-folder-tools { margin-left: auto; } .favorite-active-task { flex-wrap: wrap; } }
+@media (max-width: 440px) { .favorite-detail-grid { grid-template-columns: minmax(0,1fr); } }
 @media (max-width: 940px) {
   .favorites-table table { min-width: 720px; }
   .favorite-data-row>td:nth-child(2), .favorite-data-row>td:nth-child(3), .favorites-table th:nth-child(2), .favorites-table th:nth-child(3) { padding-inline: 8px; }

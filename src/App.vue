@@ -23,7 +23,7 @@ import { compactScanProgress, sameScanConfig } from './scan-experience'
 const desktop = isTauri()
 const appWindow = desktop ? getCurrentWindow() : null
 const appShell = ref<HTMLElement | null>(null)
-useDismissibleDetails(appShell, '.scan-progress-disclosure, .favorite-job-details, .favorite-test-settings')
+useDismissibleDetails(appShell, '.scan-progress-disclosure')
 const config = ref<ScanConfig>(defaultConfig())
 const run = ref<ScanRun | null>(null)
 const resultsView = ref<InstanceType<typeof AllResultsPanel> | null>(null)

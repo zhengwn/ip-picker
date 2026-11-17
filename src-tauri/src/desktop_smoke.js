@@ -83,7 +83,7 @@ async function exercise() {
   folderName.dispatchEvent(new Event('input', { bubbles: true }))
   ;(await button('.favorite-modal[open] button[type="submit"]', '新建收藏夹')).click()
   await waitFor('new folder while scanning', () => document.querySelector('.favorite-folder-list')?.textContent.includes('冒烟分类'))
-  ;(await element('.favorite-job-summary>.text-button')).click()
+  ;(await element('input[aria-label="仅看复测变化"]')).click()
   const search = await element('.favorite-search input')
   search.value = 'no-matching-address'
   search.dispatchEvent(new Event('input', { bubbles: true }))
@@ -98,6 +98,21 @@ async function exercise() {
   ;(await button('.favorite-modal[open] button[type="submit"]', '仅收藏')).click()
   await waitFor('untested saved row', () => document.querySelector('.favorites-table')?.textContent.includes('尚未测速'))
   if (search.value) throw new Error('The saved address is still hidden behind the previous search')
+  const favoritesTable = document.querySelector('.favorites-table')
+  const favoriteBounds = favoritesTable.getBoundingClientRect()
+  if (favoriteBounds.top > 180 || favoriteBounds.height < window.innerHeight * .6) {
+    throw new Error('Favorite metadata occupies too much of the list viewport')
+  }
+  ;(await element('.favorite-more-trigger')).click()
+  await waitFor('favorite details available without moving the list', () => document.querySelector('#favorite-more-panel')?.textContent.includes('下次复测参数'))
+  if (favoritesTable.getBoundingClientRect().top !== favoriteBounds.top) throw new Error('Favorite details pushed the list down')
+  document.querySelector('.favorite-more-trigger').dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  await waitFor('favorite details close and restore focus', () => !document.querySelector('#favorite-more-panel') && document.activeElement === document.querySelector('.favorite-more-trigger'))
+  ;(await element('.favorite-more-trigger')).click()
+  ;(await waitFor('rename folder in management details', () => [...document.querySelectorAll('.favorite-manage-actions button')].find(node => node.textContent.trim() === '重命名收藏夹'))).click()
+  ;(await button('.favorite-modal[open] button[type="button"]:not(.icon-button)', '取消')).click()
+  await waitFor('return from folder editor to details trigger', () => !document.querySelector('.favorite-modal[open]') && document.activeElement === document.querySelector('.favorite-more-trigger'))
+
   const savedToggle = await element('.favorite-row-toggle')
   savedToggle.click()
   await waitFor('save-only details never claim a test start', () =>

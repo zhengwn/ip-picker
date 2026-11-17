@@ -92,6 +92,38 @@ test('saving an address and editing notes stay available while a measurement is 
   assert.equal(calls.length, 2)
 })
 
+test('favorite changes count follows the selected folder while retesting keeps the whole folder scope', async context => {
+  const config = defaultConfig()
+  const library = {
+    folders: [{ id: 'home', name: '家用' }, { id: 'work', name: '办公' }],
+    entries: ['a', 'b', 'c'].map((id, index) => ({
+      id, folderId: id === 'b' ? 'work' : 'home', savedAt: '2026-11-15T00:00:00Z',
+      runId: 'current', runStatus: 'completed', runStartedAt: '2026-11-16T00:00:00Z', note: '', config,
+      result: result(`104.16.0.${index + 1}`),
+    })),
+  }
+  const job = {
+    run: run(library.entries.map(entry => entry.result)), favoriteIds: ['a', 'b', 'c'],
+    baselines: library.entries.map(entry => ({ favoriteId: entry.id, testedAt: entry.savedAt, config, colo: 'HKG', measurementPassed: true, tcpP95Ms: entry.id === 'c' ? 60 : 80, downloadMbps: 30 })),
+  }
+  const calls = []
+  setInvokeHandler(async (command, args) => {
+    calls.push([command, args])
+    return { favorites: library, job: { run: { ...job.run, id: 'next', status: 'running' }, favoriteIds: ['a', 'c'] } }
+  })
+  const state = mount(context, FavoritesPanel, { desktop: true, config, library, testJob: job })
+  assert.equal(state.changedCount.value, 2)
+  state.selectedFolderId.value = 'home'
+  state.showChangesOnly.value = true
+  assert.equal(state.changedCount.value, 1)
+  assert.deepEqual(state.visibleEntries.value.map(entry => entry.id), ['a'])
+  assert.equal(state.entries.value.length, 2)
+  await state.startTest({ folderId: 'home' })
+  assert.equal(calls[0][0], 'start_favorite_test')
+  assert.equal(calls[0][1].folderId, 'home')
+  assert.equal(calls[0][1].favoriteId, undefined)
+})
+
 test('before/after comparisons distinguish changed conditions, partial data and untouched entries', () => {
   const config = defaultConfig()
   const networkPath = { interfaceName: 'en0', interfaceKind: 'wifi', tunnelInterface: false, sampleIp: '104.16.0.1' }
