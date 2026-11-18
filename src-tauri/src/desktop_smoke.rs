@@ -44,7 +44,10 @@ pub(crate) fn configure(
 ) -> (Builder<Wry>, Context<Wry>) {
     let path = data_dir().expect("missing desktop smoke data directory");
     let phase = std::env::var("IP_PICKER_SMOKE_PHASE").expect("missing desktop smoke phase");
-    assert!(matches!(phase.as_str(), "exercise" | "reopen"));
+    assert!(matches!(
+        phase.as_str(),
+        "exercise" | "reopen" | "performance-1000" | "performance-10000"
+    ));
     context.config_mut().identifier = "com.ippicker.desktop-smoke".into();
     for window in &mut context.config_mut().app.windows {
         window.incognito = true;
@@ -60,6 +63,11 @@ pub(crate) fn configure(
         plugin::Builder::<Wry>::new("desktop-smoke")
             .js_init_script(script)
             .setup(move |app, _| {
+                if phase.starts_with("performance-") {
+                    app.listen("ip-picker-smoke-metrics", |event| {
+                        println!("desktop smoke metrics {}", event.payload());
+                    });
+                }
                 let app_handle = app.clone();
                 app.once(FINISHED, move |event| {
                     match serde_json::from_str::<Option<String>>(event.payload()) {
@@ -120,16 +128,47 @@ pub(crate) async fn run_prepared_scan(
         }),
         ..Default::default()
     };
+    let phase = std::env::var("IP_PICKER_SMOKE_PHASE").unwrap_or_default();
+    let mut results = vec![result.clone()];
+    let candidate_count = match phase.as_str() {
+        "performance-1000" => 1000,
+        "performance-10000" => 10000,
+        _ => 1,
+    };
+    if candidate_count > 1 {
+        progress.stage = "downloading".into();
+        results.extend((1..candidate_count as u32).map(|index| {
+            let mut row = IpResult::new(Ipv4Addr::from(
+                u32::from(Ipv4Addr::new(198, 18, 0, 0)) + index,
+            ));
+            row.exclude(ExclusionCode::TcpConnect, "TCP 连接超时");
+            row
+        }));
+    }
+    let results = std::sync::Arc::new(results);
     callback(EngineUpdate {
         progress: progress.clone(),
-        results: vec![result.clone()],
+        results: results.clone(),
     });
-    cancellation.cancelled().await;
-    result.exclude(ExclusionCode::Cancelled, "测试已停止，已保留样本");
+    if candidate_count > 1 {
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(175)) => {
+                    progress.downloaded_bytes += 1024 * 1024;
+                    callback(EngineUpdate { progress: progress.clone(), results: results.clone() });
+                }
+            }
+        }
+    } else {
+        cancellation.cancelled().await;
+    }
+    let mut results = std::sync::Arc::unwrap_or_clone(results);
+    results[0].exclude(ExclusionCode::Cancelled, "测试已停止，已保留样本");
     progress.stage = "cancelled".into();
     Ok(EngineOutcome {
         progress,
-        results: vec![result],
+        results,
         cancelled: true,
     })
 }

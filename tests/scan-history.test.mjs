@@ -64,7 +64,7 @@ test('history compares the exact requested IP and scales TCP charts across match
   assert.equal(state.rows.value[1].run.progress.networkPath.sampleIp, oldIp)
   assert.deepEqual([...state.changedSettings.value], ['测速目标', 'TCP 探测'])
   assert.equal(state.infoLabel.value, '对比条件有差异')
-  assert.deepEqual(state.comparisonWarnings.value, ['测速参数不同', '网络接口不同', '部分接口来自其他 IP 的采样'])
+  assert.deepEqual(state.comparisonWarnings.value, ['测速参数不同', '部分接口来自其他 IP 的采样'])
   assert.equal(state.rows.value[1].settings.find(setting => setting.label === '测速目标').value, wifi.run.config.targetUrl)
   assert.match(state.rows.value[1].settings.find(setting => setting.label === 'TCP 探测').value, /间隔 300 ms/)
   assert.ok(state.tcpScale.value >= 400)
@@ -148,7 +148,7 @@ test('a historical run starts with precision records and applies IP, POP and sta
 test('an indirect route sample remains visible as uncertainty after comparison metadata is collapsed', async context => {
   const ip = '104.16.0.1'
   const first = match(ip, 'en0')
-  const second = match(ip, 'en0')
+  const second = match(ip, 'en8')
   second.run.id = 'second-run'
   second.run.progress.networkPath.sampleIp = '104.16.0.2'
   setInvokeHandler(async command => command === 'get_scan_history' ? { limit: 10, entries: [] } : [first, second])

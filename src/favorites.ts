@@ -58,12 +58,17 @@ export interface FavoriteTestBaseline {
 }
 
 const comparisonFields: (keyof ScanConfig)[] = ['targetUrl', 'connectTimeoutMs', 'requestTimeoutMs', 'tcpConcurrency', 'stabilityAttempts', 'stabilityIntervalMs', 'stabilityLatencyMetric', 'maxTcpMs', 'maxStabilityFailurePercent', 'tcpLatencyScreening', 'stabilityFirst', 'verificationAttempts', 'downloadRounds', 'downloadSeconds', 'downloadBudgetEnabled', 'downloadBudgetMiB']
+export const indirectRouteWarning = '部分接口来自其他 IP 的采样'
 
-export function comparisonContextDifferences(before: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, after: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }): string[] {
+export function comparisonContextDifferences(before: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, after: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, ip?: string): string[] {
   const differences: string[] = []
   if (comparisonFields.some(field => !(field === 'downloadBudgetMiB' && before.config.downloadBudgetEnabled === false && after.config.downloadBudgetEnabled === false) && before.config[field] !== after.config[field])) differences.push('测速参数不同')
-  if (!before.networkPath || !after.networkPath) differences.push('网络路径未完整记录')
-  else if (before.networkPath.interfaceName !== after.networkPath.interfaceName || before.networkPath.interfaceKind !== after.networkPath.interfaceKind || before.networkPath.tunnelInterface !== after.networkPath.tunnelInterface) differences.push('网络接口不同')
+  const previousPath = before.networkPath
+  const currentPath = after.networkPath
+  if (!previousPath || !currentPath) differences.push('网络路径未完整记录')
+  else if (ip && (previousPath.sampleIp !== ip || currentPath.sampleIp !== ip)) differences.push(indirectRouteWarning)
+  else if (previousPath.interfaceName !== currentPath.interfaceName || previousPath.tunnelInterface !== currentPath.tunnelInterface
+    || (previousPath.interfaceKind && currentPath.interfaceKind && previousPath.interfaceKind !== currentPath.interfaceKind)) differences.push('网络接口不同')
   if (before.colo && after.colo && before.colo !== after.colo) differences.push('接入机房不同')
   return differences
 }
@@ -90,7 +95,7 @@ function compareFavoriteEntry(entry: FavoriteEntry, job: FavoriteTestJob, baseli
   if (entry.runId !== job.run.id && Date.parse(entry.savedAt) > Date.parse(job.run.startedAt)) return null
   if (entry.runId !== job.run.id) return { label: '本轮未更新', detail: '保留上次测试记录', changed: false, differences: [] as string[] }
   if (!baseline) return { label: '本轮已更新', detail: '可在测速历史查看已保留的记录', changed: true, differences: [] as string[] }
-  const differences = comparisonContextDifferences(baseline, { config: entry.config, networkPath: entry.networkPath, colo: entry.result.colo })
+  const differences = comparisonContextDifferences(baseline, { config: entry.config, networkPath: entry.networkPath, colo: entry.result.colo }, entry.result.ip)
   const parts: string[] = []
   if (baseline.measurementPassed !== entry.result.measurementPassed) parts.push(entry.result.measurementPassed ? '本次完整通过' : '本次未通过完整测速')
   const p95 = completedTcpMetricValue(entry.result, 'p95')
@@ -101,7 +106,7 @@ function compareFavoriteEntry(entry: FavoriteEntry, job: FavoriteTestJob, baseli
     else if (before != null && after == null) parts.push(`${label}本次未测满`)
     else if (before == null && after != null) parts.push(`${label}本次已测满`)
   }
-  return { label: parts.join(' · ') || (comparable ? '未见明显数值变化' : '暂无可比较的完整测量'), detail: `对比 ${favoriteDate(baseline.testedAt)}；仅描述两次观测，不代表长期趋势。`, changed: parts.length > 0 || differences.some(difference => difference !== '网络路径未完整记录'), differences }
+  return { label: parts.join(' · ') || (comparable ? '未见明显数值变化' : '暂无可比较的完整测量'), detail: `对比 ${favoriteDate(baseline.testedAt)}；仅描述两次观测，不代表长期趋势。`, changed: parts.length > 0 || differences.some(difference => difference !== '网络路径未完整记录' && difference !== indirectRouteWarning), differences }
 }
 
 export function favoriteTestDate(entry: FavoriteEntry): string {

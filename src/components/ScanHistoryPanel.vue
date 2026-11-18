@@ -1,21 +1,23 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, shallowRef, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, History, Info, LoaderCircle, Search } from '@lucide/vue'
+import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, History, Info, LoaderCircle, RotateCcw, Search } from '@lucide/vue'
 import { validManualIpv4 } from '../custom-ips'
-import { comparisonContextDifferences, favoriteDate, favoriteNumber } from '../favorites'
+import { comparisonContextDifferences, favoriteDate, favoriteError, favoriteNumber, indirectRouteWarning } from '../favorites'
+import { estimateScan } from '../scan-estimate'
 import type { TcpDisplayMetric } from '../result-preferences'
 import { tcpLatencyChartScale } from '../result-row-display'
-import type { NetworkPathSnapshot, ScanConfig, ScanHistory, ScanHistoryKind, ScanHistoryMatch, ScanRun } from '../types'
-import { candidateExclusionReason, candidateMeasurementStatus, hasPrecisionMeasurement, observedFailurePercent, stabilityMetricLabel, targetHost } from '../ui-state'
-import { scanModeLabel } from '../scan-experience'
+import type { IpResult, NetworkPathSnapshot, ScanConfig, ScanHistory, ScanHistoryKind, ScanHistoryMatch, ScanRun } from '../types'
+import { candidateExclusionReason, candidateMeasurementStatus, hasPrecisionMeasurement, initialTcpFailureReason, observedFailurePercent, stabilityMetricLabel, targetHost, validateConfig } from '../ui-state'
+import { scanModeLabel, singleIpConfig } from '../scan-experience'
 import { useDismissiblePopover } from '../popovers'
 import SelectControl from './SelectControl.vue'
 import TcpDiagnostics from './TcpDiagnostics.vue'
 import TcpLatencyCell from './TcpLatencyCell.vue'
 import TcpLatencyHeader from './TcpLatencyHeader.vue'
 
-const props = defineProps<{ desktop: boolean; active: boolean; revision: number }>()
+const props = defineProps<{ desktop: boolean; active: boolean; revision: number; retestDisabled?: boolean }>()
+const emit = defineEmits<{ retest: [ip: string, config: ScanConfig] }>()
 const tcpDisplayMetric = defineModel<TcpDisplayMetric>('tcpDisplayMetric', { default: 'runMetric' })
 
 type View = { mode: 'recent' } | { mode: 'compare'; ip: string } | { mode: 'run'; id: string; kind: ScanHistoryKind }
@@ -30,6 +32,9 @@ const loadError = ref('')
 const retry = ref(0)
 const ipInput = ref('')
 const inputError = ref('')
+const baselineError = ref('')
+const savingBaseline = ref(false)
+const baselineAction = ref<HTMLButtonElement | null>(null)
 const searchField = ref<HTMLInputElement | null>(null)
 const backButton = ref<HTMLButtonElement | null>(null)
 const table = ref<HTMLElement | null>(null)
@@ -70,6 +75,7 @@ watch([() => props.active, () => props.revision, view, retry], async ([active, ,
 
 watch(view, () => {
   infoOpen.value = false
+  baselineError.value = ''
   runScope.value = 'precision'
   clearRunFilters()
   page.value = 1
@@ -115,6 +121,37 @@ async function goBack() {
 const run = computed(() => content.value?.mode === 'run' ? content.value.run : null)
 const history = computed(() => content.value?.mode === 'recent' ? content.value.history : null)
 const matches = computed(() => content.value?.mode === 'compare' ? content.value.matches : [])
+const baseline = computed(() => matches.value.find(match => match.baseline))
+const baselineConfig = computed(() => {
+  const config = baseline.value?.run.config
+  if (!config?.stabilityFirst || config.tcpLatencyScreening) return null
+  const snapshot = singleIpConfig(config, comparedIp.value)
+  return validateConfig(snapshot) ? null : snapshot
+})
+const baselineEstimate = computed(() => baselineConfig.value ? estimateScan(baselineConfig.value) : null)
+
+async function setBaseline(runId: string | null) {
+  if (!props.desktop || savingBaseline.value || view.value.mode !== 'compare') return
+  const ip = comparedIp.value
+  savingBaseline.value = true
+  baselineError.value = ''
+  try {
+    const matches = await invoke<ScanHistoryMatch[]>('set_scan_history_baseline', { ip, runId })
+    if (view.value.mode !== 'compare' || comparedIp.value !== ip) return
+    if (loading.value) retry.value++
+    else content.value = { mode: 'compare', matches }
+    await nextTick()
+    if (view.value.mode === 'compare' && comparedIp.value === ip) {
+      (baselineAction.value ?? backButton.value)?.focus({ preventScroll: true })
+    }
+  } catch (error) {
+    if (view.value.mode === 'compare' && comparedIp.value === ip) baselineError.value = favoriteError(error)
+  } finally { savingBaseline.value = false }
+}
+
+function retestBaseline() {
+  if (baselineConfig.value && !props.retestDisabled) emit('retest', comparedIp.value, baselineConfig.value)
+}
 const runRows = computed(() => {
   const current = run.value
   if (!current) return []
@@ -195,13 +232,17 @@ const changedSettings = computed(() => {
 })
 
 const comparisonWarnings = computed(() => {
-  const first = matches.value[0]?.run
+  const first = (baseline.value ?? matches.value[0])?.run
   if (!first) return []
-  const warnings = matches.value.slice(1).flatMap(({ run }) => comparisonContextDifferences(
-    { config: first.config, networkPath: first.progress.networkPath, colo: first.results[0]?.colo ?? '' },
-    { config: run.config, networkPath: run.progress.networkPath, colo: run.results[0]?.colo ?? '' },
+  const warnings = matches.value.filter(match => match.run.id !== first.id).flatMap(({ run }) => comparisonContextDifferences(
+    { config: first.config, networkPath: pathFor(first, first.results[0]), colo: first.results[0]?.colo ?? '' },
+    { config: run.config, networkPath: pathFor(run, run.results[0]), colo: run.results[0]?.colo ?? '' },
+    comparedIp.value,
   ))
-  if (matches.value.some(({ run }) => run.progress.networkPath && run.progress.networkPath.sampleIp !== comparedIp.value)) warnings.push('部分接口来自其他 IP 的采样')
+  if (matches.value.some(({ run }) => {
+    const path = pathFor(run, run.results[0])
+    return path && path.sampleIp !== comparedIp.value
+  })) warnings.push(indirectRouteWarning)
   return [...new Set(warnings)]
 })
 const infoLabel = computed(() => view.value.mode === 'run' ? '本轮详情'
@@ -210,9 +251,9 @@ const infoLabel = computed(() => view.value.mode === 'run' ? '本轮详情'
 const rows = computed(() => {
   const current = run.value
   const source = current
-    ? filteredRunRows.value.slice(pageStart.value, pageStart.value + pageSize).map(({ result, status }) => ({ run: current, result, kind: null, status }))
+    ? filteredRunRows.value.slice(pageStart.value, pageStart.value + pageSize).map(({ result, status }) => ({ run: current, result, kind: null, status, baseline: false, baselineOnly: false }))
     : matches.value.flatMap(match => match.run.results.map(result => ({ ...match, result, status: candidateMeasurementStatus(result, match.run) })))
-  return source.map(({ run, result, kind, status }) => {
+  return source.map(({ run, result, kind, status, baseline, baselineOnly }) => {
     const samples = result.downloadSamplesMbps
     const speed = samples.length > 0 ? favoriteNumber(result.downloadMbps) : '—'
     return {
@@ -220,6 +261,10 @@ const rows = computed(() => {
       run,
       result,
       kind,
+      baseline,
+      baselineOnly,
+      canPin: !!(initialTcpFailureReason(result) || result.tcpMs > 0 || result.attempts > 0 || result.tcpStability?.probesMs?.length || result.downloadSamplesMbps.length),
+      networkPath: pathFor(run, result),
       pop: result.colo || result.observedColos[0] || '—',
       failureRate: observedFailurePercent(result.tcpStability),
       initial: result.tcpMs > 0 ? favoriteNumber(result.tcpMs) : '—',
@@ -236,6 +281,10 @@ const statusText = { running: '测速中', completed: '已完成', cancelled: '�
 const statusClass = { running: 'active', completed: 'good', cancelled: 'quiet', failed: 'error' } as const
 const kindText = { scan: '地区优选', favorite: '收藏复测' } as const
 const interfaceText = { wired: '有线', wifi: 'Wi‑Fi', tunnel: '隧道', other: '' } as const
+
+function pathFor(run: ScanRun, result?: IpResult) {
+  return result?.networkPath ?? run.progress.networkPath
+}
 
 function interfaceLabel(path?: NetworkPathSnapshot | null) {
   if (!path) return '未记录'
@@ -288,6 +337,16 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
       </section>
     </header>
     <p v-if="inputError" id="history-ip-error" class="history-input-error" role="alert">{{ inputError }}</p>
+    <p v-if="baselineError" class="history-input-error" role="alert">{{ baselineError }}</p>
+    <div v-if="baseline" class="history-baseline-bar">
+      <strong>对比基线</strong><time :datetime="baseline.run.startedAt">{{ favoriteDate(baseline.run.startedAt) }}</time>
+      <template v-if="baselineEstimate">
+        <span id="baseline-retest-cost" :title="baselineEstimate.detail">{{ baselineEstimate.duration }} · 下载正文 {{ baselineEstimate.download }}</span>
+        <button type="button" class="button" :disabled="retestDisabled" aria-describedby="baseline-retest-cost" @click="retestBaseline"><RotateCcw :size="12" aria-hidden="true" />按基线参数复测</button>
+      </template>
+      <span v-else>该轮参数与当前测速规则不兼容</span>
+      <button ref="baselineAction" type="button" class="text-button" :aria-disabled="savingBaseline" @click="setBaseline(null)">取消固定</button>
+    </div>
     <div v-if="run?.results.length" class="history-filters" role="group" aria-label="筛选本轮测速记录">
       <SelectControl compact><select v-model="runScope" aria-label="本轮结果范围"><option value="precision">精测记录</option><option value="all">全部 IP</option></select></SelectControl>
       <label class="history-search-field history-run-search"><span class="visually-hidden">搜索本轮 IP 地址</span><Search :size="14" aria-hidden="true" /><input v-model="runIpQuery" type="search" autocomplete="off" spellcheck="false" placeholder="搜索本轮 IP" /></label>
@@ -325,13 +384,14 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
           <template v-for="row in rows" :key="row.key">
             <tr class="history-data-row">
               <td v-if="row.kind" class="history-run-cell">
-                <button type="button" class="text-button history-row-action history-time" :title="`查看本轮${kindText[row.kind]}结果`" @click="openRun(row.run.id, row.kind)"><time :datetime="row.run.startedAt">{{ favoriteDate(row.run.startedAt) }}</time><ChevronRight :size="12" aria-hidden="true" /></button>
-                <span class="history-secondary history-host" :title="row.run.config.targetUrl">{{ targetHost(row.run.config.targetUrl) }}</span>
+                <time v-if="row.baselineOnly" class="history-time" :datetime="row.run.startedAt">{{ favoriteDate(row.run.startedAt) }}</time>
+                <button v-else type="button" class="text-button history-row-action history-time" :title="`查看本轮${kindText[row.kind]}结果`" @click="openRun(row.run.id, row.kind)"><time :datetime="row.run.startedAt">{{ favoriteDate(row.run.startedAt) }}</time><ChevronRight :size="12" aria-hidden="true" /></button>
+                <span class="history-secondary history-host" :title="row.run.config.targetUrl">{{ row.baseline ? '基线 · ' : '' }}{{ targetHost(row.run.config.targetUrl) }}</span>
               </td>
               <td v-else><button type="button" class="text-button history-row-action mono" :aria-label="`对比 IP ${row.result.ip} 的历史结果`" @click="compareIp(row.result.ip)">{{ row.result.ip }}<Search :size="12" aria-hidden="true" /></button></td>
               <td>
-                <span v-if="row.kind" class="history-network" :title="interfaceDetail(row.run.progress.networkPath)">{{ interfaceLabel(row.run.progress.networkPath) }}</span>
-                <span class="history-location"><span class="mono" :title="row.result.observedColos.join(' / ')">{{ row.pop }}</span><span v-if="row.kind && row.run.progress.networkPath && row.run.progress.networkPath.sampleIp !== row.result.ip" class="history-route-tag" :title="`接口来自 ${row.run.progress.networkPath.sampleIp} 的路由样本，并非本 IP 的直接观测`">采样</span></span>
+                <span v-if="row.kind" class="history-network" :title="interfaceDetail(row.networkPath)">{{ interfaceLabel(row.networkPath) }}</span>
+                <span class="history-location"><span class="mono" :title="row.result.observedColos.join(' / ')">{{ row.pop }}</span><span v-if="row.kind && row.networkPath && row.networkPath.sampleIp !== row.result.ip" class="history-route-tag" :title="`接口来自 ${row.networkPath.sampleIp} 的路由样本`">采样</span></span>
               </td>
               <td class="history-number">
                 <template v-if="row.result.tcpStability?.attempted">
@@ -345,11 +405,11 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
             </tr>
             <tr v-if="expandedResult === row.key" class="history-detail-row"><td colspan="6">
               <section id="history-tcp-detail" tabindex="-1" :aria-label="`${row.result.ip} 的参数与测速详情`">
-                <div class="history-detail-heading"><strong class="mono">{{ row.result.ip }}</strong><span>{{ favoriteDate(row.run.startedAt) }}</span><button type="button" class="text-button" @click="toggleResult(row.key)">收起详情<ChevronDown :size="12" class="history-collapse" aria-hidden="true" /></button></div>
+                <div class="history-detail-heading"><strong class="mono">{{ row.result.ip }}</strong><span>{{ favoriteDate(row.run.startedAt) }}</span><button v-if="row.kind && row.canPin && !row.baseline" type="button" class="button history-pin-button" :disabled="savingBaseline" @click="setBaseline(row.run.id)">{{ baseline ? '换作基线' : '固定为基线' }}</button><button type="button" class="text-button" @click="toggleResult(row.key)">收起详情<ChevronDown :size="12" class="history-collapse" aria-hidden="true" /></button></div>
                 <p v-if="row.reason" class="history-detail-reason">{{ row.reason }}</p>
                 <div class="history-evidence-meta">
                   <section class="history-detail-settings" aria-label="本轮实际参数"><h4>测试参数</h4><dl class="history-settings-list"><div v-for="setting in row.settings" :key="setting.label" :class="{ 'setting-diff': view.mode === 'compare' && changedSettings.has(setting.label) }"><dt>{{ setting.label }}</dt><dd>{{ setting.value }}</dd></div></dl></section>
-                  <section aria-label="本轮网络采样"><h4>网络与初筛</h4><dl class="history-settings-list"><div><dt>初筛延迟</dt><dd>{{ row.initial }} ms</dd></div><div><dt>路由接口</dt><dd>{{ interfaceLabel(row.run.progress.networkPath) }}</dd></div><template v-if="row.run.progress.networkPath"><div><dt>采样 IP</dt><dd class="mono">{{ row.run.progress.networkPath.sampleIp }}{{ row.run.progress.networkPath.sampleIp === row.result.ip ? '（本 IP）' : '（其他 IP 的路径样本）' }}</dd></div><div><dt>采样时间</dt><dd>{{ favoriteDate(row.run.progress.networkPath.capturedAt) }}</dd></div></template><div><dt>观测 POP</dt><dd>{{ row.result.observedColos.join(' / ') || '未记录' }}</dd></div></dl></section>
+                  <section aria-label="本轮网络采样"><h4>网络与初筛</h4><dl class="history-settings-list"><div><dt>初筛延迟</dt><dd>{{ row.initial }} ms</dd></div><div><dt>路由接口</dt><dd>{{ interfaceLabel(row.networkPath) }}</dd></div><template v-if="row.networkPath"><div><dt>采样 IP</dt><dd class="mono">{{ row.networkPath.sampleIp }}{{ row.networkPath.sampleIp === row.result.ip ? '（本 IP）' : '（其他 IP 的路径样本）' }}</dd></div><div><dt>采样时间</dt><dd>{{ favoriteDate(row.networkPath.capturedAt) }}</dd></div></template><div><dt>观测 POP</dt><dd>{{ row.result.observedColos.join(' / ') || '未记录' }}</dd></div></dl></section>
                 </div>
                 <TcpDiagnostics :result="row.result" :config="row.run.config" />
               </section>
@@ -373,6 +433,9 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
 </template>
 
 <style scoped>
+.history-baseline-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 4px 16px; border-bottom: 1px solid var(--line); background: var(--surface-sunken); color: var(--muted); font-size: 11px; }
+.history-baseline-bar strong { color: var(--text); }
+.history-baseline-bar .button, .history-pin-button { min-height: 24px; height: 24px; font-size: 11px; }
 .history-panel { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--panel); }
 .history-toolbar { display: flex; position: relative; z-index: 3; flex: none; align-items: center; gap: 12px; min-height: 48px; padding: 8px 20px; border-bottom: 1px solid var(--line); }
 .history-heading, .history-search, .history-pages { display: flex; align-items: center; gap: 8px; min-width: 0; }

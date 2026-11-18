@@ -44,5 +44,11 @@ jobs:
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - name: Test Rust core
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+      - name: Exercise the desktop workflow
+        run: node tests/desktop-smoke.mjs
       - name: Compile desktop application
+        if: runner.os == 'macOS'
         run: npm run tauri -- build --debug --no-bundle
+      - name: Verify Windows installer build
+        if: runner.os == 'Windows'
+        run: npm run tauri -- build --debug --bundles nsis

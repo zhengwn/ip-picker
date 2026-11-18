@@ -11,7 +11,8 @@
     "tauri": "tauri",
     "test": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:frontend": "node --test",
-    "test:desktop-smoke": "npm run build && node tests/desktop-smoke.mjs"
+    "test:desktop-smoke": "npm run build && node tests/desktop-smoke.mjs",
+    "test:desktop-performance": "npm run build && node tests/desktop-smoke.mjs --performance"
   },
   "dependencies": {
     "@lucide/vue": "^1.61.0",

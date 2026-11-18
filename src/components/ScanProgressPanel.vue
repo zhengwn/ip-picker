@@ -27,10 +27,11 @@ const batchCaption = computed(() => batch.value ? `本批稳定性已处理 ${ba
 const batchNumber = computed(() => props.run.progress.precisionBatch?.number ?? batch.value?.number)
 const stagePercent = computed(() => stabilizing.value ? batch.value?.percent ?? null : phase.value.percent)
 const stageCaption = computed(() => stabilizing.value ? batchCaption.value : phase.value.caption)
-const currentScope = computed(() => discovering.value ? '发现阶段 · 连通性与 POP 识别各执行一次' : stabilityFirst.value ? '分区精测 · 稳定性全测 → 各区前 10 名服务校验 → 下载测速' : batchNumber.value ? `分区精测 · 第 ${batchNumber.value} 批（${regionalLimit.value == null ? '未找到足够结果会继续补位' : '仅在各区入围名单内补位'}）` : '分区精测 · 按批验证、检查稳定性并下载复测')
+const currentScope = computed(() => props.run.retestIp ? `指定 IP · ${props.run.retestIp}` : discovering.value ? '发现阶段 · 连通性与 POP 识别各执行一次' : stabilityFirst.value ? '分区精测 · 稳定性全测 → 各区前 10 名服务校验 → 下载测速' : batchNumber.value ? `分区精测 · 第 ${batchNumber.value} 批（${regionalLimit.value == null ? '未找到足够结果会继续补位' : '仅在各区入围名单内补位'}）` : '分区精测 · 按批验证、检查稳定性并下载复测')
 const criteria = computed(() => {
   const config = props.run.config
   if (config.stabilityAttempts == null || config.maxTcpMs == null) return '正在准备本批候选与本次稳定性判定参数。'
+  if (props.run.retestIp) return `累计 2 次连接失败立即淘汰。测满 ${config.stabilityAttempts} 次后，按${latencyMetricLabel.value} ≤ ${config.maxTcpMs} ms、连接失败率 ≤ ${config.maxStabilityFailurePercent}% 判定。`
   if (config.stabilityFirst) return `累计 2 次连接失败立即淘汰，与允许失败率无关。其余候选测满 ${config.stabilityAttempts} 次后，按${latencyMetricLabel.value} ≤ ${config.maxTcpMs} ms、连接失败率 ≤ ${config.maxStabilityFailurePercent}% 判定。全部入围候选测完，再从各区达标候选中选前 10 名服务校验与下载测速。`
   return `达标须测满 ${config.stabilityAttempts} 次，${latencyMetricLabel.value} ≤ ${config.maxTcpMs} ms、连接失败率 ≤ ${config.maxStabilityFailurePercent}%。已确定后续探测也无法达标时，立即淘汰并安排下一个。稳定性达标后还需下载复测。`
 })
@@ -39,7 +40,7 @@ const downloadStatus = computed(() => {
   if (progress.downloadedBytes > 0) return `累计下载 ${(progress.downloadedBytes / 1024 / 1024).toFixed(1)} MiB`
   if (progress.stage === 'downloading') return '下载测速进行中，尚未读取响应体'
   if (progress.stage === 'connecting' || progress.stage === 'discovering' || stabilizing.value && batch.value?.number === 1) return '下载测速尚未开始'
-  return stabilityFirst.value ? '全部稳定性测完后，仅对各区前 10 名进行下载测速' : '稳定性通过后进行下载测速'
+  return stabilityFirst.value && !props.run.retestIp ? '全部稳定性测完后，仅对各区前 10 名进行下载测速' : '通过稳定性和服务校验后开始下载'
 })
 const stopPolicy = computed(() => {
   const budgetStop = props.run.config.downloadBudgetEnabled !== false ? '剩余预算不足以复测、' : ''
@@ -82,7 +83,7 @@ function settledLatency(candidate: StabilityBatchCandidate) { return candidate.r
     <details class="scan-details">
       <summary><span class="scan-cumulative-short" aria-live="polite">{{ precision ? `累计已处理 ${queue.processed} / ${queue.available} 个 · 完整测速通过 ${queue.measurementPassed} 个 · 处理中 ${queue.processing} · 待测 ${queue.queued}` : '查看地区识别与测试规则' }}</span><span class="scan-detail-toggle">测速详情<ChevronDown :size="12" aria-hidden="true" /></span></summary>
       <div class="scan-expanded-content">
-        <p v-if="precision" class="scan-detail-description">累计已处理{{ regionalLimit == null ? '候选' : '入围候选' }} {{ queue.processed }} / {{ queue.available }} 个；本批处理中 {{ queue.processing }} · {{ regionalLimit == null ? '后备待选' : '入围待测' }} {{ queue.queued }}。已取得 {{ queue.qualified }} 个达标结果 · {{ queue.measurementPassed }} 个完整测速通过 · {{ queue.measurementPassed - queue.qualified }} 个低于速率目标 · {{ queue.earlyRejected }} 个提前淘汰。</p>
+        <p v-if="precision && !run.retestIp" class="scan-detail-description">累计已处理{{ regionalLimit == null ? '候选' : '入围候选' }} {{ queue.processed }} / {{ queue.available }} 个；本批处理中 {{ queue.processing }} · {{ regionalLimit == null ? '后备待选' : '入围待测' }} {{ queue.queued }}。已取得 {{ queue.qualified }} 个达标结果 · {{ queue.measurementPassed }} 个完整测速通过 · {{ queue.measurementPassed - queue.qualified }} 个低于速率目标 · {{ queue.earlyRejected }} 个提前淘汰。</p>
         <template v-if="stabilizing && batch">
           <p class="scan-batch-overview">本批 <strong>{{ batch.candidates.length }}</strong> 个 IP：测满 {{ batch.requestedPerIp }} 次 <strong>{{ batch.completed.length }}</strong> 个 · 提前淘汰 <strong>{{ batch.rejected.length }}</strong> 个 · 正在探测 <strong>{{ batch.active.length }}</strong> 个 · 等待 <strong>{{ batch.waiting.length }}</strong> 个</p>
           <div v-if="active.length" class="scan-active-grid" aria-label="正在探测的 IP，结果待复测完成">
@@ -117,9 +118,9 @@ function settledLatency(candidate: StabilityBatchCandidate) { return candidate.r
         </template>
         <p v-else-if="stabilizing" class="scan-detail-description">正在准备本批候选；收到批次清单后，会逐个显示正在探测的 IP。</p>
         <div class="scan-rules">
-          <p class="scan-detail-description">{{ currentScope }}</p><p class="scan-detail-description">{{ phase.explanation }}</p><p v-if="precision" class="scan-detail-description">{{ stopPolicy }}</p><p v-if="stabilizing" class="scan-detail-description">{{ criteria }}</p>
-          <div class="scan-region-status"><span class="scan-footer-label">地区识别与精测入围（非测速通过数）</span><div class="scan-region-list"><div v-for="region in regionalPools" :key="region.code" class="scan-region-item"><span><span class="tiny-dot" :class="{ found: region.identified }" />{{ regionName(region.code) }} · 已识别 <strong>{{ region.identified }}</strong> 个 IP</span><template v-if="region.pool"><p>{{ region.pool.label }}</p><p>{{ region.pool.detail }}</p></template></div></div></div>
-          <div class="scan-run-meta"><span>{{ precisionPolicyLabel(run.config) }}</span><span>{{ downloadStatus }} / {{ run.config.downloadBudgetEnabled !== false ? `预算 ${run.config.downloadBudgetMiB} MiB` : '不限制流量' }}</span><span>本次测试已耗时 {{ elapsed }}</span></div>
+          <p class="scan-detail-description">{{ currentScope }}</p><p class="scan-detail-description">{{ phase.explanation }}</p><p v-if="precision && !run.retestIp" class="scan-detail-description">{{ stopPolicy }}</p><p v-if="stabilizing" class="scan-detail-description">{{ criteria }}</p>
+          <div v-if="!run.retestIp" class="scan-region-status"><span class="scan-footer-label">地区识别与精测入围（非测速通过数）</span><div class="scan-region-list"><div v-for="region in regionalPools" :key="region.code" class="scan-region-item"><span><span class="tiny-dot" :class="{ found: region.identified }" />{{ regionName(region.code) }} · 已识别 <strong>{{ region.identified }}</strong> 个 IP</span><template v-if="region.pool"><p>{{ region.pool.label }}</p><p>{{ region.pool.detail }}</p></template></div></div></div>
+          <div class="scan-run-meta"><span v-if="!run.retestIp">{{ precisionPolicyLabel(run.config) }}</span><span>{{ downloadStatus }} / {{ run.config.downloadBudgetEnabled !== false ? `预算 ${run.config.downloadBudgetMiB} MiB` : '不限制流量' }}</span><span>本次测试已耗时 {{ elapsed }}</span></div>
         </div>
       </div>
     </details>

@@ -1,8 +1,13 @@
 import { defaultConfig, type ScanConfig, type ScanRun } from './types'
 import { completeMeasurement, stageProgressText } from './ui-state'
 
-export function scanModeLabel(run: Pick<ScanRun, 'quickValidation'>): string {
+export function scanModeLabel(run: Pick<ScanRun, 'quickValidation' | 'retestIp'>): string {
+  if (run.retestIp) return '单 IP 复测'
   return run.quickValidation == null ? '历史测速' : run.quickValidation ? '快速验证' : '完整优选'
+}
+
+export function singleIpConfig(config: ScanConfig, ip: string): ScanConfig {
+  return { ...config, source: 'custom', customIps: ip, maxCandidates: 1 }
 }
 
 const configFields = Object.keys(defaultConfig()) as (keyof ScanConfig)[]

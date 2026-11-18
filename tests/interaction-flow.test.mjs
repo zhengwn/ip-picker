@@ -135,6 +135,8 @@ test('before/after comparisons distinguish changed conditions, partial data and 
   entry.config = { ...config, stabilityAttempts: 10 }
   entry.networkPath = { ...networkPath, interfaceName: 'en8' }
   assert.deepEqual(favoriteTestChange(entry, job).differences, ['测速参数不同', '网络接口不同'])
+  entry.networkPath.sampleIp = '104.16.0.2'
+  assert.deepEqual(favoriteTestChange(entry, job).differences, ['测速参数不同', '部分接口来自其他 IP 的采样'])
   entry.result.downloadSamplesMbps = [30]
   assert.match(favoriteTestChange(entry, job).label, /下载本次未测满/)
   entry.runId = 'previous'

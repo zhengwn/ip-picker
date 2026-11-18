@@ -14,6 +14,7 @@ function rowOutcome(result: IpResult, run: ScanRun, status: string) {
   if (status === 'qualified') return { label: '测速通过', tone: 'good' } as const
   if (status === 'measured') return { label: '测速完成 · 未达标', tone: 'warning' } as const
   if (status === 'pendingSummary') return { label: '测速完成 · 待汇总', tone: 'quiet' } as const
+  if (status === 'retest') return { label: '建议完整复测', tone: 'warning', blockedDownload: true } as const
 
   const initialFailure = initialTcpFailureReason(result)
   if (initialFailure) {

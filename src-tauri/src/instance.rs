@@ -22,15 +22,16 @@ impl InstanceGuard {
             use std::os::windows::fs::OpenOptionsExt;
             options.share_mode(0);
         }
-        let file = options
-            .open(data_dir.join("instance.lock"))
-            .map_err(|error| {
-                #[cfg(windows)]
-                if error.raw_os_error() == Some(32) {
-                    return already_running();
-                }
+        let opened = options.open(data_dir.join("instance.lock"));
+        #[cfg(windows)]
+        let opened = opened.map_err(|error| {
+            if error.raw_os_error() == Some(32) {
+                already_running()
+            } else {
                 error
-            })?;
+            }
+        });
+        let file = opened?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;

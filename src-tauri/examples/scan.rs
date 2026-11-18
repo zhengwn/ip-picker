@@ -41,11 +41,11 @@ async fn scan(config_path: PathBuf) -> Result<(), String> {
     let last_progress = Arc::new(Mutex::new((String::new(), usize::MAX)));
     let callback = Arc::new(move |update: EngineUpdate| {
         let progress = update.progress;
-        let bucket = if progress.total == 0 {
-            0
-        } else {
-            progress.completed.saturating_mul(10) / progress.total
-        };
+        let bucket = progress
+            .completed
+            .saturating_mul(10)
+            .checked_div(progress.total)
+            .unwrap_or(0);
         if let Ok(mut previous) = last_progress.lock() {
             if previous.0 != progress.stage || previous.1 != bucket {
                 eprintln!(

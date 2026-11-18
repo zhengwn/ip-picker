@@ -73,6 +73,7 @@ export interface TcpProbeFailure extends TcpConnectionFailure {
 
 export interface IpResult {
   ip: string
+  networkPath?: NetworkPathSnapshot
   regionCode: string
   city: string
   colo: string
@@ -117,6 +118,7 @@ export interface TcpStability {
 export interface ScanRun {
   id: string
   quickValidation?: boolean | null
+  retestIp?: string
   status: 'running' | 'completed' | 'cancelled' | 'failed'
   startedAt: string
   finishedAt?: string
@@ -131,6 +133,7 @@ export type ScanHistoryKind = 'scan' | 'favorite'
 export interface ScanHistoryEntry {
   kind: ScanHistoryKind
   quickValidation?: boolean | null
+  retestIp?: string
   id: string
   status: ScanRun['status']
   startedAt: string
@@ -148,6 +151,8 @@ export interface ScanHistory {
 export interface ScanHistoryMatch {
   kind: ScanHistoryKind
   run: ScanRun
+  baseline?: boolean
+  baselineOnly?: boolean
 }
 
 export interface SavedState { config: ScanConfig; lastRun?: ScanRun; warning?: string; favorites?: FavoriteLibrary; favoriteTest?: FavoriteTestJob | null }

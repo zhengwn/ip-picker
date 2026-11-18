@@ -3,7 +3,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { Activity, BarChart3, ChevronDown, ChevronLeft, ChevronRight, Copy, Search, SearchX, SlidersHorizontal } from '@lucide/vue'
 import { regionName, type IpResult, type ScanRun } from '../types'
-import { candidateExclusionReason, candidateMeasurementStatus, completeMeasurement, completedTcpMetricValue, hasPrecisionMeasurement, initialTcpFailureReason, isDownloadShortlistExclusion, observedFailurePercent, observedTcpMs, regionalPrecisionLimit, stabilityMetricLabel, stabilityVerdict, summarizeExclusions } from '../ui-state'
+import { candidateExclusionReason, candidateMeasurementStatus, completeMeasurement, completedTcpMetricValue, hasPrecisionMeasurement, initialTcpFailureReason, isDownloadShortlistExclusion, observedFailurePercent, observedTcpMs, quickRetestAdvice, regionalPrecisionLimit, stabilityMetricLabel, stabilityVerdict, summarizeExclusions } from '../ui-state'
 import type { ResultSortBy, TcpDisplayMetric } from '../result-preferences'
 import { displayForLatencySort, latencySortForDisplay } from '../result-preferences'
 import { describeResultRow, tcpLatencyChartScale } from '../result-row-display'
@@ -17,8 +17,8 @@ import TcpLatencyCell from './TcpLatencyCell.vue'
 import TcpLatencyHeader from './TcpLatencyHeader.vue'
 
 type ResultAction = 'regions' | 'budget' | 'stability' | 'target' | 'expand'
-const props = defineProps<{ run: ScanRun; savedIps: Set<string>; favoriteDisabled: boolean; settingsDiffer?: boolean; settingsDisabled?: boolean }>()
-const emit = defineEmits<{ favorite: [result: IpResult, event: MouseEvent]; notify: [text: string, error?: boolean]; action: [action: ResultAction]; 'reuse-config': [] }>()
+const props = defineProps<{ run: ScanRun; savedIps: Set<string>; favoriteDisabled: boolean; settingsDiffer?: boolean; settingsDisabled?: boolean; retestDisabled?: boolean }>()
+const emit = defineEmits<{ favorite: [result: IpResult, event: MouseEvent]; notify: [text: string, error?: boolean]; action: [action: ResultAction]; 'reuse-config': []; retest: [ip: string] }>()
 const desktop = isTauri()
 const copyingIp = ref<string | null>(null)
 
@@ -30,7 +30,7 @@ async function copyIp(ip: string) {
   finally { copyingIp.value = null }
 }
 
-type ResultStatus = 'qualified' | 'measured' | 'pendingSummary' | 'rejected' | 'notDownloaded' | 'stability' | 'unfinished'
+type ResultStatus = 'qualified' | 'measured' | 'pendingSummary' | 'retest' | 'rejected' | 'notDownloaded' | 'stability' | 'unfinished'
 const query = ref('')
 const regionFilter = ref('all')
 const popFilter = ref('all')
@@ -78,13 +78,15 @@ const statusOptions: { value: ResultStatus; label: string }[] = [
   { value: 'qualified', label: '完整测速达标' },
   { value: 'measured', label: '完整测速未达标' },
   { value: 'pendingSummary', label: '测速完成 · 待汇总' },
+  { value: 'retest', label: '建议完整复测' },
   { value: 'rejected', label: '稳定性未达标／提前淘汰' },
   { value: 'notDownloaded', label: '稳定性已完成 · 未入选下载' },
   { value: 'stability', label: '稳定性达标 · 完整测速未通过' },
   { value: 'unfinished', label: '精测未完成' },
 ]
-const visibleStatusOptions = computed(() => props.run.status === 'running'
-  ? statusOptions : statusOptions.filter(option => option.value !== 'pendingSummary'))
+const visibleStatusOptions = computed(() => statusOptions.filter(option =>
+  (option.value !== 'pendingSummary' || props.run.status === 'running') &&
+  (option.value !== 'retest' || retestCount.value > 0)))
 
 function status(result: IpResult): ResultStatus {
   if (completeMeasurement(result, props.run.config)) {
@@ -93,6 +95,7 @@ function status(result: IpResult): ResultStatus {
     return result.eligible ? 'qualified' : 'measured'
   }
   if (isDownloadShortlistExclusion(result)) return 'notDownloaded'
+  if (quickRetestAdvice(result, props.run)) return 'retest'
   const verdict = stabilityVerdict(result, props.run.config)
   if (verdict === 'failed') return 'rejected'
   if (verdict === 'passed') return 'stability'
@@ -186,6 +189,7 @@ function downloadDescription(result: IpResult) {
 const downloadedCount = computed(() => precisionRecords.value.filter(record => record.download != null).length)
 const roundSummary = computed(() => props.run.status === 'running' ? null : summarizeScanResults(props.run, downloadedCount.value))
 const qualifiedCount = computed(() => precisionRecords.value.filter(record => record.status === 'qualified').length)
+const retestCount = computed(() => precisionRecords.value.filter(record => record.status === 'retest').length)
 const hasBudgetExclusions = computed(() => props.run.results.some(result => result.exclusionCode === 'downloadBudget'))
 const identifiedRegions = computed(() => [...new Set([
   ...Object.entries(props.run.progress.discoveredByRegion).filter(([, count]) => count > 0).map(([code]) => code),
@@ -295,6 +299,10 @@ function showStabilityFailures() {
   showObservations()
   statusFilter.value = 'rejected'
 }
+function showRetestCandidates() {
+  showObservations()
+  statusFilter.value = 'retest'
+}
 function closeSummaryForResults() {
   const wasOpen = summaryOpen.value
   summaryOpen.value = false
@@ -330,9 +338,10 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
     <div class="all-results-heading">
       <h2 id="all-results-title">测试结果</h2>
       <span class="status-label" :class="{ active: run.status === 'running', good: run.status === 'completed' && downloadedCount > 0, quiet: run.status === 'cancelled' || run.status === 'completed' && !downloadedCount, error: run.status === 'failed' }" role="status" aria-live="polite">{{ runStatus }}</span>
-      <span v-if="run.quickValidation" class="run-mode-label">快速验证</span>
+      <span v-if="run.quickValidation || run.retestIp" class="run-mode-label">{{ scanModeLabel(run) }}</span>
       <time v-if="testTime" class="results-test-time muted" :datetime="run.startedAt" title="本轮开始时间">{{ testTime }}</time>
       <p v-if="roundSummary" class="results-heading-summary" :title="[roundSummary.headline, roundSummary.detail].filter(Boolean).join('：')">{{ roundSummary.headline }}</p>
+      <button v-if="retestCount" type="button" class="text-button result-retest-link" @click="showRetestCandidates">{{ retestCount }} 个建议复测</button>
       <button ref="summaryTrigger" type="button" class="button more-filters-button run-summary-button" :class="{ 'is-active': summaryOpen }" :aria-expanded="summaryOpen" aria-controls="run-summary" :title="settingsDiffer ? '查看本轮结果、实际参数与下次设置的差异' : '查看本轮参数、地区统计和处理建议'" @click="summaryOpen = !summaryOpen">
         <BarChart3 :size="13" aria-hidden="true" />本轮详情<span v-if="settingsDiffer" class="settings-differ-indicator" aria-label="下次设置与本轮不同" /><ChevronDown :size="12" :class="{ 'is-open': summaryOpen }" aria-hidden="true" />
       </button>
@@ -341,7 +350,8 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
         <p>{{ scanModeLabel(run) }} · {{ runStatus }} · {{ testTime }}</p>
         <dl class="run-parameters" aria-label="本轮实际测速参数">
           <div class="run-target"><dt>测速目标</dt><dd>{{ run.config.targetUrl }}</dd></div>
-          <div><dt>抽样上限</dt><dd>{{ count(run.config.maxCandidates) }} 个</dd></div>
+          <div v-if="run.retestIp"><dt>复测 IP</dt><dd class="mono">{{ run.retestIp }}</dd></div>
+          <div v-else><dt>抽样上限</dt><dd>{{ count(run.config.maxCandidates) }} 个</dd></div>
           <div><dt>TCP 探测</dt><dd>{{ run.config.stabilityAttempts == null ? '未记录稳定性计划' : `${run.config.stabilityAttempts} 次` }} · {{ run.config.maxTcpMs == null ? '未设延迟上限' : `${metricName} ≤ ${run.config.maxTcpMs} ms` }}</dd></div>
           <div><dt>下载计划</dt><dd>{{ run.config.downloadRounds }} 轮 × {{ run.config.downloadSeconds }} 秒</dd></div>
           <div><dt>下载预算</dt><dd>{{ run.config.downloadBudgetEnabled !== false ? `${run.config.downloadBudgetMiB} MiB` : '不限下载流量' }}</dd></div>
@@ -357,8 +367,10 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
             <div class="result-next-actions" aria-label="本轮结果的下一步操作">
               <template v-if="qualifiedCount"><button class="text-button" @click="showQualified()">查看达标 IP（{{ qualifiedCount }}）</button><button class="text-button" @click="showQualified('tcp')">优先低延迟</button><button class="text-button" @click="showQualified('download')">优先下载速度</button></template>
               <button v-if="hasBudgetExclusions" class="text-button" @click="requestAction('budget')">调整预算后重测</button>
-              <template v-if="roundSummary.stabilityFailures"><button class="text-button" @click="showStabilityFailures">查看稳定性失败</button><button class="text-button" @click="requestAction('stability')">检查判定条件</button></template>
-              <template v-if="!roundSummary.precisionCount"><button class="text-button" @click="requestAction('regions')">调整目标地区</button><button class="text-button" @click="requestAction('target')">检查测速目标</button></template>
+              <button v-if="retestCount" class="text-button" @click="showRetestCandidates">查看建议复测的 IP</button>
+              <button v-if="roundSummary.stabilityFailures > retestCount" class="text-button" @click="showStabilityFailures">查看稳定性失败</button>
+              <button v-if="roundSummary.stabilityFailures" class="text-button" @click="requestAction('stability')">检查判定条件</button>
+              <template v-if="!roundSummary.precisionCount"><button v-if="!run.retestIp" class="text-button" @click="requestAction('regions')">调整目标地区</button><button class="text-button" @click="requestAction('target')">检查测速目标</button></template>
               <button v-if="run.quickValidation && !qualifiedCount" class="text-button" @click="requestAction('expand')">扩大抽样做完整优选</button>
               <button v-if="!qualifiedCount && roundSummary.precisionCount" class="text-button" @click="showObservations">查看已有精测记录</button>
             </div>
@@ -377,9 +389,9 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
         </div>
 
         <button v-if="!roundSummary && initialIssueResults.length && !initialIssuesOpen" type="button" class="text-button" @click="setInitialIssuesOpen(true)">查看初筛异常（{{ count(initialIssueResults.length) }}）<ChevronRight :size="11" /></button>
-        <h4>各地区统计</h4>
         <p v-if="run.error">{{ run.error }}</p>
-        <table>
+        <h4 v-if="!run.retestIp">各地区统计</h4>
+        <table v-if="!run.retestIp">
           <thead><tr><th scope="col">目标地区</th><th scope="col">识别到的 IP</th><th scope="col">入围复测</th><th scope="col">稳定性通过</th><th scope="col">完成下载</th></tr></thead>
           <tbody>
             <tr v-for="region in regionalStats" :key="region.code">
@@ -391,7 +403,7 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
             </tr>
           </tbody>
         </table>
-        <p>统计涵盖本轮所有观测。<template v-if="regionalStats.some(region => region.admitted == null)"> — 表示入围数无法确认。</template></p>
+        <p v-if="!run.retestIp">统计涵盖本轮所有观测。<template v-if="regionalStats.some(region => region.admitted == null)"> — 表示入围数无法确认。</template></p>
         <h4>本轮排除或未完成原因</h4>
         <ul v-if="exclusions.length">
           <li v-for="item in exclusions" :key="item.key"><span>{{ item.label }}</span><strong>{{ item.count }}</strong></li>
@@ -473,7 +485,8 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
                 <span class="mono result-ip">{{ record.result.ip }}</span><button class="icon-button result-copy" :disabled="!desktop || copyingIp !== null" :aria-label="`复制 IP ${record.result.ip}`" :title="desktop ? '复制 IP 地址' : '请在桌面应用中复制'" @click="copyIp(record.result.ip)"><Copy :size="13" aria-hidden="true" /></button></span></td>
               <td v-if="!initialIssuesOpen" :title="record.result.observedColos.length > 1 ? `本次观测到的机房 ${record.result.observedColos.join(' / ')}。表格显示首次观测。` : undefined"><span class="location-cell"><span class="location-name">{{ location(record.result.regionCode) }}</span><span v-if="firstPop(record.result)" class="result-pop">{{ firstPop(record.result) }}</span></span></td>
               <td>
-                <span class="result-outcome" :data-tone="record.display.outcome.tone" :title="record.reason || record.display.outcome.label">{{ record.display.outcome.label }}</span>
+                <button v-if="record.status === 'retest' && desktop" type="button" class="text-button result-retest-link" :disabled="retestDisabled" :title="quickRetestAdvice(record.result, run) ?? ''" :aria-label="`完整复测 ${record.result.ip}`" @click="emit('retest', record.result.ip)">建议完整复测</button>
+                <span v-else class="result-outcome" :data-tone="record.display.outcome.tone" :title="record.reason || record.display.outcome.label">{{ record.display.outcome.label }}</span>
                 <small v-if="!initialIssuesOpen && record.result.tcpStability && record.tcpFailurePercent != null" class="result-tcp-failures" title="TCP 连接失败次数 / 已探测次数">
                   失败 {{ record.result.tcpStability.failed }}/{{ record.result.tcpStability.attempted }} · {{ failureRateFormat.format(record.tcpFailurePercent) }}%
                 </small>
@@ -500,6 +513,7 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
               <td :colspan="initialIssuesOpen ? 4 : 6">
                 <strong>{{ candidateMeasurementStatus(record.result, run) }}</strong>
                 <p v-if="record.reason">{{ record.reason }}</p>
+                <p v-if="record.status === 'retest'">{{ quickRetestAdvice(record.result, run) }}</p>
                 <TcpDiagnostics :result="record.result" :config="run.config" />
               </td>
             </tr>
@@ -519,6 +533,7 @@ watch(() => props.run.id, () => { observationsOpen.value = false; initialIssuesO
 <style scoped>
 .result-next-actions { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 4px; }
 .result-next-actions .text-button { font-size: 11px; min-height: 24px; padding: 0; }
+.result-retest-link { flex: none; min-height: 22px; padding: 0; color: var(--warn); font-size: 11px; white-space: nowrap; }
 .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
 .all-results-panel { display: flex; flex: 1 1 0; flex-direction: column; min-width: 0; min-height: 0; margin: 0; padding: 0; overflow: hidden; border: 0; border-radius: 0; box-shadow: none; background: var(--panel); }
 .all-results-controls { position: relative; z-index: 3; display: flex; flex-direction: column; flex: 0 0 auto; padding-bottom: 8px; overflow: visible; }

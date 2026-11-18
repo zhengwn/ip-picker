@@ -32,6 +32,11 @@ async function openHistory() {
 
 async function exercise() {
   await button('.start-button', '开始完整优选')
+  const budgetShortcut = await button('.scan-budget-toggle', '开启流量预算')
+  budgetShortcut.click()
+  await button('.scan-budget-toggle[aria-pressed="true"]', '预算已开启 · 400 MiB')
+  budgetShortcut.click()
+  await button('.scan-budget-toggle[aria-pressed="false"]', '开启流量预算')
   const { config } = await invoke('load_state')
   const invalid = { ...config, customIps: '127.0.0.1\nbad-ip' }
   for (const command of ['save_config', 'start_scan']) {
@@ -156,6 +161,16 @@ async function exercise() {
     [...document.querySelectorAll('.region-choice[aria-pressed="true"]')]
       .find(node => node.textContent.includes('日本')))
   japan.click()
+
+  await openHistory()
+  const historyInput = await element('#history-ip-search')
+  historyInput.value = '127.0.0.1'
+  historyInput.dispatchEvent(new Event('input', { bubbles: true }))
+  ;(await button('.history-search button', '对比 IP')).click()
+  const wired = await waitFor('wired measurement to pin', () => [...document.querySelectorAll('.history-data-row')].find(row => row.textContent.includes('有线 · en8')))
+  wired.querySelector('.history-result-toggle').click()
+  ;(await button('.history-pin-button', '固定为基线')).click()
+  await element('.history-baseline-bar')
 }
 
 async function reopen() {
@@ -163,6 +178,7 @@ async function reopen() {
   await waitFor('saved cancelled run', () =>
     document.querySelector('.all-results-heading .status-label')?.textContent.trim() === '已停止')
   await waitFor('persisted quick run identity', () => document.querySelector('.run-mode-label')?.textContent.includes('快速验证'))
+  await element('#scan-estimate-detail')
   await waitFor('setting saved when closing', () =>
     [...document.querySelectorAll('.region-choice[aria-pressed="false"]')]
       .some(node => node.textContent.includes('日本')))
@@ -216,13 +232,87 @@ async function reopen() {
   if (!probes.textContent.includes('连接超时') || !probes.textContent.includes('1501.2 ms')) {
     throw new Error('The history did not restore the failed probe and measured wait')
   }
-  comparison.querySelector('tbody button').click()
+  wifi.querySelector('.history-time').click()
   const detail = await element('[aria-label="本轮 IP 测速记录"]')
   if (detail.getBoundingClientRect().top > 180) throw new Error('Single-run history controls leave too little room for IP records')
   if (!detail.textContent.includes('127.0.0.1') || detail.querySelector(tcpMetricSelect)?.value !== 'average' ||
       !detail.querySelector('.tcp-probe-chart')) {
     throw new Error('The saved run did not reopen with the shared TCP column')
   }
+  ;(await button('.history-back', '返回对比')).click()
+  await element('.history-baseline-bar')
+  ;(await button('.history-baseline-bar .button', '按基线参数复测')).click()
+  await button('.start-button', '停止测速')
+  const replay = await invoke('get_scan')
+  if (replay.retestIp !== '127.0.0.1' || replay.config.stabilityAttempts !== 110 || replay.quickValidation) {
+    throw new Error('The retest did not use the saved baseline or targeted IP')
+  }
+  ;(await button('.start-button', '停止测速')).click()
+  await waitFor('retest stopped', () => document.querySelector('.all-results-heading .status-label')?.textContent.trim() === '已停止')
+}
+
+function measureDomChange(description, read, change) {
+  return new Promise((resolve, reject) => {
+    const started = performance.now()
+    const observer = new MutationObserver(() => {
+      if (!read()) return
+      observer.disconnect()
+      clearTimeout(timeout)
+      resolve(performance.now() - started)
+    })
+    const timeout = setTimeout(() => {
+      observer.disconnect()
+      reject(new Error(`Timed out measuring ${description}`))
+    }, 8000)
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true })
+    change()
+  })
+}
+
+async function exercisePerformance() {
+  const candidates = Number(phase.split('-')[1])
+  let snapshot
+  let downloadUpdate
+  await invoke('plugin:event|listen', {
+    event: 'scan-update',
+    target: { kind: 'Any' },
+    handler: window.__TAURI_INTERNALS__.transformCallback(({ payload }) => {
+      if (payload.results?.length === candidates) snapshot ??= payload
+      if (payload.downloadedBytes > 0 && !payload.results) downloadUpdate ??= payload
+    }),
+  })
+  ;(await button('.start-button', '开始完整优选')).click()
+  await waitFor('full snapshot and compact download updates', () => snapshot && downloadUpdate &&
+    Number.parseFloat(document.querySelector('.scan-progress-disclosure summary .downloaded-total')?.textContent) > 0)
+  const jsonBytes = value => new TextEncoder().encode(JSON.stringify(value)).length
+  ;(await element('.run-summary-button')).click()
+  ;(await waitFor('initial issues action', () => [...document.querySelectorAll('.run-summary-panel button')].find(node => node.textContent.includes('查看初筛异常')))).click()
+  const search = await element('input[aria-label="搜索初筛异常 IP"]')
+  const timings = []
+  for (let index = 0; index < 8; index++) {
+    const ip = `198.18.3.20${index}`
+    timings.push(await measureDomChange('filtered candidate row', () => {
+      const results = document.querySelectorAll('.all-results-table .result-ip')
+      return results.length === 1 && results[0].textContent === ip
+    }, () => {
+      search.value = ip
+      search.dispatchEvent(new Event('input', { bubbles: true }))
+    }))
+  }
+  const stop = await button('.start-button', '停止测速')
+  const stopMs = await measureDomChange('terminal status',
+    () => document.querySelector('.all-results-heading .status-label')?.textContent.trim() === '已停止',
+    () => stop.click())
+  await invoke('plugin:event|emit', {
+    event: 'ip-picker-smoke-metrics',
+    payload: {
+      candidates,
+      fullSnapshotBytes: jsonBytes(snapshot),
+      downloadUpdateBytes: jsonBytes(downloadUpdate),
+      medianFilterMs: timings.sort((a, b) => a - b).slice(3, 5).reduce((sum, value) => sum + value, 0) / 2,
+      stopMs,
+    },
+  })
 }
 
 function report(error) {
@@ -232,5 +322,5 @@ function report(error) {
   })
 }
 
-const run = phase === 'exercise' ? exercise : reopen
+const run = phase === 'exercise' ? exercise : phase === 'reopen' ? reopen : exercisePerformance
 void run().then(() => report(null), error => report(String(error)))

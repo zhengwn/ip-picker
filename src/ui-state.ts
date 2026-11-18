@@ -373,6 +373,7 @@ export function summarizeMeasurementCoverage(results: IpResult[], config: ScanCo
 
 /** Report evidence actually obtained, independently of why a candidate was excluded. */
 export function candidateMeasurementStatus(result: IpResult, run: ScanRun): string {
+  if (quickRetestAdvice(result, run)) return '建议完整复测'
   if (isDownloadShortlistExclusion(result)) return '稳定性已完成 · 未入选下载'
   if (isRegionalAdmissionExclusion(result)) return '未入围 · 未精测'
   if (completeMeasurement(result, run.config)) return '完整测速完成'
@@ -402,6 +403,21 @@ export function candidateMeasurementStatus(result: IpResult, run: ScanRun): stri
   if (!result.tcpMs && !result.attempts
     && (result.exclusionCode ? result.exclusionCode === 'tcpConnect' : /^TCP/.test(result.exclusionReason ?? ''))) return 'TCP 未连通'
   return '未精测'
+}
+
+export function quickRetestAdvice(result: IpResult, run: ScanRun): string | null {
+  const { tcpStability: stats } = result
+  const { maxTcpMs, stabilityLatencyMetric, maxStabilityFailurePercent } = run.config
+  if (!run.quickValidation || run.status === 'running' || stats?.requested !== 10 || !completeStability(result, run.config)) return null
+  const oneFailure = stats.failed === 1 && result.exclusionCode === 'stabilityFailureRate'
+  if (oneFailure && maxStabilityFailurePercent >= 1) {
+    return '10 次中有 1 次连接失败，已超出本轮失败率上限。增加探测次数后可重新判断。'
+  }
+  if (result.exclusionCode === 'stabilityLatency' && stabilityLatencyMetric === 'p95' && maxTcpMs != null
+    && stats.failed === 0 && stats.probesMs.filter(probe => probe != null && probe > maxTcpMs).length === 1) {
+    return '10 次探测的 P95 等于最慢的一次。本轮只有一次延迟超限，建议增加探测次数。'
+  }
+  return null
 }
 
 export interface StabilityBatchCandidate {
@@ -502,7 +518,7 @@ export function summarizePrecisionQueue(run: ScanRun) {
   }, 0)
   const available = Math.max(identifiedAvailable, precisionJobs.length)
   const measured = precisionJobs.filter(result => completeMeasurement(result, config))
-  const qualified = measured.filter(result => selected.has(result.regionCode)
+  const qualified = measured.filter(result => (run.retestIp || selected.has(result.regionCode))
     && (config.preference === 'download' || result.downloadMbps >= config.minDownloadMbps))
   const processed = precisionJobs.filter(result => precisionCandidateSettled(result, config)).length
   const processing = precisionJobs.filter(result => inBatch.has(result.ip) && !precisionCandidateSettled(result, config)).length
@@ -521,7 +537,7 @@ export function summarizePrecisionQueue(run: ScanRun) {
 export function stageProgressText(run: ScanRun): { title: string; caption: string; explanation: string; percent: number | null } {
   if (run.status === 'cancelled') return { title: '测试已停止', caption: '已保留完成的观测', explanation: '未完成的探测不会计为连接失败。', percent: null }
   if (run.status === 'failed') return { title: '本次测试未完成', caption: '已保留取得的观测', explanation: '请查看结果中的具体原因。', percent: null }
-  if (run.status === 'completed') return { title: '测速已结束', caption: '本轮结果已整理完成', explanation: '请查看各地区结果与具体判定。', percent: null }
+  if (run.status === 'completed') return { title: '测速已结束', caption: '本轮结果已整理完成', explanation: run.retestIp ? '可查看该 IP 的测量样本与判定。' : '请查看各地区结果与具体判定。', percent: null }
   const progress = run.progress
   const completed = Math.max(0, progress.completed)
   const total = Math.max(0, progress.total)
@@ -530,9 +546,9 @@ export function stageProgressText(run: ScanRun): { title: string; caption: strin
   switch (progress.stage) {
     case 'connecting': return { title: '正在检查 TCP 连通性', caption: total ? `已检查 ${count} 个 IP（${percent}%）` : '正在准备待检查的 IP', explanation: '连接成功后先识别实际接入地区；此进度只表示当前连通性检查。', percent }
     case 'discovering': return { title: '正在识别实际响应地区', caption: total ? `已检查 ${count} 个 IP 的 POP 响应（${percent}%）` : '正在准备地区识别', explanation: '按当前网络实际响应的 POP 分组；识别不到的归属保留为未知。', percent }
-    case 'verifying': return { title: '正在验证候选可用性', caption: total ? `已复核 ${count} 个候选（${percent}%）` : '正在准备候选可用性验证', explanation: run.config.stabilityFirst ? `全部稳定性测试已结束；仅对各区前 10 名下载候选完成 ${run.config.verificationAttempts} 次服务可用性校验。` : `每个候选完成 ${run.config.verificationAttempts} 次服务可用性校验，再进入 TCP 稳定性复测。`, percent }
+    case 'verifying': return { title: '正在验证候选可用性', caption: total ? `已复核 ${count} 个候选（${percent}%）` : '正在准备候选可用性验证', explanation: run.retestIp ? `TCP 稳定性已通过，计划执行 ${run.config.verificationAttempts} 次服务可用性校验。` : run.config.stabilityFirst ? `全部稳定性测试已结束；仅对各区前 10 名下载候选完成 ${run.config.verificationAttempts} 次服务可用性校验。` : `每个候选完成 ${run.config.verificationAttempts} 次服务可用性校验，再进入 TCP 稳定性复测。`, percent }
     case 'downloading': return { title: '正在进行下载复测', caption: total ? `已处理 ${count} 个计划下载轮次（${percent}%）` : '正在准备下载复测', explanation: '进度包含失败或跳过的计划轮次；成功取得的有效下载样本用于最终推荐。', percent }
-    case 'completed': return { title: '正在汇总本轮结果', caption: '测速阶段已结束，正在整理结果', explanation: '将根据本次设置分别生成各地区推荐。', percent: null }
+    case 'completed': return { title: '正在汇总本轮结果', caption: '测速阶段已结束，正在整理结果', explanation: run.retestIp ? '正在保存该 IP 的测量与判定。' : '将根据本次设置分别生成各地区推荐。', percent: null }
     case 'cancelled': return { title: '测试已停止', caption: '已保留完成的观测', explanation: '未完成的探测不会计为连接失败。', percent: null }
     case 'failed': return { title: '本次测试未完成', caption: '已保留取得的观测', explanation: '请查看结果中的具体原因。', percent: null }
     default: return { title: '正在检查 TCP 稳定性', caption: '正在准备本批候选', explanation: run.config.stabilityFirst ? '先完成所有入围候选的稳定性测试；累计 2 次连接失败立即淘汰，其余测满后再按地区选前 10 名下载。' : '已确定无法达标的 IP 会提前淘汰；仍有机会达标的继续探测。', percent: null }

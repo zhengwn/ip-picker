@@ -73,8 +73,8 @@ export function summarizeScanResults(run: ScanRun, downloadedCount: number) {
   if (initialTcpFailures === totalCandidates) return { ...counts, headline: '没有 IP 通过 TCP 初筛', detail: '' }
   if (!precisionCount) {
     const recognized = run.config.regions.some(code => (run.progress.discoveredByRegion[code] ?? 0) > 0)
-      || run.results.some(result => result.colo && run.config.regions.includes(result.regionCode))
-    return { ...counts, headline: '没有 IP 开始精测', detail: recognized ? '' : '没有识别到所选地区的接入点' }
+      || run.results.some(result => result.colo && (run.retestIp || run.config.regions.includes(result.regionCode)))
+    return { ...counts, headline: '没有 IP 开始精测', detail: recognized ? '' : run.retestIp ? '没有识别到该 IP 的接入点' : '没有识别到所选地区的接入点' }
   }
 
   const stabilityDetails = (Object.keys(failures) as StabilityFailureKind[])

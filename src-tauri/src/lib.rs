@@ -14,10 +14,11 @@ mod storage;
 
 use crate::{
     engine::{
-        prepare_scan, run_targeted_scan, EngineOutcome, EngineUpdate, PreparedScan, UpdateCallback,
+        prepare_ip_retest, prepare_scan, run_targeted_scan, EngineOutcome, EngineUpdate,
+        PreparedScan, UpdateCallback,
     },
     favorites::{checked_ipv4, FavoriteLibrary, FavoriteTestJob, FavoriteTestStart},
-    history::{compare_ip, HistoryEntry, HistoryKind, HistorySummary, ScanHistory, HISTORY_LIMIT},
+    history::{HistoryKind, HistoryMatch, HistorySummary, ScanHistory, HISTORY_LIMIT},
     model::{ScanCommandError, ScanConfig, ScanProgress, ScanRun},
     storage::SavedState,
 };
@@ -25,6 +26,7 @@ use crate::{
 use desktop_smoke::run_prepared_scan;
 #[cfg(not(feature = "desktop-smoke"))]
 use engine::run_prepared_scan;
+use serde::Serialize;
 use std::{
     net::Ipv4Addr,
     path::PathBuf,
@@ -39,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 /// retains only the newest snapshot while an earlier snapshot is being sent.
 fn progress_bridge<F>(deliver: F) -> (UpdateCallback, tokio::task::JoinHandle<()>)
 where
-    F: Fn(EngineUpdate) + Send + Sync + 'static,
+    F: Fn(EngineUpdate, bool) + Send + Sync + 'static,
 {
     let (sender, mut receiver) = tokio::sync::watch::channel::<Option<EngineUpdate>>(None);
     let callback: UpdateCallback = Arc::new(move |update| {
@@ -47,11 +49,18 @@ where
     });
     let deliver = Arc::new(deliver);
     let forwarder = tokio::spawn(async move {
+        let mut last_results = None;
         while receiver.changed().await.is_ok() {
             let update = receiver.borrow_and_update().clone();
             if let Some(update) = update {
+                // If a full snapshot was coalesced away, its next byte update
+                // still carries those rows and must deliver them.
+                let rows_changed = !last_results
+                    .as_ref()
+                    .is_some_and(|last| Arc::ptr_eq(last, &update.results));
+                last_results = Some(update.results.clone());
                 let deliver = deliver.clone();
-                if tokio::task::spawn_blocking(move || deliver(update))
+                if tokio::task::spawn_blocking(move || deliver(update, rows_changed))
                     .await
                     .is_err()
                 {
@@ -63,6 +72,40 @@ where
     (callback, forwarder)
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressUpdate {
+    id: String,
+    downloaded_bytes: u64,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+enum DesktopUpdate<T> {
+    Snapshot(T),
+    Progress(ProgressUpdate),
+}
+
+fn apply_engine_update(
+    run: &mut ScanRun,
+    update: EngineUpdate,
+    rows_changed: bool,
+) -> Option<ProgressUpdate> {
+    run.progress = update.progress;
+    if rows_changed {
+        run.results.clone_from(&update.results);
+        if run.retest_ip.is_some() {
+            run.record_observed_regions();
+        }
+        None
+    } else {
+        Some(ProgressUpdate {
+            id: run.id.clone(),
+            downloaded_bytes: run.progress.downloaded_bytes,
+        })
+    }
+}
+
 struct RuntimeState {
     saved: SavedState,
     cancellation: Option<CancellationToken>,
@@ -72,18 +115,28 @@ struct RuntimeState {
 impl RuntimeState {
     fn begin_scan(
         &mut self,
-        config: ScanConfig,
+        mut config: ScanConfig,
         token: CancellationToken,
         path: &std::path::Path,
         persist_config: bool,
+        retest_ip: Option<&str>,
     ) -> Result<(ScanRun, PreparedScan), ScanCommandError> {
         if self.has_active_measurement() {
             return Err("已有测试正在运行，请先停止并等待结束".into());
         }
         // Parse every custom entry and sample once before replacing the latest run.
-        let prepared = prepare_scan(config.clone())?;
+        let target = retest_ip.map(checked_ipv4).transpose()?;
+        let prepared = if let Some(ip) = target {
+            config.source = "custom".into();
+            config.custom_ips = ip.to_string();
+            config.max_candidates = 1;
+            prepare_ip_retest(config.clone(), ip)?
+        } else {
+            prepare_scan(config.clone())?
+        };
         let run = ScanRun {
-            quick_validation: Some(!persist_config),
+            quick_validation: Some(!persist_config && target.is_none()),
+            retest_ip: target.map(|ip| ip.to_string()),
             id: uuid::Uuid::new_v4().to_string(),
             status: "running".into(),
             started_at: chrono::Utc::now().to_rfc3339(),
@@ -93,7 +146,7 @@ impl RuntimeState {
             results: Vec::new(),
             error: None,
         };
-        self.begin(run.clone(), token, path, persist_config)?;
+        self.begin(run.clone(), token, path, persist_config && target.is_none())?;
         Ok((run, prepared))
     }
 
@@ -197,6 +250,7 @@ impl RuntimeState {
         let (job, ips) = next.favorites.prepare_test(
             ScanRun {
                 quick_validation: Some(false),
+                retest_ip: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 status: "running".into(),
                 started_at: chrono::Utc::now().to_rfc3339(),
@@ -359,6 +413,9 @@ fn finish_run(run: &mut ScanRun, outcome: Result<EngineOutcome, String>, cancell
             run.error = Some(error);
         }
     }
+    if run.retest_ip.is_some() {
+        run.record_observed_regions();
+    }
     run.progress.stage = run.status.clone();
     run.progress.stability_batch = None;
     run.progress.precision_batch = None;
@@ -454,6 +511,7 @@ fn load_state(state: State<'_, AppState>) -> Result<SavedState, String> {
         .saved
         .clone();
     snapshot.scan_history.clear();
+    snapshot.history_baselines.clear();
     Ok(snapshot)
 }
 
@@ -500,10 +558,25 @@ fn get_scan_history_run(
 fn compare_scan_history_ip(
     ip: String,
     state: State<'_, AppState>,
-) -> Result<Vec<HistoryEntry>, String> {
+) -> Result<Vec<HistoryMatch>, String> {
     let ip = checked_ipv4(&ip)?.to_string();
     let inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
-    Ok(compare_ip(inner.saved.recent_history(), &ip))
+    Ok(inner.saved.history_comparison(&ip))
+}
+
+#[tauri::command]
+fn set_scan_history_baseline(
+    ip: String,
+    run_id: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<HistoryMatch>, String> {
+    let ip = checked_ipv4(&ip)?.to_string();
+    let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
+    let mut next = inner.saved.clone();
+    next.set_history_baseline(&ip, run_id.as_deref())?;
+    storage::save(&state.storage_path, &next)?;
+    inner.saved = next;
+    Ok(inner.saved.history_comparison(&ip))
 }
 
 #[tauri::command]
@@ -711,24 +784,29 @@ async fn start_favorite_test(
         let callback_id = run_id.clone();
         let (checkpoint_updates, checkpoint_writer) =
             owned_state.start_checkpoint_writer(HistoryKind::Favorite, run_id.clone());
-        let (callback, forwarder) = progress_bridge(move |update: EngineUpdate| {
+        let (callback, forwarder) = progress_bridge(move |update, rows_changed| {
             let snapshot = callback_state.inner.lock().ok().and_then(|mut inner| {
                 let current = inner.saved.favorite_test.as_mut()?;
                 if current.run.id != callback_id || current.run.status != "running" {
                     return None;
                 }
-                current.run.progress = update.progress;
-                current.run.results = update.results;
-                current.record_observed_regions();
-                let snapshot = current.clone();
+                let progress = apply_engine_update(&mut current.run, update, rows_changed);
+                let has_observations =
+                    progress.is_some() || current.run.results.iter().any(favorites::was_attempted);
+                let payload = if let Some(progress) = progress {
+                    DesktopUpdate::Progress(progress)
+                } else {
+                    current.record_observed_regions();
+                    DesktopUpdate::Snapshot(current.clone())
+                };
                 inner.saved.measurement_revision += 1;
-                Some((snapshot, inner.saved.measurement_revision))
+                Some((payload, inner.saved.measurement_revision, has_observations))
             });
-            if let Some((snapshot, revision)) = snapshot {
-                if snapshot.run.results.iter().any(favorites::was_attempted) {
+            if let Some((payload, revision, has_observations)) = snapshot {
+                if has_observations {
                     checkpoint_updates.send_replace(revision);
                 }
-                let _ = callback_app.emit("favorite-test-update", snapshot);
+                let _ = callback_app.emit("favorite-test-update", payload);
             }
         });
         let outcome = run_targeted_scan(config, ips, cancellation.clone(), callback).await;
@@ -774,6 +852,7 @@ fn cancel_favorite_test(run_id: String, state: State<'_, AppState>) -> Result<()
 async fn start_scan(
     config: ScanConfig,
     persist_config: Option<bool>,
+    retest_ip: Option<String>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanRun, ScanCommandError> {
@@ -787,6 +866,7 @@ async fn start_scan(
             cancellation.clone(),
             &state.storage_path,
             persist_config.unwrap_or(true),
+            retest_ip.as_deref(),
         )?;
         inner.worker = Some(worker);
         started
@@ -799,24 +879,28 @@ async fn start_scan(
         let callback_id = run_id.clone();
         let (checkpoint_updates, checkpoint_writer) =
             owned_state.start_checkpoint_writer(HistoryKind::Scan, run_id.clone());
-        let (callback, forwarder) = progress_bridge(move |update: EngineUpdate| {
+        let (callback, forwarder) = progress_bridge(move |update, rows_changed| {
             let snapshot = callback_state.inner.lock().ok().and_then(|mut inner| {
                 let current = inner.saved.last_run.as_mut()?;
                 if current.id != callback_id || current.status != "running" {
                     return None;
                 }
-                current.progress = update.progress;
-                current.results = update.results;
-                let snapshot = current.clone();
+                let progress = apply_engine_update(current, update, rows_changed);
+                let has_observations =
+                    progress.is_some() || current.results.iter().any(favorites::was_attempted);
+                let payload = match progress {
+                    Some(progress) => DesktopUpdate::Progress(progress),
+                    None => DesktopUpdate::Snapshot(current.clone()),
+                };
                 inner.saved.measurement_revision += 1;
-                Some((snapshot, inner.saved.measurement_revision))
+                Some((payload, inner.saved.measurement_revision, has_observations))
             });
             // Serialization can be expensive; never retain the state lock here.
-            if let Some((snapshot, revision)) = snapshot {
-                if snapshot.results.iter().any(favorites::was_attempted) {
+            if let Some((payload, revision, has_observations)) = snapshot {
+                if has_observations {
                     checkpoint_updates.send_replace(revision);
                 }
-                let _ = callback_app.emit("scan-update", snapshot);
+                let _ = callback_app.emit("scan-update", payload);
             }
         });
         let outcome = run_prepared_scan(prepared, cancellation.clone(), callback).await;
@@ -911,6 +995,7 @@ pub fn run() {
             get_scan_history,
             get_scan_history_run,
             compare_scan_history_ip,
+            set_scan_history_baseline,
             get_favorites,
             get_favorite_test,
             save_config,
@@ -934,6 +1019,7 @@ pub fn run() {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use crate::history::compare_ip;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn slow_progress_delivery_keeps_only_the_latest_snapshot_without_blocking_producers() {
@@ -943,9 +1029,9 @@ mod lifecycle_tests {
         let started_tx = Mutex::new(Some(started_tx));
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Mutex::new(release_rx);
-        let (callback, forwarder) = progress_bridge(move |update| {
+        let (callback, forwarder) = progress_bridge(move |update, rows_changed| {
             let number = update.progress.completed;
-            received.lock().unwrap().push(number);
+            received.lock().unwrap().push((number, rows_changed));
             if number == 1 {
                 started_tx.lock().unwrap().take().unwrap().send(()).unwrap();
                 release_rx
@@ -955,17 +1041,19 @@ mod lifecycle_tests {
                     .unwrap();
             }
         });
-        let update = |number| EngineUpdate {
+        let update = |number, results| EngineUpdate {
             progress: ScanProgress {
                 completed: number,
                 ..Default::default()
             },
-            results: Vec::new(),
+            results,
         };
-        callback(update(1));
+        let first_rows = Arc::new(Vec::new());
+        let latest_rows = Arc::new(Vec::new());
+        callback(update(1, first_rows));
         started_rx.await.unwrap();
         for number in 2..=100 {
-            callback(update(number));
+            callback(update(number, latest_rows.clone()));
         }
         drop(callback);
         release_tx.send(()).unwrap();
@@ -973,12 +1061,13 @@ mod lifecycle_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(*delivered.lock().unwrap(), vec![1, 100]);
+        assert_eq!(*delivered.lock().unwrap(), vec![(1, true), (100, true)]);
     }
 
     fn run(id: &str) -> ScanRun {
         ScanRun {
             quick_validation: Some(false),
+            retest_ip: None,
             id: id.into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),
@@ -1061,7 +1150,7 @@ mod lifecycle_tests {
             ..ScanConfig::default()
         };
         let (started, _) = inner
-            .begin_scan(config, CancellationToken::new(), &path, false)
+            .begin_scan(config, CancellationToken::new(), &path, false, None)
             .unwrap();
         let saved = storage::load(&path).unwrap();
         assert_eq!(
@@ -1201,6 +1290,12 @@ mod lifecycle_tests {
                 )
                 .unwrap();
             assert!(warning.is_none());
+            if number == 0 {
+                inner
+                    .saved
+                    .set_history_baseline("127.0.0.1", Some(&pending.id))
+                    .unwrap();
+            }
         }
         let mut pending = run("empty-interruption");
         pending.status = "running".into();
@@ -1213,7 +1308,7 @@ mod lifecycle_tests {
             .unwrap();
         inner.interrupt_for_shutdown(&path).unwrap();
 
-        let restored = storage::load(&path).unwrap();
+        let mut restored = storage::load(&path).unwrap();
         let latest = restored.recent_history();
         assert_eq!(latest.len(), HISTORY_LIMIT);
         assert_eq!(restored.scan_history.len(), HISTORY_LIMIT);
@@ -1225,6 +1320,14 @@ mod lifecycle_tests {
         );
         assert_eq!(latest[0].1.id, format!("scan-{HISTORY_LIMIT}"));
         assert_eq!(latest[HISTORY_LIMIT - 1].1.id, "scan-1");
+        let matches = restored.history_comparison("127.0.0.1");
+        assert_eq!(matches.len(), HISTORY_LIMIT + 1);
+        assert_eq!(matches[0].entry.run.id, "scan-0");
+        assert_eq!(matches[0].entry.run.results[0].tcp_ms, 20.0);
+        assert!(matches[0].baseline && matches[0].baseline_only);
+        restored.set_history_baseline("127.0.0.1", None).unwrap();
+        storage::save(&path, &restored).unwrap();
+        assert!(storage::load(&path).unwrap().history_baselines.is_empty());
         assert_eq!(restored.last_run.unwrap().id, "empty-interruption");
         assert_eq!(restored.favorite_test.unwrap().run.id, "old-favorite");
     }
@@ -1526,7 +1629,7 @@ mod lifecycle_tests {
             };
             let validation = config.validate_with_candidates().unwrap_err();
             let startup_error = inner
-                .begin_scan(config, CancellationToken::new(), &path, true)
+                .begin_scan(config, CancellationToken::new(), &path, true, None)
                 .unwrap_err();
             assert_eq!(
                 serde_json::to_value(startup_error).unwrap(),
@@ -1563,7 +1666,8 @@ mod lifecycle_tests {
                 config,
                 CancellationToken::new(),
                 &path.join("blocked"),
-                true
+                true,
+                None
             )
             .is_err());
         assert_eq!(serde_json::to_value(&inner.saved).unwrap(), original_state);
@@ -1781,7 +1885,7 @@ mod lifecycle_tests {
                 expected_config
             );
             assert_eq!(
-                serde_json::to_value(&restored.last_run.unwrap()).unwrap(),
+                serde_json::to_value(restored.last_run.unwrap()).unwrap(),
                 previous_history
             );
         }

@@ -42,6 +42,56 @@ function mount(context, component, props) {
   return app.state
 }
 
+test('quick boundary results can be shown under the completed download default and retested alone', async context => {
+  const samples = Array(10).fill(25)
+  const nearThreshold = candidate('104.16.0.1', {
+    regionCode: 'HK', colo: 'HKG', attempts: 1, successCount: 1, exclusionCode: 'stabilityLatency',
+    tcpStability: { requested: 10, attempted: 10, succeeded: 10, failed: 0, completed: true, probesMs: [...samples.slice(1), 234] },
+  })
+  const oneFailure = candidate('104.16.0.2', {
+    regionCode: 'HK', colo: 'HKG', attempts: 1, successCount: 1, exclusionCode: 'stabilityFailureRate',
+    tcpStability: { requested: 10, attempted: 10, succeeded: 9, failed: 1, completed: true, probesMs: [...samples.slice(1), null] },
+  })
+  const twoFailures = candidate('104.16.0.3', {
+    regionCode: 'HK', colo: 'HKG', attempts: 1, successCount: 1, exclusionCode: 'stabilityEarly',
+    tcpStability: { requested: 10, attempted: 2, succeeded: 0, failed: 2, completed: false, probesMs: [null, null] },
+  })
+  const downloaded = candidate('104.16.0.4', {
+    attempts: 5, successCount: 5, downloadMbps: 30, downloadSamplesMbps: [29, 31], measurementPassed: true, eligible: true,
+    tcpStability: { requested: 10, attempted: 10, succeeded: 10, failed: 0, completed: true, probesMs: samples },
+  })
+  const run = { ...finishedRun([nearThreshold, oneFailure, twoFailures, downloaded]), quickValidation: true }
+  const table = mount(context, AllResultsPanel, { run, savedIps: new Set(), favoriteDisabled: false })
+  assert.equal(table.retestCount.value, 2)
+  assert.deepEqual(table.filtered.value.map(row => row.result.ip), [downloaded.ip])
+  table.showRetestCandidates()
+  assert.deepEqual(table.filtered.value.map(row => row.result.ip).sort(), [nearThreshold.ip, oneFailure.ip])
+  assert.equal(table.completedDownloadOnly.value, true)
+
+  const starts = []
+  const config = { ...defaultConfig(), stabilityAttempts: 20, downloadBudgetEnabled: true, downloadBudgetMiB: 30 }
+  setWindowFixture({ async onCloseRequested() { return () => {} } })
+  setInvokeHandler(async (command, args) => {
+    if (command === 'load_state') return { config, lastRun: run }
+    if (command === 'get_scan' || command === 'get_favorite_test') return null
+    if (command === 'start_scan') {
+      starts.push(args)
+      return { ...run, id: 'single-ip-retest', retestIp: args.retestIp, config: args.config, quickValidation: false, results: [] }
+    }
+    throw new Error(`Unexpected command: ${command}`)
+  })
+  const state = mount(context, App)
+  await setImmediate()
+  await state.startFullRetest(oneFailure.ip)
+  assert.equal(starts.length, 1)
+  assert.equal(starts[0].retestIp, oneFailure.ip)
+  assert.equal(starts[0].persistConfig, false)
+  assert.equal(starts[0].config.customIps, oneFailure.ip)
+  assert.equal(starts[0].config.stabilityAttempts, 100)
+  assert.equal(starts[0].config.downloadBudgetMiB, 30)
+  assert.equal(state.config.value.stabilityAttempts, 20)
+})
+
 test('a saved star opens management without mutating any favorite', async context => {
   const result = candidate('104.16.0.1')
   const run = finishedRun([result])
@@ -68,6 +118,42 @@ test('a saved star opens management without mutating any favorite', async contex
   await state.openFavorite(result, { currentTarget: null })
   assert.deepEqual(state.favoriteTarget.value, { runId: run.id, ip: result.ip })
   assert.deepEqual(calls, [])
+})
+
+test('late command snapshots cannot roll back live scan or favorite observations', async context => {
+  let resolveScanRefresh
+  const config = defaultConfig()
+  const loadingRun = { ...finishedRun([]), status: 'running', progress: { ...finishedRun([]).progress, stage: 'connecting' } }
+  const collected = { ...loadingRun, results: [candidate('104.16.0.1', { tcpMs: 50 })],
+    progress: { ...loadingRun.progress, stage: 'downloading', downloadedBytes: 60 } }
+  let scanRequests = 0
+  setWindowFixture({ async onCloseRequested() { return () => {} } })
+  setInvokeHandler(async (command) => {
+    if (command === 'load_state') return { config }
+    if (command === 'get_favorite_test') return null
+    if (command === 'start_scan') return loadingRun
+    if (command === 'get_scan') {
+      if (scanRequests++ === 0) return null
+      return new Promise(resolve => { resolveScanRefresh = resolve })
+    }
+    throw new Error(`Unexpected command: ${command}`)
+  })
+  const app = mount(context, App)
+  await setImmediate()
+  const starting = app.startScan()
+  await setImmediate()
+  app.receiveRun(collected)
+  app.receiveProgress(app.run.value, { id: collected.id, downloadedBytes: 80 })
+  resolveScanRefresh(loadingRun)
+  await starting
+  assert.equal(app.run.value.results[0].tcpMs, 50)
+  assert.equal(app.run.value.progress.downloadedBytes, 80)
+
+  const favorites = savedLibrary(collected.results[0])
+  app.receiveFavoriteTest({ favoriteIds: ['home-entry'], run: collected })
+  app.onFavoriteTestStarted({ favorites, job: { favoriteIds: ['home-entry'], run: loadingRun } })
+  assert.equal(app.favoriteTest.value.run.results[0].tcpMs, 50)
+  assert.equal(app.favoriteTest.value.run.progress.downloadedBytes, 80)
 })
 
 test('favorite management updates or removes the selected folder entry', async context => {

@@ -1,11 +1,13 @@
 use crate::{
     favorites::{FavoriteLibrary, FavoriteTestJob},
-    history::{has_history_results, recent_runs, HistoryEntry, HistoryKind},
+    history::{
+        compare_ip, has_history_results, recent_runs, HistoryEntry, HistoryKind, HistoryMatch,
+    },
     model::{IpResult, ScanConfig, ScanProgress, ScanRun, CLOUDFLARE_CANDIDATE_COUNT},
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs, io,
     io::Write,
     path::{Path, PathBuf},
@@ -29,6 +31,8 @@ pub struct SavedState {
     pub favorite_test: Option<FavoriteTestJob>,
     #[serde(default, skip_serializing)]
     pub scan_history: Vec<HistoryEntry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub history_baselines: BTreeMap<String, HistoryEntry>,
     // On disk this field is the archive index. Once loaded, only references
     // that could not be read stay here so a settings save cannot erase them.
     #[serde(default, rename = "scanHistoryFiles", skip_serializing)]
@@ -50,6 +54,7 @@ impl Default for SavedState {
             favorites: FavoriteLibrary::default(),
             favorite_test: None,
             scan_history: Vec::new(),
+            history_baselines: BTreeMap::new(),
             unavailable_history_files: Vec::new(),
             measurement_revision: 0,
             pending_favorite_results: false,
@@ -74,6 +79,53 @@ impl SavedState {
             self.last_run.as_ref(),
             self.favorite_test.as_ref().map(|job| &job.run),
         )
+    }
+
+    pub fn history_comparison(&self, ip: &str) -> Vec<HistoryMatch> {
+        let mut matches: Vec<_> = compare_ip(self.recent_history(), ip)
+            .into_iter()
+            .map(|entry| HistoryMatch {
+                entry,
+                baseline: false,
+                baseline_only: false,
+            })
+            .collect();
+        if let Some(baseline) = self.history_baselines.get(ip) {
+            let recent = matches
+                .iter()
+                .position(|item| item.entry.run.id == baseline.run.id);
+            if let Some(index) = recent {
+                matches.remove(index);
+            }
+            matches.insert(
+                0,
+                HistoryMatch {
+                    entry: baseline.clone(),
+                    baseline: true,
+                    baseline_only: recent.is_none(),
+                },
+            );
+        }
+        matches
+    }
+
+    pub fn set_history_baseline(&mut self, ip: &str, run_id: Option<&str>) -> Result<(), String> {
+        if let Some(run_id) = run_id {
+            let source = self
+                .recent_history()
+                .into_iter()
+                .filter(|(_, run)| run.id == run_id)
+                .collect();
+            let baseline = compare_ip(source, ip)
+                .into_iter()
+                .next()
+                .filter(|entry| crate::favorites::was_attempted(&entry.run.results[0]))
+                .ok_or("该轮没有可固定的 IP 测量，或记录已移出测速历史")?;
+            self.history_baselines.insert(ip.to_owned(), baseline);
+        } else {
+            self.history_baselines.remove(ip);
+        }
+        Ok(())
     }
 
     // The latest scan and retest already live in their own state slots. Keep
@@ -267,10 +319,11 @@ pub fn load_for_startup(path: &Path) -> Result<SavedState, String> {
 }
 
 pub fn load(path: &Path) -> Result<SavedState, String> {
-    if !path.exists() {
-        return Ok(SavedState::default());
-    }
-    let bytes = fs::read(path).map_err(|e| format!("无法读取本地设置：{e}"))?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SavedState::default()),
+        Err(error) => return Err(format!("无法读取本地设置：{error}")),
+    };
     let mut json: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("本地设置格式错误：{e}"))?;
     preserve_legacy_budget(json.pointer_mut("/lastRun/config"));
@@ -348,6 +401,9 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
     saved.config.stability_first = true;
     let checkpoint = restore_checkpoint(path, &mut saved);
     if let Some(run) = saved.last_run.as_mut() {
+        if run.retest_ip.is_some() {
+            run.record_observed_regions();
+        }
         let interrupted = run.status == "running";
         if interrupted {
             run.status = "cancelled".into();
@@ -855,6 +911,7 @@ mod tests {
         unclassified.exclusion_reason = None;
         ScanRun {
             quick_validation: Some(false),
+            retest_ip: None,
             id: "legacy-run".into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),
@@ -951,6 +1008,39 @@ mod tests {
         let bytes = serde_json::to_vec(&json).unwrap();
         fs::write(path, &bytes).unwrap();
         bytes
+    }
+
+    #[test]
+    fn single_ip_retest_keeps_valid_measurements_outside_the_original_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut run = legacy_run();
+        let mut result = run.results.swap_remove(1);
+        result.tcp_ms = 40.0;
+        result.tcp_stability = Some(crate::stability::summarize(
+            100,
+            200.0,
+            vec![Some(45.0); 100],
+        ));
+        result.measurement_passed = true;
+        assert_eq!(result.region_code, "JP");
+        assert!(result.has_complete_measurement(&run.config));
+        run.retest_ip = Some(result.ip.clone());
+        run.config.regions = vec!["HK".into()];
+        run.results = vec![result];
+        save(
+            &path,
+            &SavedState {
+                last_run: Some(run),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let restored = load(&path).unwrap().last_run.unwrap();
+        assert_eq!(restored.config.regions, ["HK", "JP"]);
+        assert!(restored.results[0].measurement_passed);
+        assert!(restored.results[0].eligible);
     }
 
     #[test]
@@ -1177,10 +1267,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("custom-coverage.json");
         for (source, cap) in [("custom", 1024), ("cloudflare", 2048)] {
-            let mut state = SavedState::default();
-            state.candidate_coverage_version = 0;
-            state.config.source = source.into();
-            state.config.max_candidates = cap;
+            let state = SavedState {
+                candidate_coverage_version: 0,
+                config: ScanConfig {
+                    source: source.into(),
+                    max_candidates: cap,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
             save(&path, &state).unwrap();
             let restored = load(&path).unwrap();
             assert_eq!(restored.config.max_candidates, cap);

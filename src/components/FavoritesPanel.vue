@@ -335,7 +335,7 @@ onBeforeUnmount(() => {
               <div><dt>HTTPS 服务校验</dt><dd>成功 {{ entry.result.successCount }} / 已测 {{ entry.result.attempts }} · 计划 {{ entry.config.verificationAttempts }} 次</dd></div><div><dt>HTTPS 首响波动</dt><dd>{{ entry.result.successCount ? `${favoriteNumber(entry.result.jitterMs)} ms` : '尚无成功数据' }}</dd></div>
               <div><dt>下载样本</dt><dd>{{ entry.result.downloadSamplesMbps.length ? entry.result.downloadSamplesMbps.map(favoriteNumber).join(' / ') + ' Mbps' : '尚无下载样本' }}</dd></div><div><dt>下载计划</dt><dd>{{ entry.config.downloadRounds }} 轮 × {{ entry.config.downloadSeconds }} 秒 · {{ downloadBudgetLabel(entry.config) }}</dd></div>
               <div><dt>HTTPS 请求超时</dt><dd>{{ entry.config.requestTimeoutMs }} ms</dd></div>
-              <template v-if="entry.networkPath"><div><dt>测试网络接口</dt><dd>{{ entry.networkPath.interfaceName }}{{ entry.networkPath.tunnelInterface ? ' · 隧道接口' : '' }}</dd></div><div><dt>网络路径采样</dt><dd>{{ entry.networkPath.sampleIp }} · {{ favoriteDate(entry.networkPath.capturedAt) }}</dd></div></template>
+              <template v-if="entry.networkPath"><div><dt>测试网络接口</dt><dd>{{ entry.networkPath.interfaceName }}{{ entry.networkPath.tunnelInterface ? ' · 隧道接口' : '' }}</dd></div><div><dt>网络路径采样</dt><dd>{{ entry.networkPath.sampleIp }}{{ entry.networkPath.sampleIp === entry.result.ip ? '（本 IP）' : '（其他 IP）' }} · {{ favoriteDate(entry.networkPath.capturedAt) }}</dd></div></template>
               <div class="favorite-full"><dt>测试记录 ID</dt><dd class="mono">{{ entry.runId }}</dd></div>
             </dl>
               </section></td></tr>

@@ -3,7 +3,10 @@ use crate::{
     network::NetworkPath,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::Ipv4Addr};
+use std::{
+    collections::{HashMap, HashSet},
+    net::Ipv4Addr,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,15 +42,7 @@ impl FavoriteTestJob {
     /// The targeted engine accepts observed countries outside the discovery
     /// filter. Record those countries alongside the evidence for later gating.
     pub fn record_observed_regions(&mut self) {
-        for result in &self.run.results {
-            let region = &result.region_code;
-            if region.len() == 2
-                && region.bytes().all(|byte| byte.is_ascii_uppercase())
-                && !self.run.config.regions.contains(region)
-            {
-                self.run.config.regions.push(region.clone());
-            }
-        }
+        self.run.record_observed_regions();
     }
 
     pub fn interrupt(&mut self, message: &str) {
@@ -211,7 +206,7 @@ impl FavoriteLibrary {
             config: run.config.clone(),
             result: result.clone(),
             targeted: false,
-            network_path: run.progress.network_path.clone(),
+            network_path: run.path_for(result),
         };
         if let Some(index) = existing {
             self.entries[index] = snapshot;
@@ -342,22 +337,29 @@ impl FavoriteLibrary {
                 return Err("请选择一个收藏记录、一个收藏夹，或在收藏夹中输入一个 IPv4 地址".into())
             }
         };
+        if favorite_ids.len() > 10_000 {
+            return Err("一次最多测试 10000 个收藏 IP，请拆分收藏夹后重试".into());
+        }
         let ips = if let Some((_, ip, _)) = &manual_target {
             vec![*ip]
         } else {
+            let entries: HashMap<_, _> = self
+                .entries
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.result.ip.as_str()))
+                .collect();
             favorite_ids
                 .iter()
                 .map(|id| {
-                    let entry = self.entries.iter().find(|entry| &entry.id == id).unwrap();
-                    checked_ipv4(&entry.result.ip)
+                    let address = entries
+                        .get(id.as_str())
+                        .ok_or("收藏记录不存在，请刷新后重试")?;
+                    checked_ipv4(address)
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
         if ips.is_empty() {
             return Err("这个收藏夹还没有 IP，请先手动添加或收藏测试结果".into());
-        }
-        if ips.len() > 10_000 {
-            return Err("一次最多测试 10000 个收藏 IP，请拆分收藏夹后重试".into());
         }
         let mut seen = HashSet::new();
         if ips.iter().any(|ip| !seen.insert(*ip)) {
@@ -441,20 +443,17 @@ impl FavoriteLibrary {
         let mut snapshot_config = job.run.config.clone();
         snapshot_config.source = "custom".into();
         snapshot_config.custom_ips = String::new();
-        for favorite_id in &job.favorite_ids {
-            let Some(entry) = self
-                .entries
-                .iter_mut()
-                .find(|entry| &entry.id == favorite_id)
-            else {
-                continue;
-            };
-            let Some(result) = job
-                .run
-                .results
-                .iter()
-                .find(|result| result.ip == entry.result.ip)
-            else {
+        let target_ids: HashSet<_> = job.favorite_ids.iter().map(String::as_str).collect();
+        let mut results_by_ip = HashMap::new();
+        for result in &job.run.results {
+            results_by_ip.entry(result.ip.as_str()).or_insert(result);
+        }
+        for entry in self
+            .entries
+            .iter_mut()
+            .filter(|entry| target_ids.contains(entry.id.as_str()))
+        {
+            let Some(&result) = results_by_ip.get(entry.result.ip.as_str()) else {
                 continue;
             };
             let is_new_placeholder = entry.run_id == job.run.id && entry.run_status == "running";
@@ -471,7 +470,7 @@ impl FavoriteLibrary {
             };
             entry.result = result.clone();
             entry.targeted = true;
-            entry.network_path = job.run.progress.network_path.clone();
+            entry.network_path = job.run.path_for(result);
         }
     }
 }
@@ -523,6 +522,7 @@ mod tests {
         ));
         ScanRun {
             quick_validation: Some(false),
+            retest_ip: None,
             id: "original-run".into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),
@@ -981,10 +981,15 @@ mod tests {
         job.run.results[0].region_code = "HK".into();
         job.run.results[1].tcp_ms = 25.0;
         job.run.results[1].region_code = "JP".into();
+        let mut second_path = job.run.progress.network_path.clone().unwrap();
+        second_path.sample_ip.clone_from(&job.run.results[1].ip);
+        second_path.interface_name = "en7".into();
+        second_path.interface_kind = Some(crate::network::InterfaceKind::Wired);
+        job.run.results[1].network_path = Some(second_path);
         job.interrupt("cancelled after both IPs were attempted");
         favorites.apply_test_results(&job);
 
-        for entry in &favorites.entries[1..] {
+        for (entry, interface) in favorites.entries[1..].iter().zip(["en0", "en7"]) {
             let mut expected_config = job.run.config.clone();
             expected_config.custom_ips = entry.result.ip.clone();
             assert_eq!(
@@ -995,7 +1000,10 @@ mod tests {
             assert!(entry.config.regions.iter().any(|region| region == "JP"));
             assert_eq!(entry.run_status, "cancelled");
             assert_eq!(entry.note, "keep");
-            assert_eq!(entry.network_path.as_ref().unwrap().interface_name, "en0");
+            assert_eq!(
+                entry.network_path.as_ref().unwrap().interface_name,
+                interface
+            );
         }
         assert_eq!(
             serde_json::to_value(&favorites.entries[0]).unwrap(),

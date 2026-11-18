@@ -48,7 +48,7 @@ const DOWNLOAD_CANDIDATES_PER_REGION: usize = 10;
 #[derive(Debug, Clone)]
 pub struct EngineUpdate {
     pub progress: ScanProgress,
-    pub results: Vec<IpResult>,
+    pub results: Arc<Vec<IpResult>>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,9 +66,10 @@ pub type UpdateCallback = Arc<dyn Fn(EngineUpdate) + Send + Sync>;
 pub(crate) struct PreparedScan {
     config: ScanConfig,
     ips: Vec<Ipv4Addr>,
+    scope: ScanScope,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanScope {
     Regional,
     Targeted,
@@ -78,17 +79,38 @@ struct State {
     progress: ScanProgress,
     results: Vec<IpResult>,
     last_event: Instant,
+    last_emitted_results: Option<Arc<Vec<IpResult>>>,
 }
 
 impl State {
     fn emit(&mut self, callback: &UpdateCallback, force: bool) {
         if force || self.last_event.elapsed() >= EVENT_INTERVAL {
-            callback(EngineUpdate {
-                progress: self.progress.clone(),
-                results: self.results.clone(),
-            });
-            self.last_event = Instant::now();
+            let results = Arc::new(self.results.clone());
+            self.last_emitted_results = Some(results.clone());
+            self.send_update(callback, results);
         }
+    }
+
+    /// Use only between emissions that bracket a download body read. Rows
+    /// cannot change in this interval. A coalesced update retains its snapshot.
+    fn emit_download_bytes(&mut self, callback: &UpdateCallback, downloaded_bytes: u64) {
+        if downloaded_bytes == self.progress.downloaded_bytes
+            || self.last_event.elapsed() < EVENT_INTERVAL
+        {
+            return;
+        }
+        self.progress.downloaded_bytes = downloaded_bytes;
+        if let Some(results) = self.last_emitted_results.clone() {
+            self.send_update(callback, results);
+        }
+    }
+
+    fn send_update(&mut self, callback: &UpdateCallback, results: Arc<Vec<IpResult>>) {
+        callback(EngineUpdate {
+            progress: self.progress.clone(),
+            results,
+        });
+        self.last_event = Instant::now();
     }
 
     fn stage(&mut self, stage: &str, total: usize, message: String, callback: &UpdateCallback) {
@@ -163,7 +185,23 @@ pub(crate) fn prepare_scan(config: ScanConfig) -> Result<PreparedScan, ScanComma
         Some(candidates) => sample_custom_candidates(candidates, config.max_candidates)?,
         None => sample_cloudflare(config.max_candidates)?,
     };
-    Ok(PreparedScan { config, ips })
+    Ok(PreparedScan {
+        config,
+        ips,
+        scope: ScanScope::Regional,
+    })
+}
+
+pub(crate) fn prepare_ip_retest(
+    config: ScanConfig,
+    ip: Ipv4Addr,
+) -> Result<PreparedScan, ScanCommandError> {
+    config.validate_with_candidates()?;
+    Ok(PreparedScan {
+        config,
+        ips: vec![ip],
+        scope: ScanScope::Targeted,
+    })
 }
 
 /// Execute exactly the candidates that were accepted before the scan was saved.
@@ -172,8 +210,8 @@ pub(crate) async fn run_prepared_scan(
     cancellation: CancellationToken,
     callback: UpdateCallback,
 ) -> Result<EngineOutcome, String> {
-    let PreparedScan { config, ips } = prepared;
-    run_candidates(config, ips, ScanScope::Regional, cancellation, callback).await
+    let PreparedScan { config, ips, scope } = prepared;
+    run_candidates(config, ips, scope, cancellation, callback).await
 }
 
 /// Measure exactly the supplied addresses without applying discovery sampling,
@@ -218,38 +256,62 @@ async fn run_candidates(
         progress: ScanProgress {
             total: ips.len(),
             discovered_by_region: config.regions.iter().map(|r| (r.clone(), 0)).collect(),
-            network_path: crate::network::capture(ips[0]),
+            network_path: if scope == ScanScope::Regional {
+                crate::network::capture(ips[0])
+            } else {
+                None
+            },
             ..Default::default()
         },
         results: ips.iter().map(|ip| IpResult::new(*ip)).collect(),
         last_event: Instant::now(),
+        last_emitted_results: None,
     };
     state.stage(
         "connecting",
         ips.len(),
         if scope == ScanScope::Targeted {
-            format!("TCP 连接检查：{} 个指定收藏 IPv4", ips.len())
+            format!("TCP 连接检查：{} 个指定 IPv4", ips.len())
         } else {
             format!("TCP 连接筛选：{} 个抽样 IPv4", ips.len())
         },
         &callback,
     );
+    // Bound concurrent route queries. macOS runs one OS process per query.
+    let route_queries = tokio::sync::Semaphore::new(4);
     let tcp = stream::iter(ips.iter().copied().enumerate().map(|(index, ip)| {
         let deadline = Duration::from_millis(config.connect_timeout_ms);
+        let route_queries = &route_queries;
         async move {
-            (
-                index,
-                isolated_tcp_probe(SocketAddr::new(IpAddr::V4(ip), port), deadline).await,
-            )
+            let path = if scope == ScanScope::Targeted {
+                let _permit = route_queries
+                    .acquire()
+                    .await
+                    .expect("route limiter stays open");
+                tokio::task::spawn_blocking(move || crate::network::capture(ip))
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+            let outcome = isolated_tcp_probe(SocketAddr::new(IpAddr::V4(ip), port), deadline).await;
+            (index, path, outcome)
         }
     }))
     .buffer_unordered(config.tcp_concurrency);
     tokio::pin!(tcp);
-    while let Some((index, outcome)) = tokio::select! {
+    while let Some((index, path, outcome)) = tokio::select! {
         biased;
         _ = cancellation.cancelled() => { return Ok(state.cancel(&config, &callback)); }
         next = tcp.next() => next
     } {
+        if scope == ScanScope::Targeted {
+            if index == 0 {
+                state.progress.network_path = path.clone();
+            }
+            state.results[index].network_path = path;
+        }
         match outcome {
             Ok(ms) => apply_tcp_measurement(&mut state.results[index], ms, &config),
             Err(failure) => {
@@ -414,7 +476,7 @@ async fn run_candidates(
         download_candidates.len(),
         if scope == ScanScope::Targeted {
             format!(
-                "TCP 稳定性已全部结束，验证全部通过稳定性检查的收藏 IP：每个 IP 共验证 {} 次 HTTPS",
+                "TCP 稳定性已全部结束，验证全部通过稳定性检查的指定 IP：每个 IP 共验证 {} 次 HTTPS",
                 config.verification_attempts
             )
         } else {
@@ -459,9 +521,9 @@ async fn run_candidates(
         schedule.remaining_rounds,
         if scope == ScanScope::Targeted {
             if config.download_budget_enabled {
-                "对全部验证通过的收藏 IP 进行下载复测，共享本轮下载预算".into()
+                "对全部验证通过的指定 IP 进行下载复测，共享本轮下载预算".into()
             } else {
-                "对全部验证通过的收藏 IP 进行下载复测，不限制下载流量".into()
+                "对全部验证通过的指定 IP 进行下载复测，不限制下载流量".into()
             }
         } else {
             format!("各区仅对稳定性择优的前 {DOWNLOAD_CANDIDATES_PER_REGION} 个进行下载复测")
@@ -515,8 +577,7 @@ async fn run_candidates(
                 }
                 result = &mut download => break result,
                 _ = ticker.tick() => {
-                    state.progress.downloaded_bytes = used + counter.load(std::sync::atomic::Ordering::Relaxed);
-                    state.emit(&callback, false);
+                    state.emit_download_bytes(&callback, used + counter.load(std::sync::atomic::Ordering::Relaxed));
                 }
             }
         };
@@ -572,7 +633,7 @@ async fn run_candidates(
             .filter(|item| item.measurement_passed)
             .count();
         format!(
-            "收藏 IP 测试完成，{passed} / {} 个通过完整测量",
+            "指定 IP 测试完成，{passed} / {} 个通过测量",
             state.results.len()
         )
     } else if available == 0 {
@@ -1522,7 +1583,7 @@ fn median(samples: &[f64]) -> f64 {
     }
     let mut sorted = samples.to_vec();
     sorted.sort_by(f64::total_cmp);
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
     } else {
         sorted[sorted.len() / 2]
@@ -1756,6 +1817,34 @@ fn weighted_network_quotas(weights: &[usize], total: usize) -> Vec<usize> {
 }
 
 #[cfg(test)]
+async fn read_http_fixture_headers(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error, ErrorKind};
+    use tokio::io::AsyncReadExt;
+
+    let mut request = Vec::new();
+    let mut buffer = [0; 2048];
+    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+        let length = stream.read(&mut buffer).await?;
+        if length == 0 {
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "client closed before sending HTTP headers",
+            ));
+        }
+        request.extend_from_slice(&buffer[..length]);
+        if request.len() > 16 * 1024 {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "oversized request headers",
+            ));
+        }
+    }
+    Ok(request)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1793,6 +1882,7 @@ mod tests {
             progress: ScanProgress::default(),
             results: rows,
             last_event: Instant::now(),
+            last_emitted_results: None,
         }
     }
 
@@ -2655,14 +2745,11 @@ mod tests {
 
     #[tokio::test]
     async fn download_waiting_for_headers_uses_only_the_request_timeout() {
-        use tokio::io::AsyncReadExt;
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            read_http_fixture_headers(&mut socket).await.unwrap();
             std::future::pending::<()>().await;
         });
         let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2693,14 +2780,13 @@ mod tests {
 
     #[tokio::test]
     async fn unlimited_downloads_read_slow_unknown_lengths_until_the_independent_body_deadline() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            read_http_fixture_headers(&mut socket).await.unwrap();
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nCF-Ray: abc-HKG\r\n\r\n")
                 .await
@@ -2745,14 +2831,13 @@ mod tests {
 
     #[tokio::test]
     async fn budgeted_download_rejects_an_unknown_length_before_reading_the_body() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            read_http_fixture_headers(&mut socket).await.unwrap();
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
                 .await
@@ -2802,7 +2887,7 @@ mod tests {
                 vec![0, 10, 20, 30, 0, 10, 20, 30, 1, 11, 21, 31, 1, 11, 21, 31],
                 32,
             ),
-            (5, vec![0, 10, 20].repeat(5), 37),
+            (5, [0, 10, 20].repeat(5), 37),
         ] {
             let mut queue = DownloadQueue::new(&groups, &order, rounds);
             let mut samples = Vec::new();
@@ -2837,16 +2922,16 @@ mod tests {
             .map(|(index, region)| (region, vec![index]))
             .collect();
         let mut queue = DownloadQueue::new(&groups, &order, 5);
-        let total = Some(1024 * 1024);
+        let total = 1024 * 1024;
         assert!(matches!(
-            queue.next(total, 0),
+            queue.next(Some(total), 0),
             Some(DownloadSlot::Round { index: 0, .. })
         ));
         assert_eq!(queue.skip_remaining_rounds(0), 4);
 
         let mut used = 0;
         let mut samples = Vec::new();
-        while let Some(slot) = queue.next(total, used) {
+        while let Some(slot) = queue.next(Some(total), used) {
             let DownloadSlot::Round {
                 index,
                 allowance: Some(bytes),
@@ -2859,7 +2944,7 @@ mod tests {
             samples.push(index);
         }
         assert_eq!(samples, [[1, 2].repeat(5), vec![3; 5]].concat());
-        assert_eq!(used, total.unwrap());
+        assert_eq!(used, total);
     }
 
     #[test]
@@ -3353,6 +3438,7 @@ mod tests {
             },
             results: vec![row],
             last_event: Instant::now(),
+            last_emitted_results: None,
         };
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         sender
@@ -3396,6 +3482,7 @@ mod tests {
             },
             results: vec![row],
             last_event: Instant::now(),
+            last_emitted_results: None,
         };
         let mut rejected = crate::stability::summarize(100, 230.0, vec![None, None]);
         rejected.early_rejection =
@@ -3438,6 +3525,7 @@ mod tests {
             },
             results: vec![IpResult::new(Ipv4Addr::new(192, 0, 2, 1))],
             last_event: Instant::now(),
+            last_emitted_results: None,
         };
         let callback: UpdateCallback = Arc::new(|_| {});
         for stage in ["verifying", "stabilizing", "downloading"] {
@@ -3457,6 +3545,7 @@ mod tests {
             progress: Default::default(),
             results: vec![previous, second, third],
             last_event: Instant::now(),
+            last_emitted_results: None,
         };
         let emitted = Arc::new(std::sync::Mutex::new(Vec::<EngineUpdate>::new()));
         let captured = emitted.clone();
@@ -3755,7 +3844,7 @@ mod tests {
         let ms = measure_tcp_connect(listener.local_addr().unwrap(), Duration::from_secs(1))
             .await
             .unwrap();
-        assert!(ms.is_finite() && ms >= 0.0 && ms < 1000.0);
+        assert!((0.0..1000.0).contains(&ms));
     }
 
     #[tokio::test]
@@ -3832,7 +3921,7 @@ mod tests {
 #[cfg(test)]
 mod tls_tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     use tokio_rustls::{
         rustls::{self, pki_types::PrivatePkcs8KeyDer},
         TlsAcceptor,
@@ -3908,18 +3997,7 @@ mod tls_tests {
                 let (socket, _) = listener.accept().await.map_err(|e| e.to_string())?;
                 let mut tls = acceptor.accept(socket).await.map_err(|e| e.to_string())?;
                 let sni = tls.get_ref().1.server_name().map(str::to_owned);
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 2048];
-                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    let length = tls.read(&mut buffer).await.map_err(|e| e.to_string())?;
-                    if length == 0 {
-                        return Err("client closed before sending HTTP headers".to_string());
-                    }
-                    request.extend_from_slice(&buffer[..length]);
-                    if request.len() > 16 * 1024 {
-                        return Err("oversized request headers".to_string());
-                    }
-                }
+                let request = read_http_fixture_headers(&mut tls).await.map_err(|e| e.to_string())?;
                 let request = String::from_utf8(request).map_err(|e| e.to_string())?;
                 let response = if redirect {
                     "HTTP/1.1 302 Found\r\nLocation: https://redirect-target.invalid/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()

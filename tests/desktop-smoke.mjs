@@ -21,16 +21,18 @@ assert.ok(executable, 'desktop smoke executable not found')
 
 const directory = await mkdtemp(join(tmpdir(), 'ip-picker-smoke-'))
 const statePath = join(directory, 'state.json')
+const performanceMode = process.argv.includes('--performance')
 try {
   const config = { source: 'custom', customIps: '127.0.0.1', maxCandidates: 1, regions: ['HK', 'JP'] }
   const oldTime = '2026-10-01T00:00:00Z'
-  await writeFile(statePath, JSON.stringify({
+  const initialState = JSON.stringify({
     config,
     lastRun: null,
     favoriteTest: {
       favoriteIds: [],
       run: {
-        id: 'previous-favorite-test', status: 'completed', startedAt: oldTime, finishedAt: oldTime, config,
+        id: 'previous-favorite-test', status: 'completed', startedAt: oldTime, finishedAt: oldTime,
+        config: { ...config, stabilityAttempts: 110, downloadBudgetEnabled: false },
         progress: {
           stage: 'completed', completed: 1, total: 1, downloadedBytes: 0, discoveredByRegion: { HK: 1 }, message: '收藏复测完成',
           networkPath: { sampleIp: '127.0.0.1', interfaceName: 'en8', interfaceKind: 'wired', tunnelInterface: false, capturedAt: oldTime },
@@ -42,9 +44,11 @@ try {
         }],
       },
     },
-  }))
+  })
+  await writeFile(statePath, initialState)
 
-  for (const phase of ['exercise', 'reopen']) {
+  for (const phase of performanceMode ? ['performance-1000', 'performance-10000'] : ['exercise', 'reopen']) {
+    if (performanceMode) await writeFile(statePath, initialState)
     const app = spawnSync(executable, [], {
       cwd: root,
       encoding: 'utf8',
@@ -60,19 +64,31 @@ try {
 
     const saved = JSON.parse(await readFile(statePath, 'utf8'))
     assert.equal(saved.lastRun.status, 'cancelled')
-    assert.equal(saved.lastRun.config.stabilityAttempts, 10)
+    if (performanceMode) {
+      const metrics = JSON.parse(app.stdout.match(/^desktop smoke metrics (.+)$/m)?.[1] ?? 'null')
+      assert.ok(metrics && metrics.downloadUpdateBytes < 128)
+      assert.equal(saved.lastRun.results.length, metrics.candidates)
+      assert.ok(saved.lastRun.progress.downloadedBytes > 0)
+      continue
+    }
+    assert.equal(saved.lastRun.config.stabilityAttempts, phase === 'exercise' ? 10 : 110)
     assert.equal(saved.lastRun.config.downloadBudgetEnabled, false)
     assert.equal(saved.lastRun.config.downloadBudgetMiB, saved.config.downloadBudgetMiB)
     assert.deepEqual(saved.config.regions, ['HK'])
     assert.equal(saved.config.stabilityAttempts, 100)
     assert.equal(saved.config.downloadBudgetEnabled, false)
     assert.equal(saved.favorites.entries.length, 2)
-    assert.equal(saved.lastRun.quickValidation, true)
+    assert.equal(saved.lastRun.quickValidation, phase === 'exercise')
+    assert.equal(saved.historyBaselines['127.0.0.1'].run.id, 'previous-favorite-test')
     const untested = saved.favorites.entries.find(entry => entry.result.ip === '127.0.0.2')
     assert.equal(untested.runId, '')
     assert.equal(untested.note, '等待期间整理的备注')
     const entry = saved.favorites.entries.find(entry => entry.result.ip === '127.0.0.1')
-    assert.equal(entry.runId, saved.lastRun.id)
+    if (phase === 'exercise') assert.equal(entry.runId, saved.lastRun.id)
+    else {
+      assert.equal(saved.lastRun.retestIp, '127.0.0.1')
+      assert.notEqual(entry.runId, saved.lastRun.id)
+    }
     assert.equal(entry.result.ip, '127.0.0.1')
     assert.equal(entry.result.exclusionCode, 'cancelled')
     assert.equal(entry.note, '桌面冒烟收藏备注')

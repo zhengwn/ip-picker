@@ -504,6 +504,8 @@ pub enum ExclusionCode {
 #[serde(rename_all = "camelCase")]
 pub struct IpResult {
     pub ip: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_path: Option<crate::network::NetworkPath>,
     pub region_code: String,
     pub city: String,
     pub colo: String,
@@ -537,6 +539,7 @@ impl IpResult {
     pub fn new(ip: std::net::Ipv4Addr) -> Self {
         Self {
             ip: ip.to_string(),
+            network_path: None,
             region_code: "UNKNOWN".into(),
             city: String::new(),
             colo: String::new(),
@@ -885,6 +888,8 @@ pub struct ScanRun {
     /// Explicit run identity; missing legacy mode must not be guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quick_validation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retest_ip: Option<String>,
     pub status: String,
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -894,6 +899,27 @@ pub struct ScanRun {
     pub results: Vec<IpResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+impl ScanRun {
+    pub(crate) fn record_observed_regions(&mut self) {
+        for result in &self.results {
+            let region = &result.region_code;
+            if region.len() == 2
+                && region.bytes().all(|byte| byte.is_ascii_uppercase())
+                && !self.config.regions.contains(region)
+            {
+                self.config.regions.push(region.clone());
+            }
+        }
+    }
+
+    pub(crate) fn path_for(&self, result: &IpResult) -> Option<crate::network::NetworkPath> {
+        result
+            .network_path
+            .clone()
+            .or_else(|| self.progress.network_path.clone())
+    }
 }
 
 #[cfg(test)]
