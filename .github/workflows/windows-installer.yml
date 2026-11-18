@@ -1,0 +1,111 @@
+name: Build Windows installer
+run-name: Windows x64 installer for ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      IP_PICKER_RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Check the release version
+        run: |
+          $Version = (Get-Content -Raw 'src-tauri/tauri.conf.json' | ConvertFrom-Json).version
+          if ("v$Version" -cne $env:IP_PICKER_RELEASE_TAG) {
+            throw "The release tag must match the application version v$Version."
+          }
+          Write-Host "Building $env:IP_PICKER_RELEASE_TAG from $(git rev-parse HEAD)"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build the x64 release installer
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc --bundles nsis --ci -- --locked
+      - name: Verify and stage the installer
+        run: |
+          $Version = (Get-Content -Raw 'src-tauri/tauri.conf.json' | ConvertFrom-Json).version
+          $BundleDir = 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis'
+          $Installers = @(Get-ChildItem -LiteralPath $BundleDir -Filter '*-setup.exe' -File)
+          if ($Installers.Count -ne 1) {
+            throw "Expected one NSIS installer, found $($Installers.Count)."
+          }
+          $Installer = $Installers[0].FullName
+          $InstallDir = Join-Path $env:RUNNER_TEMP "ip-picker-install-$env:GITHUB_RUN_ID"
+          $InstalledApp = Join-Path $InstallDir 'ip-picker.exe'
+          $Installation = Start-Process -FilePath $Installer -ArgumentList "/S /D=$InstallDir" -Wait -PassThru
+          if ($Installation.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $InstalledApp)) {
+            throw "NSIS installation failed with exit code $($Installation.ExitCode)."
+          }
+
+          $AppFile = Get-Item -LiteralPath $InstalledApp
+          if ($AppFile.VersionInfo.ProductVersion -cne $Version) {
+            throw "Expected installed product version $Version, found $($AppFile.VersionInfo.ProductVersion)."
+          }
+          $Image = [IO.File]::ReadAllBytes($InstalledApp)
+          $PeOffset = [BitConverter]::ToInt32($Image, 0x3c)
+          if ([BitConverter]::ToUInt32($Image, $PeOffset) -ne 0x4550 -or
+              [BitConverter]::ToUInt16($Image, $PeOffset + 4) -ne 0x8664) {
+            throw 'The installed application is not an x64 PE executable.'
+          }
+
+          $AppProcess = Start-Process -FilePath $InstalledApp -WorkingDirectory $InstallDir -PassThru
+          try {
+            $Startup = [Diagnostics.Stopwatch]::StartNew()
+            while (-not $AppProcess.HasExited -and
+                   $AppProcess.MainWindowHandle -eq [IntPtr]::Zero -and
+                   $Startup.Elapsed.TotalSeconds -lt 30) {
+              Start-Sleep -Milliseconds 250
+              $AppProcess.Refresh()
+            }
+            if ($AppProcess.HasExited -or $AppProcess.MainWindowHandle -eq [IntPtr]::Zero) {
+              throw 'The installed application did not open a window.'
+            }
+            [void]$AppProcess.CloseMainWindow()
+            if (-not $AppProcess.WaitForExit(10000) -or $AppProcess.ExitCode -ne 0) {
+              throw 'The installed application did not close cleanly.'
+            }
+          } finally {
+            if (-not $AppProcess.HasExited) {
+              Stop-Process -Id $AppProcess.Id
+            }
+          }
+
+          $Uninstaller = Join-Path $InstallDir 'uninstall.exe'
+          $Uninstallation = Start-Process -FilePath $Uninstaller -ArgumentList '/S' -Wait -PassThru
+          if ($Uninstallation.ExitCode -ne 0 -or (Test-Path -LiteralPath $InstalledApp)) {
+            throw "NSIS uninstallation failed with exit code $($Uninstallation.ExitCode)."
+          }
+          Write-Host "IP Picker $Version x64 installed, opened, closed, and uninstalled successfully."
+
+          New-Item -ItemType Directory -Path 'release-assets' | Out-Null
+          $AssetName = "IP-Picker-$Version-Windows-x64-setup.exe"
+          $AssetPath = Join-Path 'release-assets' $AssetName
+          Copy-Item -LiteralPath $Installer -Destination $AssetPath
+          $Digest = (Get-FileHash -LiteralPath $AssetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$AssetPath.sha256" -Value "$Digest  $AssetName" -Encoding ascii
+          Write-Host "Installer signature status is $((Get-AuthenticodeSignature -FilePath $AssetPath).Status)."
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ip-picker-${{ inputs.tag }}-windows-x64
+          path: release-assets/
+          if-no-files-found: error
