@@ -148,22 +148,32 @@ pub(crate) async fn run_prepared_scan(
     let results = std::sync::Arc::new(results);
     callback(EngineUpdate {
         progress: progress.clone(),
-        results: results.clone(),
+        results: Some(results.clone()),
+        changed_rows: BTreeMap::new(),
     });
+    let mut results = std::sync::Arc::unwrap_or_clone(results);
     if candidate_count > 1 {
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(175)) => {
                     progress.downloaded_bytes += 1024 * 1024;
-                    callback(EngineUpdate { progress: progress.clone(), results: results.clone() });
+                    let changed_rows = if progress.downloaded_bytes == 2 * 1024 * 1024 {
+                        results[0].download_samples_mbps.push(20.0);
+                        results[0].download_mbps = 20.0;
+                        progress.completed = 1;
+                        progress.message = "下载复测 127.0.0.1 · 第 2 轮".into();
+                        BTreeMap::from([(0, results[0].clone())])
+                    } else {
+                        BTreeMap::new()
+                    };
+                    callback(EngineUpdate { progress: progress.clone(), results: None, changed_rows });
                 }
             }
         }
     } else {
         cancellation.cancelled().await;
     }
-    let mut results = std::sync::Arc::unwrap_or_clone(results);
     results[0].exclude(ExclusionCode::Cancelled, "测试已停止，已保留样本");
     progress.stage = "cancelled".into();
     Ok(EngineOutcome {

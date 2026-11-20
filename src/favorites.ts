@@ -18,6 +18,7 @@ export interface FavoriteEntry {
   runFinishedAt?: string | null
   config: ScanConfig
   result: IpResult
+  candidateListId?: string | null
   networkPath?: NetworkPathSnapshot | null
   /** This snapshot was produced by explicitly testing saved IPs. */
   targeted?: boolean
@@ -34,6 +35,7 @@ export interface FavoriteLibrary {
   revision?: number
   folders: FavoriteFolder[]
   entries: FavoriteEntry[]
+  candidateLists?: Record<string, string>
 }
 
 /** Late events and command replies must not roll back a newer saved library. */
@@ -58,6 +60,8 @@ export interface FavoriteTestBaseline {
   config: ScanConfig
   networkPath?: NetworkPathSnapshot | null
   colo: string
+  observedColos?: string[]
+  downloadPopComplete?: boolean
   measurementPassed: boolean
   tcpP95Ms: number | null
   downloadMbps: number | null
@@ -66,8 +70,29 @@ export interface FavoriteTestBaseline {
 const comparisonFields: (keyof ScanConfig)[] = ['targetUrl', 'connectTimeoutMs', 'requestTimeoutMs', 'tcpConcurrency', 'stabilityAttempts', 'stabilityIntervalMs', 'stabilityLatencyMetric', 'maxTcpMs', 'maxStabilityFailurePercent', 'tcpLatencyScreening', 'stabilityFirst', 'verificationAttempts', 'downloadRounds', 'downloadSeconds', 'downloadBudgetEnabled', 'downloadBudgetMiB']
 const downloadComparisonFields: (keyof ScanConfig)[] = ['targetUrl', 'connectTimeoutMs', 'requestTimeoutMs', 'downloadRounds', 'downloadSeconds', 'downloadBudgetEnabled', 'downloadBudgetMiB']
 export const indirectRouteWarning = '部分接口来自其他 IP 的采样'
+export const mixedPopWarning = '观测到多个接入机房'
+export const incompletePopWarning = '接入机房未完整记录'
 
-export function comparisonContextDifferences(before: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, after: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, ip?: string, downloadOnly = false): string[] {
+interface ComparisonContext {
+  config: ScanConfig
+  networkPath?: NetworkPathSnapshot | null
+  colo: string
+  observedColos?: readonly string[]
+  downloadPopComplete?: boolean
+}
+
+export function downloadPopComplete(result?: IpResult, downloadOnly = false): boolean | undefined {
+  if (!result?.downloadSamplesMbps.length) return undefined
+  if (!downloadOnly) {
+    return result.exclusionCode
+      ? result.exclusionCode !== 'popRecheckIncomplete' && result.exclusionCode !== 'popRecheckFailure'
+      : !result.exclusionReason?.startsWith('下载后的 POP 复核')
+  }
+  const colos = result.downloadSampleColos
+  return colos?.length === result.downloadSamplesMbps.length && colos.every(Boolean)
+}
+
+export function comparisonContextDifferences(before: ComparisonContext, after: ComparisonContext, ip?: string, downloadOnly = false): string[] {
   const differences: string[] = []
   const fields = downloadOnly ? downloadComparisonFields : comparisonFields
   if (fields.some(field => !(field === 'downloadBudgetMiB' && before.config.downloadBudgetEnabled === false && after.config.downloadBudgetEnabled === false) && before.config[field] !== after.config[field])) differences.push('测速参数不同')
@@ -77,7 +102,16 @@ export function comparisonContextDifferences(before: { config: ScanConfig; netwo
   else if (ip && (previousPath.sampleIp !== ip || currentPath.sampleIp !== ip)) differences.push(indirectRouteWarning)
   else if (previousPath.interfaceName !== currentPath.interfaceName || previousPath.tunnelInterface !== currentPath.tunnelInterface
     || (previousPath.interfaceKind && currentPath.interfaceKind && previousPath.interfaceKind !== currentPath.interfaceKind)) differences.push('网络接口不同')
-  if (before.colo && after.colo && before.colo !== after.colo) differences.push('接入机房不同')
+  const beforeColos = new Set([before.colo, ...(before.observedColos ?? [])].filter(Boolean))
+  const afterColos = new Set([after.colo, ...(after.observedColos ?? [])].filter(Boolean))
+  const beforeIncomplete = before.downloadPopComplete === false
+  const afterIncomplete = after.downloadPopComplete === false
+  // Absence is evidence only on the side with a complete POP record.
+  const appeared = !beforeIncomplete && [...afterColos].some(colo => !beforeColos.has(colo))
+  const disappeared = !afterIncomplete && [...beforeColos].some(colo => !afterColos.has(colo))
+  if (beforeColos.size && afterColos.size && (appeared || disappeared)) differences.push('接入机房不同')
+  if (beforeColos.size > 1 || afterColos.size > 1) differences.push(mixedPopWarning)
+  if (beforeIncomplete || afterIncomplete) differences.push(incompletePopWarning)
   return differences
 }
 
@@ -107,7 +141,14 @@ function compareFavoriteEntry(entry: FavoriteEntry, job: FavoriteTestJob, baseli
   if (!baseline) return { label: '本轮已更新', detail: '可在测速历史查看已保留的记录', changed: true, differences: [] as string[] }
   const { config, result } = download ?? entry
   const networkPath = download ? result.networkPath : entry.networkPath
-  const differences = comparisonContextDifferences(baseline, { config, networkPath, colo: result.colo }, result.ip, !!download)
+  // Older favorite baselines retained only the first POP, even when the
+  // result contained more POPs. Missing codes in those baselines prove nothing.
+  const before = baseline.observedColos === undefined && baseline.downloadPopComplete === undefined && baseline.colo
+    ? { ...baseline, downloadPopComplete: false } : baseline
+  const differences = comparisonContextDifferences(before, {
+    config, networkPath, colo: result.colo, observedColos: result.observedColos,
+    downloadPopComplete: downloadPopComplete(result, !!download),
+  }, result.ip, !!download)
   const parts: string[] = []
   if (!download && baseline.measurementPassed !== result.measurementPassed) parts.push(result.measurementPassed ? '本次完整通过' : '本次未通过完整测速')
   const p95 = download ? null : completedTcpMetricValue(result, 'p95')
@@ -120,7 +161,14 @@ function compareFavoriteEntry(entry: FavoriteEntry, job: FavoriteTestJob, baseli
     else if (before != null && after == null) parts.push(`${label}本次未测满`)
     else if (before == null && after != null) parts.push(`${label}本次已测满`)
   }
-  return { label: parts.join(' · ') || (comparable ? '未见明显数值变化' : '暂无可比较的完整测量'), detail: `对比 ${favoriteDate(baseline.testedAt)}；仅描述两次观测，不代表长期趋势。`, changed: parts.length > 0 || differences.some(difference => difference !== '网络路径未完整记录' && difference !== indirectRouteWarning), differences }
+  const uncertainPop = differences.includes(mixedPopWarning) || differences.includes(incompletePopWarning)
+  const uncertainty = ['网络路径未完整记录', indirectRouteWarning, mixedPopWarning, incompletePopWarning]
+  return {
+    label: parts.join(' · ') || (uncertainPop ? '接入机房条件待确认' : comparable ? '未见明显数值变化' : '暂无可比较的完整测量'),
+    detail: `对比 ${favoriteDate(baseline.testedAt)}；仅描述两次观测，不代表长期趋势。`,
+    changed: parts.length > 0 || differences.some(difference => !uncertainty.includes(difference)),
+    differences,
+  }
 }
 
 export function favoriteTestDate(entry: FavoriteEntry): string {
@@ -165,13 +213,14 @@ export function isIpSaved(library: FavoriteLibrary, ip: string): boolean {
 }
 
 /** Reconstruct enough of the original run for the existing evidence/status helpers. */
-export function favoriteSnapshotRun(entry: FavoriteEntry): ScanRun {
+export function favoriteSnapshotRun(entry: FavoriteEntry, candidateLists?: FavoriteLibrary['candidateLists']): ScanRun {
+  const source = entry.candidateListId ? candidateLists?.[entry.candidateListId] : undefined
   return {
     id: entry.runId,
     status: entry.runStatus,
     startedAt: entry.runStartedAt,
     finishedAt: entry.runFinishedAt ?? undefined,
-    config: entry.config,
+    config: source === undefined ? entry.config : { ...entry.config, customIps: source },
     results: [entry.result],
     progress: {
       stage: entry.runStatus === 'running' ? 'completed' : entry.runStatus,

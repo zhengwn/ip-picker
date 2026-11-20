@@ -1,5 +1,5 @@
 use crate::{
-    favorites::{FavoriteLibrary, FavoriteTestJob},
+    favorites::{CandidateListSource, FavoriteLibrary, FavoriteTestJob},
     history::{
         compare_ip, has_history_results, recent_runs, HistoryEntry, HistoryKind, HistoryMatch,
     },
@@ -9,13 +9,14 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
     fs, io,
-    io::Write,
+    io::{BufReader, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
 use uuid::Uuid;
 
 const CANDIDATE_COVERAGE_VERSION: u32 = 2;
+const RECOVERY_WITH_SOURCES_EXTENSION: &str = "with-sources.bak";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +44,8 @@ pub struct SavedState {
     pub pending_favorite_results: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    #[serde(skip)]
+    pub(crate) needs_save_on_shutdown: bool,
 }
 
 impl Default for SavedState {
@@ -59,6 +62,7 @@ impl Default for SavedState {
             measurement_revision: 0,
             pending_favorite_results: false,
             warning: None,
+            needs_save_on_shutdown: false,
         }
     }
 }
@@ -160,6 +164,346 @@ impl SavedState {
 
 fn history_path(path: &Path, id: Uuid) -> PathBuf {
     path.with_extension("history").join(format!("{id}.json"))
+}
+
+fn favorite_sources_dir(path: &Path) -> PathBuf {
+    path.with_extension("favorite-sources")
+}
+
+fn favorite_source_path(path: &Path, id: Uuid) -> PathBuf {
+    favorite_sources_dir(path).join(format!("{id}.txt"))
+}
+
+fn recovery_favorite_source_path(path: &Path, id: Uuid) -> PathBuf {
+    path.with_extension("recovery-favorite-sources")
+        .join(format!("{id}.txt"))
+}
+
+fn restore_favorite_sources(path: &Path, saved: &mut SavedState) {
+    let mut empty_sources = BTreeMap::new();
+    for run in saved.last_run.iter().chain(
+        saved
+            .scan_history
+            .iter()
+            .filter(|entry| matches!(entry.kind, HistoryKind::Scan))
+            .map(|entry| entry.run.as_ref()),
+    ) {
+        let recorded_empty = !run.config.candidate_source_unrecorded
+            && run.config.source == "cloudflare"
+            && run.config.custom_ips.is_empty();
+        empty_sources
+            .entry(run.id.as_str())
+            .and_modify(|empty| *empty &= recorded_empty)
+            .or_insert(recorded_empty);
+    }
+    let favorites = &mut saved.favorites;
+    // Older versions preserve runId when saving a favorite, even though they
+    // drop the candidate-list fields from state.json.
+    favorites
+        .candidate_lists
+        .retain(|_, source| !source.is_empty());
+    let mut checked = HashSet::new();
+    let mut missing = BTreeMap::new();
+    for entry in &mut favorites.entries {
+        let Some(reference) = entry.candidate_source_reference() else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(reference) else {
+            continue;
+        };
+        if !favorites.candidate_lists.contains_key(reference) && !checked.contains(reference) {
+            checked.insert(reference.to_owned());
+            if let Some(source) = read_favorite_source(&favorite_source_path(path, id))
+                .or_else(|| read_favorite_source(&recovery_favorite_source_path(path, id)))
+            {
+                favorites
+                    .candidate_lists
+                    .insert(reference.into(), Arc::from(source));
+            }
+        }
+        if favorites.candidate_lists.contains_key(reference) {
+            continue;
+        }
+        if !entry.config.custom_ips.is_empty() {
+            continue;
+        }
+        // A legacy null might have been inferred from defaulted scan fields.
+        // Give it a chance to recover from a backup before trusting emptiness.
+        if entry.candidate_list_id.is_unknown()
+            && entry.config.source == "cloudflare"
+            && empty_sources.get(entry.run_id.as_str()) == Some(&true)
+        {
+            entry.candidate_list_id = CandidateListSource::Inline;
+            entry.candidate_list_known_empty = true;
+        } else if !missing.contains_key(reference) {
+            missing.insert(reference.to_owned(), id);
+        }
+    }
+    if !missing.is_empty() {
+        // A restored backup can be the only copy after an older writer
+        // discards the embedded lists again. Read it without changing it.
+        let ids = missing.values().copied().collect();
+        let sources = embedded_recovery_sources(path, &ids);
+        for (reference, id) in missing {
+            if let Some(source) = sources.get(&id) {
+                favorites.candidate_lists.insert(reference, source.clone());
+            }
+        }
+    }
+}
+
+fn read_favorite_source(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .filter(|source| !source.is_empty())
+}
+
+fn preserve_favorite_sources(
+    path: &Path,
+    favorites: &FavoriteLibrary,
+    verify_existing: bool,
+) -> Result<(), String> {
+    for (id, source) in &favorites.candidate_lists {
+        let Ok(id) = Uuid::parse_str(id) else {
+            continue;
+        };
+        let source_path = favorite_source_path(path, id);
+        match fs::metadata(&source_path) {
+            Ok(metadata) if metadata.is_file() => {
+                let matches = if verify_existing {
+                    metadata.len() == source.len() as u64
+                        && fs::read(&source_path)
+                            .map_err(|error| format!("无法读取收藏候选列表备份：{error}"))?
+                            == source.as_bytes()
+                } else {
+                    metadata.len() > 0
+                };
+                if !matches {
+                    write_atomic(&source_path, source.as_bytes())?;
+                }
+            }
+            Ok(_) => return Err("收藏候选列表的备份路径不是文件".into()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                write_atomic(&source_path, source.as_bytes())?;
+            }
+            Err(error) => return Err(format!("无法检查收藏候选列表：{error}")),
+        }
+    }
+    Ok(())
+}
+
+fn favorite_source_ids(favorites: &FavoriteLibrary) -> HashSet<Uuid> {
+    favorites
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            if entry.candidate_list_id.is_unknown() && !entry.config.custom_ips.is_empty() {
+                return None;
+            }
+            let reference = entry.candidate_source_reference()?;
+            Uuid::parse_str(reference).ok()
+        })
+        .collect()
+}
+
+fn archive_favorite_source(path: &Path, id: Uuid, source: Option<&str>) -> Result<(), String> {
+    let archive = recovery_favorite_source_path(path, id);
+    match fs::read_to_string(&archive) {
+        Ok(archived) if archived.is_empty() => {}
+        Ok(archived) if source.is_none_or(|source| source == archived) => return Ok(()),
+        Ok(_) => return Err("同一轮测速的恢复备份已有不同的候选列表".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    if let Some(source) = source {
+        return write_atomic(&archive, source.as_bytes());
+    }
+    match fs::read(favorite_source_path(path, id)) {
+        Ok(bytes) if bytes.is_empty() => Ok(()),
+        Ok(bytes) => write_atomic(&archive, &bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn archive_favorite_sources(path: &Path) -> Result<(), String> {
+    let files = match fs::read_dir(favorite_sources_dir(path)) {
+        Ok(files) => files,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    // Corrupt state may be unreadable, so the recovery backup must preserve
+    // every source that it could refer to. Run IDs identify immutable lists.
+    for file in files {
+        let source = file.map_err(|error| error.to_string())?.path();
+        if source
+            .extension()
+            .is_some_and(|extension| extension == "txt")
+        {
+            if let Some(id) = source
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .and_then(|name| Uuid::parse_str(name).ok())
+            {
+                archive_favorite_source(path, id, None)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recovery_backup_prefix(name: &std::ffi::OsStr) -> String {
+    format!("{}.recovery-", name.to_string_lossy())
+}
+
+fn recovery_backup_paths(path: &Path) -> Option<impl Iterator<Item = io::Result<PathBuf>>> {
+    let (parent, name) = path.parent().zip(path.file_name())?;
+    let prefix = recovery_backup_prefix(name);
+    Some(
+        fs::read_dir(parent)
+            .ok()?
+            .filter_map(move |entry| match entry {
+                Ok(entry) => {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    (name.starts_with(&prefix) && name.ends_with(".bak")).then(|| Ok(entry.path()))
+                }
+                Err(error) => Some(Err(error)),
+            }),
+    )
+}
+
+fn read_recovery_backup<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
+    if !fs::metadata(path)?.is_file() {
+        return Ok(None);
+    }
+    let file = fs::File::open(path)?;
+    Ok(Some(serde_json::from_reader(BufReader::new(file))?))
+}
+
+fn embedded_recovery_sources(path: &Path, ids: &HashSet<Uuid>) -> BTreeMap<Uuid, Arc<str>> {
+    #[derive(Deserialize)]
+    struct Backup {
+        #[serde(default)]
+        favorites: Favorites,
+    }
+
+    #[derive(Default, Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    struct Favorites {
+        candidate_lists: BTreeMap<String, serde_json::Value>,
+    }
+
+    let Some(backups) = recovery_backup_paths(path) else {
+        return BTreeMap::new();
+    };
+    let mut sources: BTreeMap<Uuid, Option<Arc<str>>> = BTreeMap::new();
+    for backup in backups.flatten() {
+        let Ok(Some(backup)) = read_recovery_backup::<Backup>(&backup) else {
+            continue;
+        };
+        for (reference, value) in backup.favorites.candidate_lists {
+            let Ok(id) = Uuid::parse_str(&reference) else {
+                continue;
+            };
+            let Some(source) = value
+                .as_str()
+                .filter(|source| !source.is_empty() && ids.contains(&id))
+            else {
+                continue;
+            };
+            sources
+                .entry(id)
+                .and_modify(|existing| {
+                    // Conflicting copies do not establish which list is original.
+                    if existing
+                        .as_deref()
+                        .is_some_and(|existing| existing != source)
+                    {
+                        *existing = None;
+                    }
+                })
+                .or_insert_with(|| Some(Arc::from(source)));
+        }
+    }
+    sources
+        .into_iter()
+        .filter_map(|(id, source)| source.map(|source| (id, source)))
+        .collect()
+}
+
+/// None means a legacy backup could not be inspected, so its references are
+/// unknown. Parse only the favorite index because unrelated fields may be corrupt.
+fn legacy_recovery_source_ids(path: &Path) -> Option<HashSet<Uuid>> {
+    #[derive(Deserialize)]
+    struct Backup {
+        #[serde(default)]
+        favorites: Favorites,
+    }
+
+    #[derive(Default, Deserialize)]
+    #[serde(default, rename_all = "camelCase")]
+    struct Favorites {
+        entries: Vec<Entry>,
+        candidate_lists: BTreeMap<String, String>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Entry {
+        run_id: String,
+        #[serde(default)]
+        candidate_list_id: CandidateListSource,
+        #[serde(default)]
+        candidate_list_known_empty: bool,
+        #[serde(default)]
+        config: Config,
+    }
+
+    #[derive(Default, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Config {
+        custom_ips: Option<String>,
+    }
+
+    let completed_suffix = format!(".{RECOVERY_WITH_SOURCES_EXTENSION}");
+    let mut sources = HashSet::new();
+    for backup in recovery_backup_paths(path)? {
+        let backup = backup.ok()?;
+        if backup
+            .file_name()?
+            .to_string_lossy()
+            .ends_with(&completed_suffix)
+        {
+            continue;
+        }
+        let Some(backup) = read_recovery_backup::<Backup>(&backup).ok()? else {
+            continue;
+        };
+        for entry in backup.favorites.entries {
+            let inline = entry
+                .config
+                .custom_ips
+                .is_some_and(|source| !source.is_empty());
+            let Some(reference) = entry
+                .candidate_list_id
+                .lookup_reference(&entry.run_id, !inline && !entry.candidate_list_known_empty)
+            else {
+                continue;
+            };
+            let embedded = backup
+                .favorites
+                .candidate_lists
+                .get(reference)
+                .is_some_and(|source| !source.is_empty());
+            if !inline && !embedded {
+                if let Ok(id) = Uuid::parse_str(reference) {
+                    sources.insert(id);
+                }
+            }
+        }
+    }
+    Some(sources)
 }
 
 fn load_history(path: &Path, saved: &mut SavedState) -> Option<String> {
@@ -265,6 +609,7 @@ fn restore_checkpoint(path: &Path, saved: &mut SavedState) -> Result<Option<Hist
     }
     run.progress = checkpoint.progress;
     run.results = checkpoint.results;
+    run.update_revision = checkpoint.revision;
     saved.measurement_revision = checkpoint.revision;
     Ok(Some(kind))
 }
@@ -284,7 +629,18 @@ fn preserve_legacy_budget(config: Option<&mut serde_json::Value>) {
 /// later save or window close overwrite the only copy of the user's data.
 pub fn load_for_startup(path: &Path) -> Result<SavedState, String> {
     let error = match load(path) {
-        Ok(saved) => return Ok(saved),
+        Ok(mut saved) => {
+            // The main index has precedence while it still contains the text.
+            // Repair divergent copies before an older app might replace it.
+            if let Err(error) = preserve_favorite_sources(path, &saved.favorites, true) {
+                let message = format!("无法备份收藏的原始候选列表：{error}");
+                saved.warning = Some(match saved.warning.take() {
+                    Some(warning) => format!("{warning}；{message}"),
+                    None => message,
+                });
+            }
+            return Ok(saved);
+        }
         Err(error) => error,
     };
     let preserve_error =
@@ -297,23 +653,30 @@ pub fn load_for_startup(path: &Path) -> Result<SavedState, String> {
         .file_name()
         .ok_or_else(|| preserve_error("文件路径缺少名称".into()))?;
     let mut backup = tempfile::Builder::new()
-        .prefix(&format!("{}.recovery-", name.to_string_lossy()))
-        .suffix(".bak")
+        .prefix(&recovery_backup_prefix(name))
+        .suffix(".tmp")
         .tempfile_in(parent)
         .map_err(|e| preserve_error(e.to_string()))?;
+    let backup_path = backup
+        .path()
+        .with_extension(RECOVERY_WITH_SOURCES_EXTENSION);
     backup
         .write_all(&bytes)
         .and_then(|_| backup.flush())
         .and_then(|_| backup.as_file().sync_all())
         .map_err(|e| preserve_error(e.to_string()))?;
-    let (_, backup_path) = backup
-        .keep()
+    archive_favorite_sources(path).map_err(preserve_error)?;
+    // Publish the completed name only after its sources are durable. A
+    // temporary file left by a crash must never look like a complete backup.
+    backup
+        .persist_noclobber(&backup_path)
         .map_err(|e| preserve_error(e.error.to_string()))?;
     Ok(SavedState {
         warning: Some(format!(
             "{error}；原始设置已备份至 {}，本次使用默认设置",
             backup_path.display()
         )),
+        needs_save_on_shutdown: true,
         ..SavedState::default()
     })
 }
@@ -375,6 +738,8 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
     let mut saved: SavedState =
         serde_json::from_value(json).map_err(|e| format!("本地设置格式错误：{e}"))?;
     let history_warning = load_history(path, &mut saved);
+    restore_favorite_sources(path, &mut saved);
+    saved.favorites.share_candidate_lists();
     if saved.candidate_coverage_version < 1 {
         // Upgrade the former built-in default only once. A later manual cap,
         // custom source, and every historical scan retain their own settings.
@@ -406,6 +771,7 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
         }
         let interrupted = run.status == "running";
         if interrupted {
+            saved.needs_save_on_shutdown = true;
             run.status = "cancelled".into();
             run.progress.stage = "cancelled".into();
             run.progress.stability_batch = None;
@@ -453,7 +819,10 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
             let previous_history = saved.scan_history.clone();
             saved.retain_recent_history();
             match save_replacing_history(path, &saved, &previous_history) {
-                Ok(()) => clear_checkpoint(path),
+                Ok(()) => {
+                    saved.needs_save_on_shutdown = false;
+                    clear_checkpoint(path);
+                }
                 Err(error) => {
                     saved.scan_history = previous_history;
                     saved.warning = Some(format!("中断的测速快照尚未保存到本地：{error}"));
@@ -499,10 +868,11 @@ fn recover_interrupted_favorite_test(saved: &mut SavedState, path: &Path) {
     let committed = next.favorites.next_revision().and_then(|revision| {
         next.favorites.revision = revision;
         next.warning = None;
-        save_replacing_history(path, &next, &saved.scan_history)
+        save_favorite_changes(path, &next, saved)
     });
     match committed {
         Ok(()) => {
+            next.needs_save_on_shutdown = false;
             *saved = next;
             clear_checkpoint(path);
         }
@@ -528,6 +898,9 @@ pub fn save(path: &Path, saved: &SavedState) -> Result<(), String> {
 
     let mut created = Vec::new();
     let result = (|| {
+        // Keep recovery copies across a failed state write. The previous
+        // index may already contain a compacted favorite for this run.
+        preserve_favorite_sources(path, &saved.favorites, false)?;
         let mut references = saved.unavailable_history_files.clone();
         for entry in &saved.scan_history {
             let id = entry.file_id.ok_or("测速归档缺少文件标识")?;
@@ -557,6 +930,55 @@ pub fn save(path: &Path, saved: &SavedState) -> Result<(), String> {
         }
     }
     result
+}
+
+pub(crate) fn save_favorite_changes(
+    path: &Path,
+    saved: &SavedState,
+    previous: &SavedState,
+) -> Result<(), String> {
+    // Files absent from both indexes may belong to a separate recovery
+    // backup. Only remove sources explicitly retired by this commit.
+    let retained = favorite_source_ids(&saved.favorites);
+    let previous_ids = favorite_source_ids(&previous.favorites);
+    let mut retired = previous_ids.difference(&retained).peekable();
+    // Backups created by older builds may still rely on the live copy. Only
+    // archive their referenced sources unless a backup cannot be inspected.
+    let recovery_sources = if retired.peek().is_some() {
+        legacy_recovery_source_ids(path)
+    } else {
+        Some(HashSet::new())
+    };
+    let mut remove = Vec::new();
+    for id in retired {
+        if recovery_sources
+            .as_ref()
+            .is_none_or(|sources| sources.contains(id))
+        {
+            let source = previous
+                .favorites
+                .candidate_lists
+                .get(&id.to_string())
+                .map(Arc::as_ref);
+            if archive_favorite_source(path, *id, source).is_err() {
+                // The old index might be the only copy. Keep it until we
+                // know a backup can still read that source after the commit.
+                if let Some(source) = source {
+                    let live = favorite_source_path(path, *id);
+                    if !fs::read_to_string(&live).is_ok_and(|existing| existing == source) {
+                        write_atomic(&live, source.as_bytes())?;
+                    }
+                }
+                continue;
+            }
+        }
+        remove.push(*id);
+    }
+    save_replacing_history(path, saved, &previous.scan_history)?;
+    for id in remove {
+        let _ = fs::remove_file(favorite_source_path(path, id));
+    }
+    Ok(())
 }
 
 pub fn save_replacing_history(
@@ -876,6 +1298,27 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
+    #[test]
+    fn startup_does_not_publish_a_recovery_backup_without_its_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let original = b"corrupt state";
+        let source = b"192.0.2.1\n# recovery evidence";
+        let live = favorite_source_path(&path, Uuid::new_v4());
+        write_atomic(&live, source).unwrap();
+        fs::write(
+            path.with_extension("recovery-favorite-sources"),
+            b"occupied",
+        )
+        .unwrap();
+        fs::write(&path, original).unwrap();
+
+        assert!(load_for_startup(&path).unwrap_err().contains("已停止启动"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::read(live).unwrap(), source);
+        assert!(recovery_backups(&path).is_empty());
+    }
+
     fn legacy_run() -> ScanRun {
         let mut low = crate::model::IpResult::new("104.16.1.1".parse().unwrap());
         low.region_code = "JP".into();
@@ -910,6 +1353,7 @@ mod tests {
         unclassified.ip = "104.16.1.7".into();
         unclassified.exclusion_reason = None;
         ScanRun {
+            update_revision: 0,
             quick_validation: Some(false),
             retest_ip: None,
             download_only: false,
@@ -1174,6 +1618,832 @@ mod tests {
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.last_run.as_ref().unwrap().id, "next-run");
         assert_eq!(serde_json::to_value(loaded.favorites).unwrap(), original);
+    }
+
+    #[test]
+    fn legacy_favorites_share_their_exact_candidate_list_and_survive_an_older_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        let source_id = Uuid::new_v4();
+        run.id = source_id.to_string();
+        run.config.source = "custom".into();
+        let source = format!(
+            "{}\n# shared-source-marker{}",
+            run.results[0].ip,
+            " ".repeat(256_000)
+        );
+        for folder in saved.favorites.folders.clone().into_iter().take(2) {
+            saved
+                .favorites
+                .save_snapshot(&folder.id, &run, &run.results[0].ip, "")
+                .unwrap();
+        }
+        let mut legacy = serde_json::to_value(&saved).unwrap();
+        for entry in legacy["favorites"]["entries"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("candidateListId");
+            entry["config"]["customIps"] = serde_json::json!(source);
+        }
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.favorites.candidate_lists.len(), 1);
+        for entry in &loaded.favorites.entries {
+            let id = entry.candidate_list_id.as_deref().unwrap();
+            assert_eq!(&*loaded.favorites.candidate_lists[id], source);
+            assert!(entry.config.custom_ips.is_empty());
+        }
+        save(&path, &loaded).unwrap();
+        let disk = fs::read_to_string(&path).unwrap();
+        assert_eq!(disk.matches("shared-source-marker").count(), 1);
+        let recovery = favorite_source_path(&path, source_id);
+        assert_eq!(fs::read_to_string(&recovery).unwrap(), source);
+        fs::remove_file(&recovery).unwrap();
+        load_for_startup(&path).unwrap();
+        assert_eq!(fs::read_to_string(&recovery).unwrap(), source);
+
+        // An older writer preserves the favorites and run IDs while stripping
+        // the newer fields. The archived scan itself is no longer present.
+        let mut older: serde_json::Value = serde_json::from_str(&disk).unwrap();
+        older["favorites"]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateLists");
+        for entry in older["favorites"]["entries"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("candidateListId");
+        }
+        older["config"]["downloadSeconds"] = serde_json::json!(5);
+        fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        let mut reopened = load(&path).unwrap();
+        assert_eq!(reopened.config.download_seconds, 5);
+        assert!(reopened
+            .favorites
+            .entries
+            .iter()
+            .all(|entry| entry.candidate_list_id.as_deref() == Some(run.id.as_str())));
+        let previous = reopened.clone();
+        let entry_id = reopened.favorites.entries[0].id.clone();
+        reopened.favorites.delete_entry(&entry_id).unwrap();
+        assert_eq!(&*reopened.favorites.candidate_lists[&run.id], source);
+        save_favorite_changes(&path, &reopened, &previous).unwrap();
+        assert!(recovery.is_file());
+        let previous = reopened.clone();
+        let entry_id = reopened.favorites.entries[0].id.clone();
+        reopened.favorites.delete_entry(&entry_id).unwrap();
+        assert!(reopened.favorites.candidate_lists.is_empty());
+        save_favorite_changes(&path, &reopened, &previous).unwrap();
+        assert!(!recovery.exists());
+    }
+
+    #[test]
+    fn saving_defaults_after_recovery_keeps_the_source_needed_by_the_original_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        let source_id = Uuid::new_v4();
+        run.id = source_id.to_string();
+        run.config.source = "custom".into();
+        let source = format!("{}\n# sole copy", run.results[0].ip);
+        run.config.custom_ips = source.clone();
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &run.results[0].ip, "")
+            .unwrap();
+        save(&path, &saved).unwrap();
+
+        let mut older: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        older["favorites"]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateLists");
+        older["favorites"]["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateListId");
+        older["config"]["downloadSeconds"] = serde_json::json!("invalid");
+        fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        let fallback = load_for_startup(&path).unwrap();
+        assert!(fallback.warning.is_some());
+        assert!(fallback.favorites.entries.is_empty());
+        let mut runtime = crate::RuntimeState {
+            saved: fallback,
+            cancellation: None,
+            worker: None,
+        };
+        runtime.interrupt_for_shutdown(&path).unwrap();
+        let unrelated = runtime.saved.clone();
+        runtime
+            .saved
+            .favorites
+            .create_folder("另一个收藏夹")
+            .unwrap();
+        save_favorite_changes(&path, &runtime.saved, &unrelated).unwrap();
+        assert_eq!(
+            fs::read_to_string(favorite_source_path(&path, source_id)).unwrap(),
+            source
+        );
+
+        let backup = recovery_backups(&path).pop().unwrap();
+        assert!(backup
+            .to_string_lossy()
+            .ends_with(&format!(".{RECOVERY_WITH_SOURCES_EXTENSION}")));
+        assert_eq!(
+            fs::read_to_string(recovery_favorite_source_path(&path, source_id)).unwrap(),
+            source
+        );
+        let mut repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(backup).unwrap()).unwrap();
+        repaired["config"]["downloadSeconds"] = serde_json::json!(3);
+        let repaired = serde_json::to_vec(&repaired).unwrap();
+        fs::write(&path, &repaired).unwrap();
+        let reopened = load(&path).unwrap();
+        assert_eq!(
+            reopened.favorites.entries[0].candidate_list_id.as_deref(),
+            Some(run.id.as_str())
+        );
+        assert_eq!(&*reopened.favorites.candidate_lists[&run.id], source);
+
+        let previous = reopened;
+        let mut next = previous.clone();
+        let mut replacement = run.clone();
+        replacement.id = Uuid::new_v4().to_string();
+        replacement.config = ScanConfig::default();
+        next.favorites
+            .save_snapshot(&folder, &replacement, &run.results[0].ip, "更新")
+            .unwrap();
+        save_favorite_changes(&path, &next, &previous).unwrap();
+        assert!(!favorite_source_path(&path, source_id).exists());
+        fs::write(&path, &repaired).unwrap();
+        let reopened_again = load(&path).unwrap();
+        assert_eq!(
+            reopened_again
+                .favorites
+                .candidate_lists
+                .get(&run.id)
+                .map(|list| &**list),
+            Some(source.as_str())
+        );
+    }
+
+    #[test]
+    fn retiring_a_source_keeps_legacy_recovery_data_even_when_archiving_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        let id = Uuid::new_v4();
+        run.id = id.to_string();
+        run.config.source = "custom".into();
+        run.config.custom_ips = format!("{}\n# original list", run.results[0].ip);
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &run.results[0].ip, "")
+            .unwrap();
+        save(&path, &saved).unwrap();
+        let legacy = dir.path().join("state.json.recovery-old.bak");
+        fs::write(&legacy, b"unreadable legacy backup").unwrap();
+        let recovery_dir = path.with_extension("recovery-favorite-sources");
+        fs::write(&recovery_dir, b"occupied").unwrap();
+        let live = favorite_source_path(&path, id);
+        fs::remove_file(&live).unwrap();
+        let mut next = saved.clone();
+        let favorite = next.favorites.entries[0].id.clone();
+        next.favorites.delete_entry(&favorite).unwrap();
+        let original = fs::read(&path).unwrap();
+        fs::create_dir(&live).unwrap();
+        assert!(save_favorite_changes(&path, &next, &saved).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        fs::remove_dir(&live).unwrap();
+        fs::write(&live, b"truncated copy").unwrap();
+        save_favorite_changes(&path, &next, &saved).unwrap();
+        assert_eq!(fs::read_to_string(&live).unwrap(), run.config.custom_ips);
+        assert!(load(&path).unwrap().favorites.entries.is_empty());
+
+        fs::remove_file(recovery_dir).unwrap();
+        fs::write(
+            legacy,
+            serde_json::to_vec(&serde_json::json!({
+                "config": {"downloadSeconds": "invalid"},
+                "favorites": {"entries": [{"runId": id}]}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        save(&path, &saved).unwrap();
+        fs::remove_file(&live).unwrap();
+        save_favorite_changes(&path, &next, &saved).unwrap();
+        assert!(!live.exists());
+        assert_eq!(
+            fs::read_to_string(recovery_favorite_source_path(&path, id)).unwrap(),
+            run.config.custom_ips
+        );
+    }
+
+    #[test]
+    fn legacy_backups_only_reference_candidate_sources_missing_from_their_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let [implicit, explicit, inline, empty, legacy_empty, embedded, other_run, completed] =
+            [(); 8].map(|_| Uuid::new_v4());
+        let legacy = dir.path().join("state.json.recovery-legacy.bak");
+        let backup = serde_json::json!({
+            "config": { "downloadSeconds": "invalid" },
+            "favorites": {
+                "candidateLists": { (embedded.to_string()): "192.0.2.1/24" },
+                "entries": [
+                    { "runId": implicit, "config": { "customIps": "" } },
+                    { "runId": other_run, "candidateListId": explicit, "config": { "customIps": "" } },
+                    { "runId": inline, "config": { "customIps": "192.0.2.1/24" } },
+                    { "runId": empty, "candidateListId": null, "candidateListKnownEmpty": true, "config": { "customIps": "" } },
+                    { "runId": legacy_empty, "candidateListId": null, "config": { "customIps": "" } },
+                    { "runId": embedded, "candidateListId": embedded, "config": { "customIps": "" } }
+                ]
+            }
+        });
+        fs::write(legacy, serde_json::to_vec(&backup).unwrap()).unwrap();
+        let marked = dir.path().join(format!(
+            "state.json.recovery-new.{RECOVERY_WITH_SOURCES_EXTENSION}"
+        ));
+        fs::write(
+            marked,
+            serde_json::to_vec(
+                &serde_json::json!({"favorites": {"entries": [{"runId": completed}]}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            legacy_recovery_source_ids(&path),
+            Some(HashSet::from([implicit, explicit, legacy_empty]))
+        );
+        fs::write(
+            dir.path().join("state.json.recovery-unreadable.bak"),
+            b"broken JSON",
+        )
+        .unwrap();
+        assert_eq!(legacy_recovery_source_ids(&path), None);
+    }
+
+    #[test]
+    fn older_writer_after_restoring_an_embedded_source_can_recover_it_from_the_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let backup_path = dir.path().join("state.json.recovery-old.bak");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        let id = Uuid::new_v4();
+        run.id = id.to_string();
+        run.config.source = "custom".into();
+        let source = format!("{}\n# original source", run.results[0].ip);
+        run.config.custom_ips = source.clone();
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &run.results[0].ip, "")
+            .unwrap();
+        save(&path, &saved).unwrap();
+        let mut backup: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        backup["config"]["downloadSeconds"] = serde_json::json!("invalid");
+        let backup_bytes = serde_json::to_vec(&backup).unwrap();
+        fs::write(&backup_path, &backup_bytes).unwrap();
+
+        let mut next = saved.clone();
+        let favorite = next.favorites.entries[0].id.clone();
+        next.favorites.delete_entry(&favorite).unwrap();
+        save_favorite_changes(&path, &next, &saved).unwrap();
+        let live = favorite_source_path(&path, id);
+        assert!(!live.exists());
+        assert!(!recovery_favorite_source_path(&path, id).exists());
+
+        // Restore the backup and model an older writer that drops the new
+        // fields while keeping the original favorite and its run ID.
+        let mut older_writeback = backup.clone();
+        older_writeback["config"]["downloadSeconds"] = serde_json::json!(5);
+        older_writeback["favorites"]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateLists");
+        older_writeback["favorites"]["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateListId");
+        let older_writeback = serde_json::to_vec(&older_writeback).unwrap();
+        fs::write(&path, &older_writeback).unwrap();
+        fs::write(
+            dir.path().join("state.json.recovery-broken.bak"),
+            b"broken JSON",
+        )
+        .unwrap();
+
+        let conflicting_path = dir.path().join("state.json.recovery-conflict.bak");
+        let mut conflicting = backup;
+        conflicting["favorites"]["candidateLists"][&run.id] = serde_json::json!("192.0.2.9/24");
+        fs::write(&conflicting_path, serde_json::to_vec(&conflicting).unwrap()).unwrap();
+        assert!(load(&path).unwrap().favorites.candidate_lists.is_empty());
+        fs::remove_file(conflicting_path).unwrap();
+
+        let recovered = load_for_startup(&path).unwrap();
+        assert_eq!(recovered.config.download_seconds, 5);
+        assert_eq!(
+            recovered
+                .favorites
+                .candidate_lists
+                .get(&run.id)
+                .map(Arc::as_ref),
+            Some(source.as_str())
+        );
+        assert_eq!(fs::read_to_string(live).unwrap(), source);
+        assert_eq!(fs::read(&backup_path).unwrap(), backup_bytes);
+        assert!(!recovery_favorite_source_path(&path, id).exists());
+
+        fs::remove_file(backup_path).unwrap();
+        fs::write(&path, older_writeback).unwrap();
+        assert_eq!(
+            load(&path)
+                .unwrap()
+                .favorites
+                .candidate_lists
+                .get(&run.id)
+                .map(Arc::as_ref),
+            Some(source.as_str())
+        );
+    }
+
+    #[test]
+    fn empty_favorite_source_files_fall_back_and_are_replaced_on_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        let id = Uuid::new_v4();
+        run.id = id.to_string();
+        run.config.source = "custom".into();
+        let source = format!("{}\n# complete source", run.results[0].ip);
+        run.config.custom_ips = source.clone();
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &run.results[0].ip, "")
+            .unwrap();
+        save(&path, &saved).unwrap();
+        let original = fs::read(&path).unwrap();
+        let backup = dir.path().join("state.json.recovery-old.bak");
+        fs::write(&backup, &original).unwrap();
+
+        let mut empty_index: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        empty_index["favorites"]["candidateLists"][&run.id] = serde_json::json!("");
+        let empty_index = serde_json::to_vec(&empty_index).unwrap();
+        let live = favorite_source_path(&path, id);
+        let archived = recovery_favorite_source_path(&path, id);
+        for archive_contents in [source.as_bytes(), &[][..]] {
+            fs::write(&path, &empty_index).unwrap();
+            fs::write(&live, b"").unwrap();
+            write_atomic(&archived, archive_contents).unwrap();
+            let reopened = load_for_startup(&path).unwrap();
+            assert_eq!(
+                reopened
+                    .favorites
+                    .candidate_lists
+                    .get(&run.id)
+                    .map(Arc::as_ref),
+                Some(source.as_str())
+            );
+            assert_eq!(fs::read_to_string(&live).unwrap(), source);
+        }
+        assert_eq!(fs::read(&backup).unwrap(), original);
+
+        archive_favorite_source(&path, id, None).unwrap();
+        assert_eq!(fs::read_to_string(archived).unwrap(), source);
+    }
+
+    #[test]
+    fn startup_repairs_a_damaged_sidecar_before_an_older_writer_drops_the_embedded_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        let id = Uuid::new_v4();
+        run.id = id.to_string();
+        run.config.source = "custom".into();
+        let source = format!("{}\n# complete source", run.results[0].ip);
+        run.config.custom_ips = source.clone();
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &run.results[0].ip, "")
+            .unwrap();
+        save(&path, &saved).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut older: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        older["favorites"]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateLists");
+        older["favorites"]["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateListId");
+        let older = serde_json::to_vec(&older).unwrap();
+        let live = favorite_source_path(&path, id);
+
+        for damage in [&b"192.0.2.1"[..], &vec![0xff; source.len()]] {
+            fs::write(&path, &original).unwrap();
+            fs::write(&live, damage).unwrap();
+            let reopened = load_for_startup(&path).unwrap();
+            assert!(reopened.warning.is_none());
+            fs::write(&path, &older).unwrap();
+            let downgraded = load(&path).unwrap();
+            assert_eq!(
+                downgraded
+                    .favorites
+                    .candidate_lists
+                    .get(&run.id)
+                    .map(Arc::as_ref),
+                Some(source.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn independent_source_takes_priority_when_legacy_run_metadata_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        run.id = Uuid::new_v4().to_string();
+        let ip = run.results[0].ip.clone();
+        let source = format!("{ip}\n# retained custom list");
+        run.config.custom_ips = source.clone();
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &ip, "")
+            .unwrap();
+        let run_id = run.id.clone();
+        saved.last_run = Some(run);
+        save(&path, &saved).unwrap();
+        let mut older: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        older["favorites"]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateLists");
+        older["favorites"]["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateListId");
+
+        older["lastRun"]["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("customIps");
+        fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        let recovered = load(&path).unwrap();
+        assert_eq!(
+            recovered
+                .favorites
+                .candidate_lists
+                .get(&run_id)
+                .map(Arc::as_ref),
+            Some(source.as_str())
+        );
+
+        older["lastRun"]["config"]["customIps"] = serde_json::json!("");
+        fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        let recovered = load(&path).unwrap();
+        assert_eq!(
+            recovered
+                .favorites
+                .candidate_lists
+                .get(&run_id)
+                .map(Arc::as_ref),
+            Some(source.as_str())
+        );
+
+        older["favorites"]["entries"][0]["candidateListId"] = serde_json::Value::Null;
+        fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        let repaired = load(&path).unwrap();
+        assert_eq!(
+            repaired.favorites.entries[0].candidate_list_id.as_deref(),
+            Some(run_id.as_str())
+        );
+        assert_eq!(
+            repaired
+                .favorites
+                .candidate_lists
+                .get(&run_id)
+                .map(Arc::as_ref),
+            Some(source.as_str())
+        );
+    }
+
+    #[test]
+    fn missing_source_metadata_remains_unknown_after_saving_the_state_again() {
+        for archived in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.json");
+            let mut saved = SavedState::default();
+            let mut run = legacy_run();
+            let id = Uuid::new_v4();
+            run.id = id.to_string();
+            let ip = run.results[0].ip.clone();
+            let source = format!("{ip}\n# recoverable custom list");
+            run.config.custom_ips = source.clone();
+            let folder = saved.favorites.folders[0].id.clone();
+            saved
+                .favorites
+                .save_snapshot(&folder, &run, &ip, "")
+                .unwrap();
+            if archived {
+                saved.archive_run(HistoryKind::Scan, run);
+            } else {
+                saved.last_run = Some(run);
+            }
+            save(&path, &saved).unwrap();
+            let complete = fs::read(&path).unwrap();
+            let mut older: serde_json::Value = serde_json::from_slice(&complete).unwrap();
+            older["favorites"]
+                .as_object_mut()
+                .unwrap()
+                .remove("candidateLists");
+            older["favorites"]["entries"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("candidateListId");
+            if archived {
+                let archive = history_path(&path, saved.scan_history[0].file_id.unwrap());
+                let mut history: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&archive).unwrap()).unwrap();
+                history["run"]["config"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("customIps");
+                fs::write(archive, serde_json::to_vec(&history).unwrap()).unwrap();
+            } else {
+                older["lastRun"]["config"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("customIps");
+            }
+            fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+            fs::remove_file(favorite_source_path(&path, id)).unwrap();
+
+            let mut reopened = load(&path).unwrap();
+            assert!(reopened.favorites.entries[0].candidate_list_id.is_unknown());
+            reopened.config.download_seconds = 5;
+            save(&path, &reopened).unwrap();
+            fs::write(dir.path().join("state.json.recovery-old.bak"), complete).unwrap();
+
+            let recovered = load_for_startup(&path).unwrap();
+            assert_eq!(recovered.config.download_seconds, 5);
+            assert_eq!(
+                recovered
+                    .favorites
+                    .candidate_lists
+                    .get(&id.to_string())
+                    .map(Arc::as_ref),
+                Some(source.as_str())
+            );
+            assert_eq!(
+                fs::read_to_string(favorite_source_path(&path, id)).unwrap(),
+                source
+            );
+        }
+    }
+
+    #[test]
+    fn previously_saved_empty_marker_can_recover_a_backup_only_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let backup = dir.path().join("state.json.recovery-old.bak");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        let id = Uuid::new_v4();
+        run.id = id.to_string();
+        let ip = run.results[0].ip.clone();
+        let source = format!("{ip}\n# preserved only in the original backup");
+        run.config.custom_ips = source.clone();
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &ip, "原备注")
+            .unwrap();
+        saved.last_run = Some(run);
+        save(&path, &saved).unwrap();
+        let complete = fs::read(&path).unwrap();
+        fs::write(&backup, &complete).unwrap();
+        let previous = saved.clone();
+        saved
+            .favorites
+            .delete_entry(&previous.favorites.entries[0].id)
+            .unwrap();
+        save_favorite_changes(&path, &saved, &previous).unwrap();
+        let live = favorite_source_path(&path, id);
+        assert!(!live.exists());
+        assert!(!recovery_favorite_source_path(&path, id).exists());
+
+        let mut mistaken: serde_json::Value = serde_json::from_slice(&complete).unwrap();
+        mistaken["favorites"]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateLists");
+        mistaken["favorites"]["entries"][0]["candidateListId"] = serde_json::Value::Null;
+        mistaken["lastRun"]["config"]["customIps"] = serde_json::json!("");
+        fs::write(&path, serde_json::to_vec(&mistaken).unwrap()).unwrap();
+
+        // Saving while the backup is unavailable must not turn the legacy
+        // null into a confirmation that there was no candidate list.
+        fs::remove_file(&backup).unwrap();
+        let mut unresolved = load(&path).unwrap();
+        assert!(!unresolved.favorites.entries[0].candidate_list_known_empty);
+        let another_folder = unresolved.favorites.folders[1].id.clone();
+        for folder in [&folder, &another_folder] {
+            unresolved
+                .favorites
+                .save_snapshot(
+                    folder,
+                    unresolved.last_run.as_ref().unwrap(),
+                    &ip,
+                    "暂时没有备份",
+                )
+                .unwrap();
+        }
+        assert!(unresolved
+            .favorites
+            .entries
+            .iter()
+            .all(|entry| !entry.candidate_list_known_empty));
+        save(&path, &unresolved).unwrap();
+        fs::write(&backup, &complete).unwrap();
+        let mut recovered = load_for_startup(&path).unwrap();
+        assert_eq!(
+            recovered.favorites.entries[0].candidate_list_id.as_deref(),
+            Some(id.to_string().as_str())
+        );
+        assert_eq!(
+            recovered.favorites.entries[1].candidate_list_id.as_deref(),
+            recovered.favorites.entries[0].candidate_list_id.as_deref()
+        );
+        assert_eq!(
+            recovered
+                .favorites
+                .candidate_lists
+                .get(&id.to_string())
+                .map(Arc::as_ref),
+            Some(source.as_str())
+        );
+        assert_eq!(fs::read_to_string(&live).unwrap(), source);
+        assert_eq!(fs::read(&backup).unwrap(), complete);
+
+        let previous = recovered.clone();
+        recovered
+            .favorites
+            .save_snapshot(
+                &folder,
+                recovered.last_run.as_ref().unwrap(),
+                &ip,
+                "更新备注",
+            )
+            .unwrap();
+        save_favorite_changes(&path, &recovered, &previous).unwrap();
+        assert_eq!(
+            recovered.favorites.entries[0].candidate_list_id.as_deref(),
+            Some(id.to_string().as_str())
+        );
+        assert_eq!(fs::read_to_string(live).unwrap(), source);
+    }
+
+    #[test]
+    fn known_empty_favorite_sources_ignore_recovery_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        let mut run = legacy_run();
+        let id = Uuid::new_v4();
+        run.id = id.to_string();
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &run.results[0].ip, "")
+            .unwrap();
+        save(&path, &saved).unwrap();
+        let backup = serde_json::json!({"favorites": {"candidateLists": {(run.id.clone()): "192.0.2.1/24"}}});
+        fs::write(
+            dir.path().join("state.json.recovery-stale.bak"),
+            serde_json::to_vec(&backup).unwrap(),
+        )
+        .unwrap();
+        assert!(load(&path).unwrap().favorites.candidate_lists.is_empty());
+        let current: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            current["favorites"]["entries"][0].get("candidateListId"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            current["favorites"]["entries"][0]["candidateListKnownEmpty"],
+            true
+        );
+
+        // Older writers omit the marker. A matching archived scan still
+        // proves that this favorite had no separate source to recover.
+        saved.archive_run(HistoryKind::Scan, run);
+        save(&path, &saved).unwrap();
+        let mut older: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        older["favorites"]["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateListId");
+        older["favorites"]["entries"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("candidateListKnownEmpty");
+        fs::write(&path, serde_json::to_vec(&older).unwrap()).unwrap();
+        let reopened = load(&path).unwrap();
+        assert!(reopened.favorites.candidate_lists.is_empty());
+        assert!(reopened.favorites.entries[0].candidate_list_known_empty);
+        assert_eq!(
+            serde_json::to_value(&reopened.favorites.entries[0])
+                .unwrap()
+                .get("candidateListId"),
+            Some(&serde_json::Value::Null)
+        );
+    }
+
+    #[test]
+    fn unrelated_legacy_backup_does_not_archive_or_block_removal_of_later_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(
+            dir.path().join("state.json.recovery-old.bak"),
+            br#"{"config":{"downloadSeconds":"invalid"},"favorites":{"entries":[]}}"#,
+        )
+        .unwrap();
+
+        for block_source_writes in [false, true] {
+            let mut saved = SavedState::default();
+            let mut run = legacy_run();
+            let id = Uuid::new_v4();
+            run.id = id.to_string();
+            run.config.source = "custom".into();
+            run.config.custom_ips = format!("{}\n# later list", run.results[0].ip);
+            let folder = saved.favorites.folders[0].id.clone();
+            saved
+                .favorites
+                .save_snapshot(&folder, &run, &run.results[0].ip, "")
+                .unwrap();
+            save(&path, &saved).unwrap();
+
+            let live = favorite_source_path(&path, id);
+            if block_source_writes {
+                fs::remove_file(&live).unwrap();
+                fs::create_dir(&live).unwrap();
+                fs::write(
+                    path.with_extension("recovery-favorite-sources"),
+                    b"occupied",
+                )
+                .unwrap();
+            }
+            let mut next = saved.clone();
+            let favorite = next.favorites.entries[0].id.clone();
+            next.favorites.delete_entry(&favorite).unwrap();
+            save_favorite_changes(&path, &next, &saved).unwrap();
+            assert!(load(&path).unwrap().favorites.entries.is_empty());
+            assert!(!live.is_file());
+            assert!(!recovery_favorite_source_path(&path, id).exists());
+        }
+    }
+
+    #[test]
+    fn independent_recovery_backup_does_not_retain_later_unrelated_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, b"corrupt state without favorites").unwrap();
+        let mut saved = load_for_startup(&path).unwrap();
+        let mut run = legacy_run();
+        let id = Uuid::new_v4();
+        run.id = id.to_string();
+        run.config.source = "custom".into();
+        run.config.custom_ips = format!("{}\n# new list", run.results[0].ip);
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &run, &run.results[0].ip, "")
+            .unwrap();
+        save(&path, &saved).unwrap();
+        let mut next = saved.clone();
+        let favorite = next.favorites.entries[0].id.clone();
+        next.favorites.delete_entry(&favorite).unwrap();
+        save_favorite_changes(&path, &next, &saved).unwrap();
+        assert!(!favorite_source_path(&path, id).exists());
+        assert!(!recovery_favorite_source_path(&path, id).exists());
     }
 
     #[test]

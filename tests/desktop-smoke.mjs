@@ -67,6 +67,7 @@ try {
     if (performanceMode) {
       const metrics = JSON.parse(app.stdout.match(/^desktop smoke metrics (.+)$/m)?.[1] ?? 'null')
       assert.ok(metrics && metrics.downloadUpdateBytes < 128)
+      assert.ok(metrics.roundUpdateBytes < 2048)
       assert.equal(saved.lastRun.results.length, metrics.candidates)
       assert.ok(saved.lastRun.progress.downloadedBytes > 0)
       continue

@@ -86,6 +86,7 @@ export interface IpResult {
   successCount: number
   attempts: number
   downloadSamplesMbps: number[]
+  downloadSampleColos?: (string | null)[]
   measurementPassed: boolean
   tcpStability?: TcpStability
   eligible: boolean
@@ -117,6 +118,7 @@ export interface TcpStability {
 
 export interface ScanRun {
   id: string
+  updateRevision?: number
   quickValidation?: boolean | null
   retestIp?: string
   downloadOnly?: boolean

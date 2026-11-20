@@ -19,15 +19,16 @@ use crate::{
     },
     favorites::{checked_ipv4, FavoriteLibrary, FavoriteTestJob, FavoriteTestStart},
     history::{HistoryKind, HistoryMatch, HistorySummary, ScanHistory, HISTORY_LIMIT},
-    model::{ScanCommandError, ScanConfig, ScanProgress, ScanRun},
+    model::{IpResult, ScanCommandError, ScanConfig, ScanProgress, ScanRun},
     storage::SavedState,
 };
 #[cfg(feature = "desktop-smoke")]
 use desktop_smoke::run_prepared_scan;
 #[cfg(not(feature = "desktop-smoke"))]
 use engine::run_prepared_scan;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     net::Ipv4Addr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -37,30 +38,31 @@ use tauri_plugin_clipboard_manager::ClipboardExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-/// Keep slow UI serialization out of the network task. The single watch slot
-/// retains only the newest snapshot while an earlier snapshot is being sent.
+/// Keep slow UI serialization out of the network task. While a delivery is
+/// in flight, retain the latest progress and the newest change per pending row.
 fn progress_bridge<F>(deliver: F) -> (UpdateCallback, tokio::task::JoinHandle<()>)
 where
-    F: Fn(EngineUpdate, bool) + Send + Sync + 'static,
+    F: Fn(EngineUpdate) + Send + Sync + 'static,
 {
-    let (sender, mut receiver) = tokio::sync::watch::channel::<Option<EngineUpdate>>(None);
+    let (sender, mut receiver) = watch::channel(());
+    let pending = Arc::new(Mutex::new(None::<EngineUpdate>));
+    let queued = pending.clone();
     let callback: UpdateCallback = Arc::new(move |update| {
-        sender.send_replace(Some(update));
+        let mut pending = queued.lock().expect("progress queue lock");
+        if let Some(pending) = pending.as_mut() {
+            pending.coalesce(update);
+        } else {
+            *pending = Some(update);
+        }
+        sender.send_replace(());
     });
     let deliver = Arc::new(deliver);
     let forwarder = tokio::spawn(async move {
-        let mut last_results = None;
         while receiver.changed().await.is_ok() {
-            let update = receiver.borrow_and_update().clone();
+            let update = pending.lock().expect("progress queue lock").take();
             if let Some(update) = update {
-                // If a full snapshot was coalesced away, its next byte update
-                // still carries those rows and must deliver them.
-                let rows_changed = !last_results
-                    .as_ref()
-                    .is_some_and(|last| Arc::ptr_eq(last, &update.results));
-                last_results = Some(update.results.clone());
                 let deliver = deliver.clone();
-                if tokio::task::spawn_blocking(move || deliver(update, rows_changed))
+                if tokio::task::spawn_blocking(move || deliver(update))
                     .await
                     .is_err()
                 {
@@ -76,7 +78,16 @@ where
 #[serde(rename_all = "camelCase")]
 struct ProgressUpdate {
     id: String,
+    update_revision: u64,
     downloaded_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    changed_rows: BTreeMap<usize, IpResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regions: Option<Vec<String>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -89,21 +100,49 @@ enum DesktopUpdate<T> {
 fn apply_engine_update(
     run: &mut ScanRun,
     update: EngineUpdate,
-    rows_changed: bool,
+    track_regions: bool,
 ) -> Option<ProgressUpdate> {
-    run.progress = update.progress;
-    if rows_changed {
-        run.results.clone_from(&update.results);
-        if run.retest_ip.is_some() {
+    run.update_revision += 1;
+    let region_count = run.config.regions.len();
+    let complete = update.results.is_some();
+    if let Some(results) = update.results {
+        run.results.clone_from(&results);
+    }
+    for (&index, result) in &update.changed_rows {
+        run.results[index].clone_from(result);
+        if track_regions && !complete {
+            model::record_observed_region(&mut run.config.regions, &result.region_code);
+        }
+    }
+    let payload = if complete {
+        if track_regions {
             run.record_observed_regions();
         }
         None
     } else {
         Some(ProgressUpdate {
             id: run.id.clone(),
-            downloaded_bytes: run.progress.downloaded_bytes,
+            update_revision: run.update_revision,
+            downloaded_bytes: update.progress.downloaded_bytes,
+            completed: (update.progress.completed != run.progress.completed)
+                .then_some(update.progress.completed),
+            message: (update.progress.message != run.progress.message)
+                .then(|| update.progress.message.clone()),
+            changed_rows: update.changed_rows,
+            regions: (region_count != run.config.regions.len()).then(|| run.config.regions.clone()),
         })
-    }
+    };
+    run.progress = update.progress;
+    payload
+}
+
+fn update_has_observations(update: &EngineUpdate) -> bool {
+    update.progress.downloaded_bytes > 0
+        || update.changed_rows.values().any(favorites::was_attempted)
+        || update
+            .results
+            .as_ref()
+            .is_some_and(|rows| rows.iter().any(favorites::was_attempted))
 }
 
 struct RuntimeState {
@@ -135,6 +174,7 @@ impl RuntimeState {
             prepare_scan(config.clone())?
         };
         let run = ScanRun {
+            update_revision: 0,
             quick_validation: Some(!persist_config && target.is_none()),
             retest_ip: target.map(|ip| ip.to_string()),
             download_only: false,
@@ -175,7 +215,8 @@ impl RuntimeState {
     ) -> Result<FavoriteLibrary, String> {
         next.favorites.revision = self.saved.favorites.next_revision()?;
         next.warning = None;
-        storage::save_replacing_history(path, &next, &self.saved.scan_history)?;
+        storage::save_favorite_changes(path, &next, &self.saved)?;
+        next.needs_save_on_shutdown = false;
         self.saved = next;
         Ok(self.saved.favorites.clone())
     }
@@ -224,12 +265,14 @@ impl RuntimeState {
             self.cancellation = old_token;
             return Err(error);
         }
+        self.saved.needs_save_on_shutdown = false;
         Ok(())
     }
 
     fn begin_favorite_test(
         &mut self,
         config: ScanConfig,
+        persist_config: bool,
         download_only: bool,
         folder_id: Option<&str>,
         favorite_id: Option<&str>,
@@ -246,11 +289,12 @@ impl RuntimeState {
         // Capture pending user settings before prepare_test replaces the source
         // with the explicit targets. A targeted test can legitimately ignore an
         // empty custom source, but that invalid source must not become active.
-        if config.validate().is_ok() {
+        if persist_config && config.validate().is_ok() {
             next.config = config.clone();
         }
         let (job, ips) = next.favorites.prepare_test(
             ScanRun {
+                update_revision: 0,
                 quick_validation: Some(false),
                 retest_ip: None,
                 download_only,
@@ -295,11 +339,13 @@ impl RuntimeState {
         self.saved.retain_recent_history();
         let warning = match storage::save_replacing_history(path, &self.saved, &previous_history) {
             Ok(()) => {
+                self.saved.needs_save_on_shutdown = false;
                 storage::clear_checkpoint(path);
                 None
             }
             Err(error) => {
                 self.saved.scan_history = previous_history;
+                self.saved.needs_save_on_shutdown = true;
                 self.saved.warning = Some(error.clone());
                 Some(format!(
                     "本轮结果尚未保存到本地，可先复制需要的 IP：{error}"
@@ -354,7 +400,7 @@ impl RuntimeState {
     fn interrupt_for_shutdown(&mut self, path: &std::path::Path) -> Result<(), String> {
         if !self.has_active_measurement()
             && !self.saved.pending_favorite_results
-            && self.saved.warning.is_none()
+            && !self.saved.needs_save_on_shutdown
         {
             return Ok(());
         }
@@ -391,6 +437,7 @@ impl RuntimeState {
         } else {
             next.warning = None;
             storage::save_replacing_history(path, &next, &self.saved.scan_history)?;
+            next.needs_save_on_shutdown = false;
             self.saved = next;
         }
         self.cancellation = None;
@@ -578,6 +625,7 @@ fn set_scan_history_baseline(
     let mut next = inner.saved.clone();
     next.set_history_baseline(&ip, run_id.as_deref())?;
     storage::save(&state.storage_path, &next)?;
+    next.needs_save_on_shutdown = false;
     inner.saved = next;
     Ok(inner.saved.history_comparison(&ip))
 }
@@ -615,6 +663,7 @@ fn save_config(config: ScanConfig, state: State<'_, AppState>) -> Result<(), Sca
         inner.saved = old;
         return Err(error.into());
     }
+    inner.saved.needs_save_on_shutdown = false;
     Ok(())
 }
 
@@ -749,10 +798,43 @@ fn delete_favorite(
     Ok(favorites)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadSettings {
+    target_url: String,
+    connect_timeout_ms: u64,
+    request_timeout_ms: u64,
+    download_rounds: usize,
+    download_seconds: u64,
+    download_budget_enabled: bool,
+    download_budget_mi_b: Option<u64>,
+}
+
+impl DownloadSettings {
+    fn apply(self, config: &ScanConfig) -> Result<ScanConfig, String> {
+        let budget = match (self.download_budget_enabled, self.download_budget_mi_b) {
+            (_, Some(budget)) => budget,
+            (false, None) => config.download_budget_mi_b,
+            (true, None) => return Err("请填写下载数据预算".into()),
+        };
+        Ok(ScanConfig {
+            target_url: self.target_url,
+            connect_timeout_ms: self.connect_timeout_ms,
+            request_timeout_ms: self.request_timeout_ms,
+            download_rounds: self.download_rounds,
+            download_seconds: self.download_seconds,
+            download_budget_enabled: self.download_budget_enabled,
+            download_budget_mi_b: budget,
+            ..config.clone()
+        })
+    }
+}
+
 #[tauri::command]
 async fn start_favorite_test(
-    config: ScanConfig,
+    config: Option<ScanConfig>,
     download_only: Option<bool>,
+    download_settings: Option<DownloadSettings>,
     folder_id: Option<String>,
     favorite_id: Option<String>,
     ip: Option<String>,
@@ -766,8 +848,15 @@ async fn start_favorite_test(
     let (done, worker) = watch::channel(());
     let (started, ips) = {
         let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
+        let persist_config = config.is_some();
+        let config = match (config, download_settings) {
+            (Some(config), None) => config,
+            (None, Some(settings)) if download_only => settings.apply(&inner.saved.config)?,
+            _ => return Err("请提供适用于本次测速的设置".into()),
+        };
         let started = inner.begin_favorite_test(
             config,
+            persist_config,
             download_only,
             folder_id.as_deref(),
             favorite_id.as_deref(),
@@ -790,23 +879,22 @@ async fn start_favorite_test(
         let callback_id = run_id.clone();
         let (checkpoint_updates, checkpoint_writer) =
             owned_state.start_checkpoint_writer(HistoryKind::Favorite, run_id.clone());
-        let (callback, forwarder) = progress_bridge(move |update, rows_changed| {
+        let (callback, forwarder) = progress_bridge(move |update| {
             let snapshot = callback_state.inner.lock().ok().and_then(|mut inner| {
                 let current = inner.saved.favorite_test.as_mut()?;
                 if current.run.id != callback_id || current.run.status != "running" {
                     return None;
                 }
-                let progress = apply_engine_update(&mut current.run, update, rows_changed);
-                let has_observations =
-                    progress.is_some() || current.run.results.iter().any(favorites::was_attempted);
+                let has_observations = update_has_observations(&update);
+                let progress = apply_engine_update(&mut current.run, update, true);
+                let revision = current.run.update_revision;
                 let payload = if let Some(progress) = progress {
                     DesktopUpdate::Progress(progress)
                 } else {
-                    current.record_observed_regions();
                     DesktopUpdate::Snapshot(current.clone())
                 };
-                inner.saved.measurement_revision += 1;
-                Some((payload, inner.saved.measurement_revision, has_observations))
+                inner.saved.measurement_revision = revision;
+                Some((payload, revision, has_observations))
             });
             if let Some((payload, revision, has_observations)) = snapshot {
                 if has_observations {
@@ -889,21 +977,22 @@ async fn start_scan(
         let callback_id = run_id.clone();
         let (checkpoint_updates, checkpoint_writer) =
             owned_state.start_checkpoint_writer(HistoryKind::Scan, run_id.clone());
-        let (callback, forwarder) = progress_bridge(move |update, rows_changed| {
+        let (callback, forwarder) = progress_bridge(move |update| {
             let snapshot = callback_state.inner.lock().ok().and_then(|mut inner| {
                 let current = inner.saved.last_run.as_mut()?;
                 if current.id != callback_id || current.status != "running" {
                     return None;
                 }
-                let progress = apply_engine_update(current, update, rows_changed);
-                let has_observations =
-                    progress.is_some() || current.results.iter().any(favorites::was_attempted);
+                let has_observations = update_has_observations(&update);
+                let track_regions = current.retest_ip.is_some();
+                let progress = apply_engine_update(current, update, track_regions);
+                let revision = current.update_revision;
                 let payload = match progress {
                     Some(progress) => DesktopUpdate::Progress(progress),
                     None => DesktopUpdate::Snapshot(current.clone()),
                 };
-                inner.saved.measurement_revision += 1;
-                Some((payload, inner.saved.measurement_revision, has_observations))
+                inner.saved.measurement_revision = revision;
+                Some((payload, revision, has_observations))
             });
             // Serialization can be expensive; never retain the state lock here.
             if let Some((payload, revision, has_observations)) = snapshot {
@@ -1032,16 +1121,24 @@ mod lifecycle_tests {
     use crate::history::compare_ip;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn slow_progress_delivery_keeps_only_the_latest_snapshot_without_blocking_producers() {
+    async fn slow_progress_delivery_coalesces_snapshots_and_keeps_latest_changes_per_row() {
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let received = delivered.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let started_tx = Mutex::new(Some(started_tx));
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Mutex::new(release_rx);
-        let (callback, forwarder) = progress_bridge(move |update, rows_changed| {
+        let (callback, forwarder) = progress_bridge(move |update| {
             let number = update.progress.completed;
-            received.lock().unwrap().push((number, rows_changed));
+            let changed: Vec<_> = update
+                .changed_rows
+                .into_iter()
+                .map(|(index, row)| (index, row.attempts))
+                .collect();
+            received
+                .lock()
+                .unwrap()
+                .push((number, update.results.is_some(), changed));
             if number == 1 {
                 started_tx.lock().unwrap().take().unwrap().send(()).unwrap();
                 release_rx
@@ -1051,31 +1148,38 @@ mod lifecycle_tests {
                     .unwrap();
             }
         });
-        let update = |number, results| EngineUpdate {
+        let update = |number, results, changed_rows| EngineUpdate {
             progress: ScanProgress {
                 completed: number,
                 ..Default::default()
             },
             results,
+            changed_rows,
         };
-        let first_rows = Arc::new(Vec::new());
-        let latest_rows = Arc::new(Vec::new());
-        callback(update(1, first_rows));
+        callback(update(1, Some(Arc::new(Vec::new())), BTreeMap::new()));
         started_rx.await.unwrap();
-        for number in 2..=100 {
-            callback(update(number, latest_rows.clone()));
+        callback(update(2, Some(Arc::new(Vec::new())), BTreeMap::new()));
+        for number in 3..100 {
+            let mut row = IpResult::new(Ipv4Addr::LOCALHOST);
+            row.attempts = number;
+            callback(update(number, None, BTreeMap::from([(number % 2, row)])));
         }
+        callback(update(100, None, BTreeMap::new()));
         drop(callback);
         release_tx.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(3), forwarder)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(*delivered.lock().unwrap(), vec![(1, true), (100, true)]);
+        assert_eq!(
+            *delivered.lock().unwrap(),
+            vec![(1, true, vec![]), (100, true, vec![(0, 98), (1, 99)])]
+        );
     }
 
     fn run(id: &str) -> ScanRun {
         ScanRun {
+            update_revision: 0,
             quick_validation: Some(false),
             retest_ip: None,
             download_only: false,
@@ -1206,6 +1310,7 @@ mod lifecycle_tests {
             let (started, _) = inner
                 .begin_favorite_test(
                     ScanConfig::default(),
+                    true,
                     false,
                     Some(&folder),
                     None,
@@ -1441,6 +1546,7 @@ mod lifecycle_tests {
             .begin_favorite_test(
                 config,
                 true,
+                true,
                 Some(&folder),
                 None,
                 None,
@@ -1512,6 +1618,7 @@ mod lifecycle_tests {
         let (late_start_response, _) = inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                true,
                 false,
                 Some(&folder),
                 None,
@@ -1553,6 +1660,7 @@ mod lifecycle_tests {
         let (note_update, _) = inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                true,
                 false,
                 Some(&folder),
                 None,
@@ -1634,6 +1742,7 @@ mod lifecycle_tests {
         let (started, _) = inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                true,
                 false,
                 Some(&folder),
                 None,
@@ -1778,6 +1887,40 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn closing_clean_state_does_not_retry_an_unavailable_favorite_source_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut saved = SavedState::default();
+        let id = uuid::Uuid::new_v4().to_string();
+        let mut measurement = run(&id);
+        let ip = "192.0.2.1";
+        measurement.config.source = "custom".into();
+        measurement.config.custom_ips = format!("{ip}\n# original source");
+        measurement.results.push(IpResult::new(ip.parse().unwrap()));
+        let folder = saved.favorites.folders[0].id.clone();
+        saved
+            .favorites
+            .save_snapshot(&folder, &measurement, ip, "")
+            .unwrap();
+        storage::save(&path, &saved).unwrap();
+        let backup = path
+            .with_extension("favorite-sources")
+            .join(format!("{id}.txt"));
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let saved = storage::load_for_startup(&path).unwrap();
+        assert!(saved.warning.as_deref().unwrap().contains("无法备份收藏"));
+        let mut inner = RuntimeState {
+            saved,
+            cancellation: None,
+            worker: None,
+        };
+        inner.interrupt_for_shutdown(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
     fn closing_recovered_state_keeps_the_original_corrupt_file_in_its_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
@@ -1892,6 +2035,7 @@ mod lifecycle_tests {
         inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                true,
                 false,
                 Some(&folder),
                 None,
@@ -1909,6 +2053,7 @@ mod lifecycle_tests {
         assert!(inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                true,
                 false,
                 Some(&folder),
                 None,
@@ -1933,6 +2078,7 @@ mod lifecycle_tests {
         assert!(inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                true,
                 false,
                 Some(&folder),
                 None,
@@ -1970,6 +2116,7 @@ mod lifecycle_tests {
             let (started, _) = inner
                 .begin_favorite_test(
                     config,
+                    true,
                     false,
                     Some(&folder),
                     None,
@@ -2018,6 +2165,7 @@ mod lifecycle_tests {
         let (started, _) = inner
             .begin_favorite_test(
                 config,
+                true,
                 false,
                 Some(&folder),
                 None,
@@ -2033,6 +2181,48 @@ mod lifecycle_tests {
             serde_json::to_value(&storage::load(&path).unwrap().config).unwrap(),
             previous_config
         );
+    }
+
+    #[test]
+    fn partial_download_settings_apply_only_to_the_retest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut inner = RuntimeState {
+            saved: SavedState::default(),
+            cancellation: None,
+            worker: None,
+        };
+        let previous = serde_json::to_value(&inner.saved.config).unwrap();
+        let settings = DownloadSettings {
+            target_url: inner.saved.config.target_url.clone(),
+            connect_timeout_ms: inner.saved.config.connect_timeout_ms,
+            request_timeout_ms: inner.saved.config.request_timeout_ms,
+            download_rounds: inner.saved.config.download_rounds,
+            download_seconds: 7,
+            download_budget_enabled: true,
+            download_budget_mi_b: Some(120),
+        };
+        let config = settings.apply(&inner.saved.config).unwrap();
+        let folder = inner.saved.favorites.folders[0].id.clone();
+        let (started, _) = inner
+            .begin_favorite_test(
+                config,
+                false,
+                true,
+                Some(&folder),
+                None,
+                Some("192.0.2.1"),
+                None,
+                CancellationToken::new(),
+                &path,
+            )
+            .unwrap();
+        assert_eq!(started.job.run.config.download_seconds, 7);
+        assert!(started.job.run.config.download_budget_enabled);
+        assert_eq!(started.job.run.config.download_budget_mi_b, 120);
+        let disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["config"], previous);
     }
 
     #[test]
@@ -2053,6 +2243,7 @@ mod lifecycle_tests {
                     max_tcp_ms: Some(231.0),
                     ..ScanConfig::default()
                 },
+                true,
                 false,
                 Some(&folder),
                 None,
@@ -2093,6 +2284,7 @@ mod lifecycle_tests {
         let (started, _) = inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                true,
                 false,
                 Some(&folder),
                 None,

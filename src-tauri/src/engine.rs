@@ -3,8 +3,8 @@
 //! checks the connected peer. Results describe the current network and target.
 
 use crate::model::{
-    compare_ip_results_with_metric, parse_custom_candidates, pop, CustomCandidates, ExclusionCode,
-    IpResult, ScanCommandError, ScanConfig, ScanProgress, StabilityBatch,
+    parse_custom_candidates, pop, sort_result_indices, CustomCandidates, ExclusionCode, IpResult,
+    ScanCommandError, ScanConfig, ScanProgress, StabilityBatch,
 };
 use crate::stability::{measure_tcp_connect, TcpConnectFailure, TcpConnectFailureKind};
 use futures_util::{stream, StreamExt};
@@ -13,7 +13,7 @@ use rand::Rng;
 use reqwest::{header, redirect::Policy, Client, Response};
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::Range,
     sync::Arc,
@@ -48,7 +48,20 @@ const DOWNLOAD_CANDIDATES_PER_REGION: usize = 10;
 #[derive(Debug, Clone)]
 pub struct EngineUpdate {
     pub progress: ScanProgress,
-    pub results: Arc<Vec<IpResult>>,
+    pub results: Option<Arc<Vec<IpResult>>>,
+    pub changed_rows: BTreeMap<usize, IpResult>,
+}
+
+impl EngineUpdate {
+    pub(crate) fn coalesce(&mut self, newer: Self) {
+        self.progress = newer.progress;
+        if newer.results.is_some() {
+            self.results = newer.results;
+            self.changed_rows = newer.changed_rows;
+        } else {
+            self.changed_rows.extend(newer.changed_rows);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,36 +93,61 @@ struct State {
     progress: ScanProgress,
     results: Vec<IpResult>,
     last_event: Instant,
-    last_emitted_results: Option<Arc<Vec<IpResult>>>,
+}
+
+struct DownloadUpdates {
+    changed: BTreeSet<usize>,
+    completed: usize,
+    downloaded_bytes: u64,
+    message: String,
 }
 
 impl State {
     fn emit(&mut self, callback: &UpdateCallback, force: bool) {
         if force || self.last_event.elapsed() >= EVENT_INTERVAL {
-            let results = Arc::new(self.results.clone());
-            self.last_emitted_results = Some(results.clone());
-            self.send_update(callback, results);
+            self.send_update(
+                callback,
+                Some(Arc::new(self.results.clone())),
+                BTreeMap::new(),
+            );
         }
     }
 
-    /// Use only between emissions that bracket a download body read. Rows
-    /// cannot change in this interval. A coalesced update retains its snapshot.
-    fn emit_download_bytes(&mut self, callback: &UpdateCallback, downloaded_bytes: u64) {
-        if downloaded_bytes == self.progress.downloaded_bytes
-            || self.last_event.elapsed() < EVENT_INTERVAL
+    fn emit_download_progress(
+        &mut self,
+        callback: &UpdateCallback,
+        updates: &mut DownloadUpdates,
+        downloaded_bytes: u64,
+    ) {
+        if self.last_event.elapsed() < EVENT_INTERVAL
+            || (updates.changed.is_empty()
+                && updates.completed == self.progress.completed
+                && updates.downloaded_bytes == downloaded_bytes
+                && updates.message == self.progress.message)
         {
             return;
         }
         self.progress.downloaded_bytes = downloaded_bytes;
-        if let Some(results) = self.last_emitted_results.clone() {
-            self.send_update(callback, results);
-        }
+        updates.completed = self.progress.completed;
+        updates.downloaded_bytes = downloaded_bytes;
+        updates.message.clone_from(&self.progress.message);
+        let changed_rows = std::mem::take(&mut updates.changed)
+            .into_iter()
+            .map(|index| (index, self.results[index].clone()))
+            .collect();
+        self.send_update(callback, None, changed_rows);
     }
 
-    fn send_update(&mut self, callback: &UpdateCallback, results: Arc<Vec<IpResult>>) {
+    fn send_update(
+        &mut self,
+        callback: &UpdateCallback,
+        results: Option<Arc<Vec<IpResult>>>,
+        changed_rows: BTreeMap<usize, IpResult>,
+    ) {
         callback(EngineUpdate {
             progress: self.progress.clone(),
             results,
+            changed_rows,
         });
         self.last_event = Instant::now();
     }
@@ -135,13 +173,13 @@ impl State {
         attempts: usize,
         callback: &UpdateCallback,
     ) {
-        self.progress.stability_batch = Some(StabilityBatch {
+        self.progress.stability_batch = Some(Arc::new(StabilityBatch {
             number,
             candidate_ips: candidates
                 .iter()
                 .map(|index| self.results[*index].ip.clone())
                 .collect(),
-        });
+        }));
         self.stage(
             "stabilizing",
             candidates.len() * attempts,
@@ -150,11 +188,18 @@ impl State {
         );
     }
 
-    fn cancel(mut self, config: &ScanConfig, callback: &UpdateCallback) -> EngineOutcome {
+    fn cancel(
+        mut self,
+        config: &ScanConfig,
+        scope: ScanScope,
+        callback: &UpdateCallback,
+    ) -> EngineOutcome {
         for item in &mut self.results {
             item.mark_cancelled(config);
         }
-        rank_results(&mut self.results, config, false);
+        if scope != ScanScope::DownloadOnly {
+            rank_results(&mut self.results, config, false);
+        }
         self.progress.stage = "cancelled".into();
         self.progress.stability_batch = None;
         self.progress.precision_batch = None;
@@ -236,7 +281,7 @@ pub(crate) async fn run_download_test(
     cancellation: CancellationToken,
     callback: UpdateCallback,
 ) -> Result<EngineOutcome, String> {
-    config.validate()?;
+    config.validate_download_only()?;
     let ips = unique_targeted_ips(ips)?;
     run_candidates(config, ips, ScanScope::DownloadOnly, cancellation, callback).await
 }
@@ -277,7 +322,6 @@ async fn run_candidates(
         },
         results: ips.iter().map(|ip| IpResult::new(*ip)).collect(),
         last_event: Instant::now(),
-        last_emitted_results: None,
     };
     if scope == ScanScope::DownloadOnly {
         let schedule = DownloadQueue::from_batches(
@@ -302,7 +346,7 @@ async fn run_candidates(
         )
         .await
         {
-            return Ok(state.cancel(&config, &callback));
+            return Ok(state.cancel(&config, scope, &callback));
         }
         state.progress.stage = "completed".into();
         let completed = state
@@ -357,7 +401,7 @@ async fn run_candidates(
     tokio::pin!(tcp);
     while let Some((index, path, outcome)) = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => { return Ok(state.cancel(&config, &callback)); }
+        _ = cancellation.cancelled() => { return Ok(state.cancel(&config, scope, &callback)); }
         next = tcp.next() => next
     } {
         if scope == ScanScope::Targeted {
@@ -397,7 +441,7 @@ async fn run_candidates(
     tokio::pin!(discoveries);
     while let Some((index, outcome)) = tokio::select! {
         biased;
-        _ = cancellation.cancelled() => { return Ok(state.cancel(&config, &callback)); }
+        _ = cancellation.cancelled() => { return Ok(state.cancel(&config, scope, &callback)); }
         next = discoveries.next() => next
     } {
         let item = &mut state.results[index];
@@ -452,13 +496,13 @@ async fn run_candidates(
     // Finish the whole bounded regional pool before choosing any downloads.
     // Only two cumulative connection failures can stop an individual probe early.
     let stability_candidates = download_schedule(&groups, &config.regions, 1);
-    state.progress.precision_batch = Some(StabilityBatch {
+    state.progress.precision_batch = Some(Arc::new(StabilityBatch {
         number: 1,
         candidate_ips: stability_candidates
             .iter()
             .map(|index| state.results[*index].ip.clone())
             .collect(),
-    });
+    }));
     let attempts = config
         .stability_attempts
         .expect("validated stability count");
@@ -489,7 +533,7 @@ async fn run_candidates(
                     }
                 }
                 drain_stability_updates(&mut state, &mut stability_updates);
-                return Ok(state.cancel(&config, &callback));
+                return Ok(state.cancel(&config, scope, &callback));
             }
             Some((index, snapshot)) = stability_updates.recv() => {
                 apply_stability_snapshot(&mut state, index, snapshot);
@@ -508,7 +552,7 @@ async fn run_candidates(
     drop(updates);
     drain_stability_updates(&mut state, &mut stability_updates);
     if cancellation.is_cancelled() {
-        return Ok(state.cancel(&config, &callback));
+        return Ok(state.cancel(&config, scope, &callback));
     }
     for index in &stability_candidates {
         if let Some((code, reason)) = state.results[*index].stability_exclusion_details(&config) {
@@ -518,13 +562,13 @@ async fn run_candidates(
 
     let download_groups = choose_download_candidates(&mut state.results, &groups, &config, scope);
     let download_candidates = download_schedule(&download_groups, &config.regions, 1);
-    state.progress.precision_batch = Some(StabilityBatch {
+    state.progress.precision_batch = Some(Arc::new(StabilityBatch {
         number: 1,
         candidate_ips: download_candidates
             .iter()
             .map(|index| state.results[*index].ip.clone())
             .collect(),
-    });
+    }));
     state.stage(
         "verifying",
         download_candidates.len(),
@@ -553,7 +597,7 @@ async fn run_candidates(
     )
     .await
     {
-        return Ok(state.cancel(&config, &callback));
+        return Ok(state.cancel(&config, scope, &callback));
     }
 
     let verified_groups = download_groups
@@ -593,7 +637,7 @@ async fn run_candidates(
     )
     .await
     {
-        return Ok(state.cancel(&config, &callback));
+        return Ok(state.cancel(&config, scope, &callback));
     }
 
     for item in &mut state.results {
@@ -661,6 +705,12 @@ async fn run_downloads(
 ) -> bool {
     let total_budget = config.download_budget_bytes();
     let mut used = 0_u64;
+    let mut updates = DownloadUpdates {
+        changed: BTreeSet::new(),
+        completed: state.progress.completed,
+        downloaded_bytes: state.progress.downloaded_bytes,
+        message: state.progress.message.clone(),
+    };
     while let Some(slot) = schedule.next(total_budget, used) {
         if cancellation.is_cancelled() {
             state.progress.downloaded_bytes = used;
@@ -674,7 +724,8 @@ async fn run_downloads(
                     "剩余下载预算不足以安排全部复测轮次",
                 );
                 state.progress.completed += config.download_rounds;
-                state.emit(callback, false);
+                updates.changed.insert(index);
+                state.emit_download_progress(callback, &mut updates, used);
                 continue;
             }
         };
@@ -694,7 +745,7 @@ async fn run_downloads(
             state.results[index].download_samples_mbps.len() + 1,
             config.download_rounds
         );
-        state.emit(callback, true);
+        state.emit_download_progress(callback, &mut updates, used);
 
         if scope == ScanScope::DownloadOnly && state.results[index].download_samples_mbps.is_empty()
         {
@@ -722,7 +773,7 @@ async fn run_downloads(
                 }
                 result = &mut download => break result,
                 _ = ticker.tick() => {
-                    state.emit_download_bytes(callback, used + counter.load(std::sync::atomic::Ordering::Relaxed));
+                    state.emit_download_progress(callback, &mut updates, used + counter.load(std::sync::atomic::Ordering::Relaxed));
                 }
             }
         };
@@ -732,9 +783,10 @@ async fn run_downloads(
             Ok(sample) if scope == ScanScope::DownloadOnly => {
                 let item = &mut state.results[index];
                 record_download_sample(item, sample.mbps);
-                if let Some(colo) = sample.colo {
-                    record_observed_colo(item, &colo);
+                if let Some(colo) = &sample.colo {
+                    record_observed_colo(item, colo);
                 }
+                item.download_sample_colos.push(sample.colo);
             }
             Ok(sample) => {
                 if !record_download(
@@ -755,7 +807,8 @@ async fn run_downloads(
             state.progress.completed += schedule.skip_remaining_rounds(index);
         }
         state.progress.completed += 1;
-        state.emit(callback, false);
+        updates.changed.insert(index);
+        state.emit_download_progress(callback, &mut updates, used);
     }
 
     !cancellation.is_cancelled()
@@ -1521,14 +1574,12 @@ fn choose_download_groups(
                         && results[*index].stability_exclusion(config).is_none()
                 })
                 .collect();
-            entries.sort_by(|a, b| {
-                compare_ip_results_with_metric(
-                    &results[*a],
-                    &results[*b],
-                    "daily",
-                    &config.stability_latency_metric,
-                )
-            });
+            sort_result_indices(
+                &mut entries,
+                results,
+                "daily",
+                &config.stability_latency_metric,
+            );
             if let Some(limit) = limit {
                 for index in entries.iter().skip(limit) {
                     results[*index].exclude(
@@ -1664,6 +1715,9 @@ fn rank_results(results: &mut [IpResult], config: &ScanConfig, completed: bool) 
         result.measurement_passed = result.has_complete_measurement(config);
         result.apply_recommendation_threshold(config);
     }
+    if !completed {
+        return;
+    }
     for region in &config.regions {
         let mut entries: Vec<_> = results
             .iter()
@@ -1671,18 +1725,14 @@ fn rank_results(results: &mut [IpResult], config: &ScanConfig, completed: bool) 
             .filter(|(_, r)| r.eligible && r.region_code == *region)
             .map(|(i, _)| i)
             .collect();
-        entries.sort_by(|a, b| {
-            compare_ip_results_with_metric(
-                &results[*a],
-                &results[*b],
-                &config.preference,
-                &config.stability_latency_metric,
-            )
-        });
-        if completed {
-            for (rank, index) in entries.into_iter().take(config.ips_per_region).enumerate() {
-                results[index].role = Some(if rank == 0 { "primary" } else { "backup" }.into());
-            }
+        sort_result_indices(
+            &mut entries,
+            results,
+            &config.preference,
+            &config.stability_latency_metric,
+        );
+        for (rank, index) in entries.into_iter().take(config.ips_per_region).enumerate() {
+            results[index].role = Some(if rank == 0 { "primary" } else { "backup" }.into());
         }
     }
 }
@@ -1992,7 +2042,6 @@ mod tests {
             progress: ScanProgress::default(),
             results: rows,
             last_event: Instant::now(),
-            last_emitted_results: None,
         }
     }
 
@@ -2365,7 +2414,7 @@ mod tests {
         assert!(!finished);
         assert_eq!(calls.get(), 3);
         assert_eq!(state.progress.completed, 0);
-        let outcome = state.cancel(&config, &callback);
+        let outcome = state.cancel(&config, ScanScope::Regional, &callback);
         let saved = &outcome.results[0];
         assert!(outcome.cancelled);
         assert_eq!(saved.attempts, 3, "cancelled request was counted");
@@ -2466,7 +2515,11 @@ mod tests {
                 .await
             );
             let state = verification_state(vec![row]);
-            let outcome = state.cancel(&config, &(Arc::new(|_| {}) as UpdateCallback));
+            let outcome = state.cancel(
+                &config,
+                ScanScope::Regional,
+                &(Arc::new(|_| {}) as UpdateCallback),
+            );
             let saved = &outcome.results[0];
             assert_eq!(saved.attempts, 5);
             assert_eq!(saved.success_count, 5);
@@ -2484,6 +2537,7 @@ mod tests {
                 saved.exclusion_code,
                 Some(ExclusionCode::PopRecheckIncomplete)
             );
+            assert_eq!(saved.download_pop_complete(false), Some(false));
             assert!(!saved.has_complete_measurement(&config));
             assert!(
                 !saved.measurement_passed,
@@ -2537,6 +2591,7 @@ mod tests {
                 Err(_) => Some(ExclusionCode::PopRecheckFailure),
             };
             assert_eq!(row.exclusion_code, code);
+            assert_eq!(row.download_pop_complete(false), Some(response.is_ok()));
         }
     }
 
@@ -3540,15 +3595,14 @@ mod tests {
             progress: ScanProgress {
                 stage: "stabilizing".into(),
                 total: 100,
-                stability_batch: Some(StabilityBatch {
+                stability_batch: Some(Arc::new(StabilityBatch {
                     number: 2,
                     candidate_ips: vec![row.ip.clone()],
-                }),
+                })),
                 ..Default::default()
             },
             results: vec![row],
             last_event: Instant::now(),
-            last_emitted_results: None,
         };
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         sender
@@ -3565,7 +3619,7 @@ mod tests {
         assert!(!state.progress.message.contains("第 0 批"));
         assert!(state.progress.message.contains("耗时高于目标样本"));
         let callback: UpdateCallback = Arc::new(|_| {});
-        let outcome = state.cancel(&ScanConfig::default(), &callback);
+        let outcome = state.cancel(&ScanConfig::default(), ScanScope::Regional, &callback);
         let stats = outcome.results[0].tcp_stability.as_ref().unwrap();
         assert_eq!(stats.attempted, 3);
         assert_eq!(stats.succeeded, 3);
@@ -3584,15 +3638,14 @@ mod tests {
             progress: ScanProgress {
                 stage: "stabilizing".into(),
                 total: 100,
-                stability_batch: Some(StabilityBatch {
+                stability_batch: Some(Arc::new(StabilityBatch {
                     number: 1,
                     candidate_ips: vec![row.ip.clone()],
-                }),
+                })),
                 ..Default::default()
             },
             results: vec![row],
             last_event: Instant::now(),
-            last_emitted_results: None,
         };
         let mut rejected = crate::stability::summarize(100, 230.0, vec![None, None]);
         rejected.early_rejection =
@@ -3627,15 +3680,14 @@ mod tests {
     fn precision_batch_persists_across_its_stages_and_clears_outside_precision() {
         let mut state = State {
             progress: ScanProgress {
-                precision_batch: Some(StabilityBatch {
+                precision_batch: Some(Arc::new(StabilityBatch {
                     number: 3,
                     candidate_ips: vec!["192.0.2.1".into()],
-                }),
+                })),
                 ..Default::default()
             },
             results: vec![IpResult::new(Ipv4Addr::new(192, 0, 2, 1))],
             last_event: Instant::now(),
-            last_emitted_results: None,
         };
         let callback: UpdateCallback = Arc::new(|_| {});
         for stage in ["verifying", "stabilizing", "downloading"] {
@@ -3655,7 +3707,6 @@ mod tests {
             progress: Default::default(),
             results: vec![previous, second, third],
             last_event: Instant::now(),
-            last_emitted_results: None,
         };
         let emitted = Arc::new(std::sync::Mutex::new(Vec::<EngineUpdate>::new()));
         let captured = emitted.clone();
@@ -3672,7 +3723,11 @@ mod tests {
             assert_eq!(batch.number, 2);
             assert_eq!(batch.candidate_ips, ["192.0.2.2"]);
             assert_eq!(
-                first.results[0].tcp_stability.as_ref().unwrap().attempted,
+                first.results.as_ref().unwrap()[0]
+                    .tcp_stability
+                    .as_ref()
+                    .unwrap()
+                    .attempted,
                 100
             );
         }
@@ -4019,8 +4074,18 @@ mod tests {
         });
         let config = ScanConfig {
             target_url: format!("https://ip-picker-fixture.invalid:{port}/download"),
+            regions: Vec::new(),
+            stability_attempts: None,
+            verification_attempts: 0,
             ..Default::default()
         };
+        assert!(config.validate().is_err());
+        assert!(ScanConfig {
+            download_rounds: 1,
+            ..config.clone()
+        }
+        .validate_download_only()
+        .is_err());
         let stages = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = stages.clone();
         let outcome = run_download_test(

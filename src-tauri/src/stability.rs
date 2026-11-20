@@ -175,15 +175,23 @@ pub fn latency_metric_ms(probes: &[Option<f64>], metric: &str) -> Option<f64> {
     {
         return None;
     }
+    if metric == "max" {
+        return probes.iter().flatten().copied().max_by(f64::total_cmp);
+    }
     let mut successful: Vec<_> = probes.iter().flatten().copied().collect();
     if successful.is_empty() {
         return None;
     }
-    successful.sort_by(f64::total_cmp);
     match metric {
-        "average" => Some(successful.iter().sum::<f64>() / successful.len() as f64),
-        "p95" => Some(successful[(95 * successful.len()).div_ceil(100) - 1]),
-        "max" => successful.last().copied(),
+        "average" => {
+            // Match the summation order in summarize and in existing records.
+            successful.sort_by(f64::total_cmp);
+            Some(successful.iter().sum::<f64>() / successful.len() as f64)
+        }
+        "p95" => {
+            let index = (95 * successful.len()).div_ceil(100) - 1;
+            Some(*successful.select_nth_unstable_by(index, f64::total_cmp).1)
+        }
         _ => None,
     }
     .filter(|value| value.is_finite())

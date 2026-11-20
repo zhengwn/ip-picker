@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 import { Check, ChevronDown, ChevronRight, CircleAlert, Clipboard, Download, FolderOpen, History, LoaderCircle, Pencil, Plus, RotateCcw, Search, Settings2, Square, Star, Trash2, X } from '@lucide/vue'
 import { regionName, type ScanConfig } from '../types'
 import { validManualIpv4 } from '../custom-ips'
-import { candidateExclusionReason, candidateMeasurementStatus, downloadMeasurementStatus, hasCompleteDownload, precisionPolicyLabel, targetHost } from '../ui-state'
+import { candidateExclusionReason, candidateMeasurementStatus, downloadMeasurementStatus, hasCompleteDownload, precisionPolicyLabel, targetHost, validateConfig } from '../ui-state'
 import { favoriteDate, favoriteError, favoriteHasTestData, favoriteNumber, favoriteRunStatus, favoriteSnapshotRun, favoriteTestDate, favoriteTestChanges, favoriteTestPassedCount, favoriteTestPhase, type FavoriteEntry, type FavoriteFolder, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from '../favorites'
 import { preferredFavoriteFolder, rememberFavoriteFolder } from '../favorite-preferences'
 import { useDismissiblePopover } from '../popovers'
@@ -109,7 +109,7 @@ function entryState(entry: FavoriteEntry) {
     return entry.downloadTest || favoriteHasTestData(entry) ? `${label} · 显示上次结果` : label
   }
   if (entry.downloadTest) return downloadMeasurementStatus(entry.downloadTest.result, entry.downloadTest.config)
-  return favoriteHasTestData(entry) ? candidateMeasurementStatus(entry.result, favoriteSnapshotRun(entry)) : '尚未测速'
+  return favoriteHasTestData(entry) ? candidateMeasurementStatus(entry.result, favoriteSnapshotRun(entry, props.library.candidateLists)) : '尚未测速'
 }
 function detailId(id: string) { return `favorite-detail-${encodeURIComponent(id)}` }
 function toggleId(id: string) { return `favorite-toggle-${encodeURIComponent(id)}` }
@@ -221,7 +221,19 @@ async function startTest(target: { folderId?: string; favoriteId?: string; ip?: 
   testError.value = ''
   error.value = ''
   try {
-    const start = await invoke<FavoriteTestStart>('start_favorite_test', { config: JSON.parse(JSON.stringify(props.config)), ...target })
+    const config = props.config
+    let settings: { config?: ScanConfig; downloadSettings?: Partial<ScanConfig> }
+    if (target.downloadOnly && validateConfig(config)) {
+      const { targetUrl, connectTimeoutMs, requestTimeoutMs, downloadRounds, downloadSeconds, downloadBudgetEnabled, downloadBudgetMiB } = config
+      settings = { downloadSettings: {
+        targetUrl, connectTimeoutMs, requestTimeoutMs, downloadRounds, downloadSeconds,
+        downloadBudgetEnabled: downloadBudgetEnabled !== false,
+        downloadBudgetMiB: downloadBudgetEnabled !== false ? downloadBudgetMiB : undefined,
+      } }
+    } else {
+      settings = { config: JSON.parse(JSON.stringify(config)) }
+    }
+    const start = await invoke<FavoriteTestStart>('start_favorite_test', { ...settings, ...target })
     localJob.value = start.job
     emit('test-started', start)
     if (target.folderId) rememberFavoriteFolder(target.folderId)

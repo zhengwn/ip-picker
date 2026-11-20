@@ -120,6 +120,8 @@ let clock: ReturnType<typeof setInterval> | undefined
 let saveTimer: ReturnType<typeof setTimeout> | undefined
 let toastTimer: ReturnType<typeof setTimeout> | undefined
 let previousRunIdForStart: string | undefined
+const scanProgressBuffer = createProgressBuffer()
+const favoriteProgressBuffer = createProgressBuffer()
 // Invalid drafts never replace the most recent valid settings awaiting a save.
 let pendingConfig: ScanConfig | null = null
 let configSavePromise: Promise<void> | undefined
@@ -244,7 +246,10 @@ function persistConfig(flush = false): Promise<void> {
       } catch (error) {
         // A rejected draft should neither overwrite saved settings nor block
         // window close. Storage errors still keep the pending write for retry.
-        if (!receiveConfigRejection(error, snapshot)) throw error
+        if (!receiveConfigRejection(error, snapshot)) {
+          if (!drainConfigSaves && configSaveDue && pendingConfig !== snapshot) continue
+          throw error
+        }
       }
       // Edits made while this write was in flight need their own subsequent save.
       if (pendingConfig === snapshot) pendingConfig = null
@@ -312,7 +317,7 @@ async function importIps(event: Event) {
 }
 function receiveRun(next: ScanRun, allowNewerSnapshot = false) {
   // Events can finish a short scan before an earlier command snapshot arrives.
-  if (run.value?.id === next.id && run.value.status !== 'running' && next.status === 'running') return
+  if (staleRunningSnapshot(run.value, next)) return
   if (starting.value && next.id === previousRunIdForStart) return
   if (run.value && run.value.id !== next.id && !starting.value) {
     if (!allowNewerSnapshot || Date.parse(next.startedAt) <= Date.parse(run.value.startedAt)) return
@@ -324,17 +329,88 @@ function receiveRun(next: ScanRun, allowNewerSnapshot = false) {
   const wasRunning = run.value?.status === 'running'
   if (next.status !== 'running' && (wasRunning || run.value?.id !== next.id)) historyRevision.value++
   run.value = next
+  replayProgress(run.value, scanProgressBuffer)
   if (next.status !== 'running') {
     if (stoppingRunId.value === next.id) stoppingRunId.value = null
     if (wasRunning) notify(next.status === 'completed' ? '测试已完成，可在结果表筛选 IP' : next.status === 'cancelled' ? '测试已停止，已完成的候选已保留' : next.error ?? '测试未完成，请查看错误详情', next.status === 'failed')
   }
 }
-type ProgressOnly = { id: string; downloadedBytes: number }
+type ProgressOnly = {
+  id: string
+  updateRevision?: number
+  downloadedBytes: number
+  completed?: number
+  message?: string
+  changedRows?: Record<number, IpResult>
+  regions?: string[]
+}
+type ProgressBuffer = { runId?: string; updates: Map<number, ProgressOnly>; refreshing: boolean; refreshPending: boolean }
+function createProgressBuffer(): ProgressBuffer {
+  return { updates: new Map(), refreshing: false, refreshPending: false }
+}
+function staleRunningSnapshot(current: ScanRun | null | undefined, next: ScanRun) {
+  return current?.id === next.id && next.status === 'running'
+    && (current.status !== 'running' || (next.updateRevision ?? 0) < (current.updateRevision ?? 0))
+}
 function receiveProgress(current: ScanRun | null | undefined, next: ProgressOnly) {
-  if (current?.id === next.id && current.status === 'running'
-    && next.downloadedBytes > current.progress.downloadedBytes) {
-    current.progress.downloadedBytes = next.downloadedBytes
+  if (current?.id !== next.id || current.status !== 'running') return
+  current.progress.downloadedBytes = Math.max(current.progress.downloadedBytes, next.downloadedBytes)
+  if (next.completed !== undefined) current.progress.completed = next.completed
+  if (next.message !== undefined) current.progress.message = next.message
+  if (next.regions) current.config.regions = next.regions
+  for (const [index, row] of Object.entries(next.changedRows ?? {})) {
+    if (current.results[Number(index)]?.ip === row.ip) current.results[Number(index)] = row
   }
+  if (next.updateRevision !== undefined) current.updateRevision = next.updateRevision
+}
+function replayProgress(current: ScanRun | null | undefined, buffer: ProgressBuffer) {
+  if (!current || current.id !== buffer.runId) return
+  if (current.status !== 'running') { buffer.updates.clear(); return }
+  let revision = current.updateRevision ?? 0
+  for (const queued of buffer.updates.keys()) {
+    if (queued <= revision) buffer.updates.delete(queued)
+  }
+  while (buffer.updates.has(revision + 1)) {
+    const next = buffer.updates.get(++revision)!
+    buffer.updates.delete(revision)
+    receiveProgress(current, next)
+  }
+}
+function queueProgress(current: ScanRun | null | undefined, next: ProgressOnly, buffer: ProgressBuffer) {
+  const revision = next.updateRevision
+  if (revision === undefined) { receiveProgress(current, next); return false }
+  if (current?.id === next.id && (current.status !== 'running' || revision <= (current.updateRevision ?? 0))) return false
+  if (buffer.runId !== next.id) {
+    if (current?.status === 'running' && current.id !== next.id) return false
+    buffer.runId = next.id
+    buffer.updates.clear()
+  }
+  buffer.updates.set(revision, next)
+  replayProgress(current, buffer)
+  return buffer.updates.size > 0
+}
+async function refreshProgress<T>(buffer: ProgressBuffer, command: string, accept: (snapshot: T) => void) {
+  if (loading.value || disposed || !buffer.updates.size) return
+  if (buffer.refreshing) {
+    buffer.refreshPending = true
+    return
+  }
+  buffer.refreshing = true
+  try {
+    do {
+      buffer.refreshPending = false
+      try {
+        const snapshot = await invoke<T | null>(command)
+        if (!disposed && snapshot) accept(snapshot)
+      } catch { /* An update queued during this read can still trigger a follow-up. */ }
+    } while (!disposed && buffer.refreshPending && buffer.updates.size)
+  } finally { buffer.refreshing = false }
+}
+function refreshScanProgress() {
+  return refreshProgress<ScanRun>(scanProgressBuffer, 'get_scan', snapshot => receiveRun(snapshot, true))
+}
+function refreshFavoriteProgress() {
+  return refreshProgress<FavoriteTestJob>(favoriteProgressBuffer, 'get_favorite_test', receiveFavoriteTest)
 }
 async function startScan(quick = false, retest?: { ip: string; config: ScanConfig }) {
   if (!desktop || locked.value || (!retest && validation.value)) return
@@ -351,7 +427,7 @@ async function startScan(quick = false, retest?: { ip: string; config: ScanConfi
     const next = await invoke<ScanRun>('start_scan', retest
       ? { config: snapshot, persistConfig: false, retestIp: retest.ip }
       : { config: snapshot, persistConfig: !quick })
-    if (run.value?.id !== next.id) run.value = next
+    if (run.value?.id !== next.id) receiveRun(next)
     if (retest && workspace.value !== 'scan') await showWorkspace('scan')
     await nextTick()
     if (progressPanel.value) {
@@ -360,7 +436,7 @@ async function startScan(quick = false, retest?: { ip: string; config: ScanConfi
     }
     const beforeRefresh = run.value
     const latest = await invoke<ScanRun | null>('get_scan')
-    if (run.value === beforeRefresh && latest?.id === next.id) receiveRun(latest)
+    if (latest?.id === next.id && (latest.updateRevision !== undefined || run.value === beforeRefresh)) receiveRun(latest)
   } catch (error) {
     if (retest) notify(commandValidationIssue(error)?.message ?? errorText(error), true)
     else if (!receiveConfigRejection(error, settings) && !configSaveError.value) pageError.value = errorText(error)
@@ -414,7 +490,7 @@ async function refreshFavorites() {
 }
 function receiveFavoriteTest(next: FavoriteTestJob) {
   const current = favoriteTest.value
-  if (current?.run.id === next.run.id && current.run.status !== 'running' && next.run.status === 'running') return
+  if (staleRunningSnapshot(current?.run, next.run)) return
   if (current && current.run.id !== next.run.id && Date.parse(next.run.startedAt) < Date.parse(current.run.startedAt)) return
   if (current?.run.id === next.run.id && next.run.status === 'running'
     && current.run.progress?.downloadedBytes > next.run.progress?.downloadedBytes) {
@@ -423,6 +499,7 @@ function receiveFavoriteTest(next: FavoriteTestJob) {
   const finishedNow = current?.run.id === next.run.id && current.run.status === 'running' && next.run.status !== 'running'
   if (next.run.status !== 'running' && (finishedNow || current?.run.id !== next.run.id)) historyRevision.value++
   favoriteTest.value = next
+  replayProgress(favoriteTest.value.run, favoriteProgressBuffer)
   if (next.run.status !== 'running' && stoppingRunId.value === next.run.id) stoppingRunId.value = null
   if (finishedNow) {
     const passed = favoriteTestPassedCount(next.run)
@@ -492,7 +569,7 @@ onMounted(async () => {
     unlistenClose = stopClose
     const stopUpdates = await listen<ScanRun | ProgressOnly>('scan-update', ({ payload }) => {
       if ('results' in payload) receiveRun(payload)
-      else receiveProgress(run.value, payload)
+      else if (queueProgress(run.value, payload, scanProgressBuffer)) void refreshScanProgress()
     })
     if (disposed) { stopUpdates(); return }
     unlisten = stopUpdates
@@ -501,7 +578,7 @@ onMounted(async () => {
     unlistenStorage = stopWarnings
     const stopFavoriteTests = await listen<FavoriteTestJob | ProgressOnly>('favorite-test-update', ({ payload }) => {
       if ('run' in payload) receiveFavoriteTest(payload)
-      else receiveProgress(favoriteTest.value?.run, payload)
+      else if (queueProgress(favoriteTest.value?.run, payload, favoriteProgressBuffer)) void refreshFavoriteProgress()
     })
     if (disposed) { stopFavoriteTests(); return }
     unlistenFavoriteTest = stopFavoriteTests
@@ -514,17 +591,22 @@ onMounted(async () => {
     updateFavorites(saved.favorites ?? defaultFavoriteLibrary())
     if (saved.favoriteTest && !favoriteTest.value) receiveFavoriteTest(saved.favoriteTest)
     if (!storageWarning.value) storageWarning.value = saved.warning ?? ''
-    if (!run.value) run.value = saved.lastRun ?? null
+    if (!run.value && saved.lastRun) receiveRun(saved.lastRun)
     const beforeScanRefresh = run.value
     const current = await invoke<ScanRun | null>('get_scan')
     if (disposed) return
-    if (current && run.value === beforeScanRefresh) receiveRun(current, true)
+    if (current && (current.updateRevision !== undefined || run.value === beforeScanRefresh)) receiveRun(current, true)
     const beforeFavoriteRefresh = favoriteTest.value
     const latestFavoriteTest = await invoke<FavoriteTestJob | null>('get_favorite_test')
     if (disposed) return
-    if (latestFavoriteTest && favoriteTest.value === beforeFavoriteRefresh) receiveFavoriteTest(latestFavoriteTest)
+    if (latestFavoriteTest && (latestFavoriteTest.run.updateRevision !== undefined || favoriteTest.value === beforeFavoriteRefresh)) receiveFavoriteTest(latestFavoriteTest)
   } catch (error) { pageError.value = `初始化失败：${errorText(error)}` }
-  finally { initialized.value = true; loading.value = false }
+  finally {
+    initialized.value = true
+    loading.value = false
+    void refreshScanProgress()
+    void refreshFavoriteProgress()
+  }
 })
 onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unlistenFavoriteTest?.(); unlistenFavorites?.(); unlistenClose?.(); clearInterval(clock); clearTimeout(saveTimer); clearTimeout(toastTimer) })
 </script>

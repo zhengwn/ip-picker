@@ -70,6 +70,47 @@ test('history compares the exact requested IP and scales TCP charts across match
   assert.ok(state.tcpScale.value >= 400)
 })
 
+test('history does not confirm a missing POP after a full scan was stopped during a POP recheck', async context => {
+  const ip = '104.16.0.1'
+  const complete = match(ip, 'en0')
+  const interrupted = match(ip, 'en0')
+  interrupted.run.id = 'interrupted'
+  interrupted.run.status = 'cancelled'
+  Object.assign(complete.run.results[0], { downloadSamplesMbps: [35, 45], observedColos: ['HKG', 'LAX'] })
+  Object.assign(interrupted.run.results[0], { downloadSamplesMbps: [35, 45], exclusionCode: 'popRecheckIncomplete' })
+  setInvokeHandler(async command => command === 'get_scan_history' ? { limit: 10, entries: [] } : [complete, interrupted])
+  const mounted = mountComponent(ScanHistoryPanel, { desktop: true, active: true, revision: 0 })
+  context.after(() => mounted.unmount())
+  mounted.state.openComparison(ip)
+  await setImmediate()
+
+  assert.ok(mounted.state.comparisonWarnings.value.includes('接入机房未完整记录'))
+  assert.ok(!mounted.state.comparisonWarnings.value.includes('接入机房不同'))
+  assert.equal(mounted.state.infoLabel.value, '对比条件待确认')
+})
+
+test('download-only history identifies the timeout difference that triggers a settings warning', async context => {
+  const ip = '104.16.0.1'
+  const entries = [3000, 5000].map(requestTimeoutMs => {
+    const entry = match(ip, 'en0')
+    entry.run.id = `download-${requestTimeoutMs}`
+    entry.run.downloadOnly = true
+    entry.run.config.requestTimeoutMs = requestTimeoutMs
+    return entry
+  })
+  setInvokeHandler(async command => command === 'get_scan_history' ? { limit: 10, entries: [] } : entries)
+  const mounted = mountComponent(ScanHistoryPanel, { desktop: true, active: true, revision: 0 })
+  context.after(() => mounted.unmount())
+  mounted.state.openComparison(ip)
+  await setImmediate()
+
+  assert.deepEqual(mounted.state.comparisonWarnings.value, ['测速参数不同'])
+  assert.deepEqual([...mounted.state.changedSettings.value], ['下载超时'])
+  assert.deepEqual(mounted.state.rows.value.map(row => row.settings.find(setting => setting.label === '下载超时').value), [
+    '连接 1500 ms · 响应头 3000 ms', '连接 1500 ms · 响应头 5000 ms',
+  ])
+})
+
 test('history compares whether legacy TCP latency screening was enabled and its threshold', async context => {
   const ip = '104.16.0.1'
   const entries = [200, 300, null, 200].map((maxTcpMs, index) => {

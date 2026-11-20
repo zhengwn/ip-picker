@@ -3,7 +3,7 @@ import { computed, nextTick, ref, shallowRef, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, History, Info, LoaderCircle, RotateCcw, Search } from '@lucide/vue'
 import { validManualIpv4 } from '../custom-ips'
-import { comparisonContextDifferences, favoriteDate, favoriteError, favoriteNumber, indirectRouteWarning } from '../favorites'
+import { comparisonContextDifferences, downloadPopComplete, favoriteDate, favoriteError, favoriteNumber, indirectRouteWarning } from '../favorites'
 import { estimateScan } from '../scan-estimate'
 import type { TcpDisplayMetric } from '../result-preferences'
 import { tcpLatencyChartScale } from '../result-row-display'
@@ -219,9 +219,12 @@ function comparisonSettings({ config, downloadOnly }: ScanRun) {
   return [
     { label: '测速目标', value: config.targetUrl },
     { label: 'TCP 初筛', value: downloadOnly ? '跳过' : initialScreening },
-    { label: 'TCP 探测', value: downloadOnly ? '跳过' : `${probes} · 超时 ${config.connectTimeoutMs} ms` },
+    { label: 'TCP 初筛并发', value: downloadOnly ? '跳过' : `${config.tcpConcurrency}` },
+    { label: 'TCP 探测', value: downloadOnly ? '跳过' : probes },
     { label: 'TCP 判定', value: downloadOnly ? '跳过' : config.stabilityAttempts == null ? '无稳定性判定' : `${threshold} · 失败率 ≤ ${config.maxStabilityFailurePercent}%` },
-    { label: 'HTTPS 验证', value: downloadOnly ? '跳过' : `${config.verificationAttempts} 次 · 超时 ${config.requestTimeoutMs} ms` },
+    { label: '精测顺序', value: downloadOnly ? '跳过' : config.stabilityFirst ? '先完成稳定性筛选' : '按批次进行服务校验和稳定性探测' },
+    { label: 'HTTPS 验证', value: downloadOnly ? '跳过' : `${config.verificationAttempts} 次` },
+    { label: '下载超时', value: `连接 ${config.connectTimeoutMs} ms · 响应头 ${config.requestTimeoutMs} ms` },
     { label: '下载计划', value: `${config.downloadRounds} 轮 × ${config.downloadSeconds} 秒 · ${budget}` },
   ]
 }
@@ -237,10 +240,10 @@ const comparisonWarnings = computed(() => {
   const first = (baseline.value ?? matches.value[0])?.run
   if (!first) return []
   const warnings = matches.value.filter(match => match.run.id !== first.id).flatMap(({ run }) => comparisonContextDifferences(
-    { config: first.config, networkPath: pathFor(first, first.results[0]), colo: first.results[0]?.colo ?? '' },
-    { config: run.config, networkPath: pathFor(run, run.results[0]), colo: run.results[0]?.colo ?? '' },
+    comparisonContext(first),
+    comparisonContext(run),
     comparedIp.value,
-    first.downloadOnly && run.downloadOnly,
+    first.downloadOnly || run.downloadOnly,
   ))
   if (matches.value.some(({ run }) => {
     const path = pathFor(run, run.results[0])
@@ -248,6 +251,13 @@ const comparisonWarnings = computed(() => {
   })) warnings.push(indirectRouteWarning)
   return [...new Set(warnings)]
 })
+function comparisonContext(run: ScanRun) {
+  const result = run.results[0]
+  return {
+    config: run.config, networkPath: pathFor(run, result), colo: result?.colo ?? '', observedColos: result?.observedColos,
+    downloadPopComplete: downloadPopComplete(result, run.downloadOnly),
+  }
+}
 const infoLabel = computed(() => view.value.mode === 'run' ? '本轮详情'
   : changedSettings.value.size || comparisonWarnings.value.some(warning => ['测速参数不同', '网络接口不同', '接入机房不同'].includes(warning)) ? '对比条件有差异'
   : comparisonWarnings.value.length ? '对比条件待确认' : '对比说明')
@@ -335,7 +345,7 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
             <h4>{{ field }}</h4>
             <dl><div v-for="match in matches" :key="match.run.id"><dt>{{ favoriteDate(match.run.startedAt) }}</dt><dd>{{ settingsByRun.get(match.run.id)?.find(setting => setting.label === field)?.value }}</dd></div></dl>
           </div>
-          <p v-if="!changedSettings.size">已记录的测速参数一致。</p>
+          <p v-if="!changedSettings.size && !comparisonWarnings.includes('测速参数不同')">已记录的测速参数一致。</p>
         </template>
       </section>
     </header>

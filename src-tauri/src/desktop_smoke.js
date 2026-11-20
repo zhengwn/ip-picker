@@ -171,6 +171,24 @@ async function exercise() {
   wired.querySelector('.history-result-toggle').click()
   ;(await button('.history-pin-button', '固定为基线')).click()
   await element('.history-baseline-bar')
+
+  const { entries } = await invoke('get_favorites')
+  const favorite = entries.find(entry => entry.result.ip === '127.0.0.1')
+  const issue = await invoke('start_favorite_test', {
+    favoriteId: favorite.id,
+    downloadOnly: true,
+    downloadSettings: {
+      targetUrl: 'https://ip-picker-fixture.invalid/download',
+      connectTimeoutMs: 1500,
+      requestTimeoutMs: 5000,
+      downloadRounds: 1,
+      downloadSeconds: 3,
+      downloadBudgetEnabled: false,
+    },
+  }).then(() => null, error => error)
+  if (!String(issue).includes('下载复测须为 2 至 5 轮')) {
+    throw new Error(`Download-only settings were not validated by the native command: ${issue}`)
+  }
 }
 
 async function reopen() {
@@ -273,17 +291,24 @@ async function exercisePerformance() {
   const candidates = Number(phase.split('-')[1])
   let snapshot
   let downloadUpdate
+  let roundUpdate
   await invoke('plugin:event|listen', {
     event: 'scan-update',
     target: { kind: 'Any' },
     handler: window.__TAURI_INTERNALS__.transformCallback(({ payload }) => {
       if (payload.results?.length === candidates) snapshot ??= payload
-      if (payload.downloadedBytes > 0 && !payload.results) downloadUpdate ??= payload
+      if (payload.changedRows?.[0]) roundUpdate ??= payload
+      if (payload.downloadedBytes > 0 && !payload.results && !payload.changedRows) downloadUpdate ??= payload
     }),
   })
   ;(await button('.start-button', '开始完整优选')).click()
-  await waitFor('full snapshot and compact download updates', () => snapshot && downloadUpdate &&
+  await waitFor('full snapshot and compact download updates', () => snapshot && downloadUpdate && roundUpdate &&
     Number.parseFloat(document.querySelector('.scan-progress-disclosure summary .downloaded-total')?.textContent) > 0)
+  const current = await invoke('get_scan')
+  if (Object.keys(roundUpdate.changedRows).length !== 1 || roundUpdate.completed !== 1 ||
+      current.progress.completed !== 1 || current.results[0].downloadSamplesMbps.at(-1) !== 20) {
+    throw new Error('The compact download update lost a completed round or its row')
+  }
   const jsonBytes = value => new TextEncoder().encode(JSON.stringify(value)).length
   ;(await element('.run-summary-button')).click()
   ;(await waitFor('initial issues action', () => [...document.querySelectorAll('.run-summary-panel button')].find(node => node.textContent.includes('查看初筛异常')))).click()
@@ -309,6 +334,7 @@ async function exercisePerformance() {
       candidates,
       fullSnapshotBytes: jsonBytes(snapshot),
       downloadUpdateBytes: jsonBytes(downloadUpdate),
+      roundUpdateBytes: jsonBytes(roundUpdate),
       medianFilterMs: timings.sort((a, b) => a - b).slice(3, 5).reduce((sum, value) => sum + value, 0) / 2,
       stopMs,
     },

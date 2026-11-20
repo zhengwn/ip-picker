@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { setImmediate } from 'node:timers/promises'
 import test from 'node:test'
-import { AllResultsPanel, App, FavoriteSaveDialog, defaultConfig, mountComponent, reactive, setInvokeHandler, setWindowFixture } from './support/component-fixture.mjs'
+import { AllResultsPanel, App, FavoriteSaveDialog, defaultConfig, emitFixtureEvent, mountComponent, reactive, setInvokeHandler, setWindowFixture } from './support/component-fixture.mjs'
 
 function candidate(ip, fields = {}) {
   return {
@@ -154,6 +154,92 @@ test('late command snapshots cannot roll back live scan or favorite observations
   app.onFavoriteTestStarted({ favorites, job: { favoriteIds: ['home-entry'], run: loadingRun } })
   assert.equal(app.favoriteTest.value.run.results[0].tcpMs, 50)
   assert.equal(app.favoriteTest.value.run.progress.downloadedBytes, 80)
+})
+
+for (const favorite of [false, true]) {
+  test(`${favorite ? 'favorite retest' : 'scan'} restores row deltas received around the initial snapshot`, async context => {
+    const config = defaultConfig()
+    const rows = [candidate('192.0.2.1'), candidate('192.0.2.2'), candidate('192.0.2.3')]
+    const measured = rows.map((row, index) => ({ ...row, downloadSamplesMbps: [index + 10] }))
+    const base = { ...finishedRun(rows), status: 'running', updateRevision: 1,
+      progress: { ...finishedRun(rows).progress, stage: 'downloading', completed: 0 } }
+    const snapshot = { ...base, updateRevision: 3, progress: { ...base.progress, completed: 2, downloadedBytes: 200 },
+      results: [measured[0], measured[1], rows[2]] }
+    const payload = run => favorite ? { run, favoriteIds: [] } : run
+    const stream = favorite ? 'favorite-test-update' : 'scan-update'
+    const read = favorite ? 'get_favorite_test' : 'get_scan'
+    let resolveLoad, resolveRefresh
+    setWindowFixture({ async onCloseRequested() { return () => {} } })
+    setInvokeHandler(command => {
+      if (command === 'load_state') return new Promise(resolve => { resolveLoad = resolve })
+      if (command === read) return new Promise(resolve => { resolveRefresh = resolve })
+      return null
+    })
+    const app = mount(context, App)
+    await setImmediate()
+    emitFixtureEvent(stream, { id: base.id, updateRevision: 2, completed: 1, downloadedBytes: 100, changedRows: { 0: measured[0] } })
+    resolveLoad({ config, [favorite ? 'favoriteTest' : 'lastRun']: payload(structuredClone(base)) })
+    await setImmediate()
+    const current = () => favorite ? app.favoriteTest.value.run : app.run.value
+    assert.deepEqual(current().results[0].downloadSamplesMbps, [10])
+
+    // Revision 3 is absent from the stream, but the outstanding snapshot
+    // has it. Revision 4 remains queued until that snapshot is applied.
+    emitFixtureEvent(stream, { id: base.id, updateRevision: 4, completed: 3, downloadedBytes: 300, changedRows: { 2: measured[2] } })
+    resolveRefresh(payload(structuredClone(snapshot)))
+    await setImmediate()
+    emitFixtureEvent(stream, { id: base.id, updateRevision: 3, completed: 2, downloadedBytes: 200, changedRows: { 2: rows[2] } })
+    emitFixtureEvent(stream, payload(snapshot))
+    assert.equal(current().updateRevision, 4)
+    assert.equal(current().progress.completed, 3)
+    assert.equal(current().progress.downloadedBytes, 300)
+    assert.deepEqual(current().results.map(row => row.downloadSamplesMbps), [[10], [11], [12]])
+
+    resolveRefresh = undefined
+    const newest = measured.map(row => ({ ...row, downloadSamplesMbps: [...row.downloadSamplesMbps, 20] }))
+    emitFixtureEvent(stream, { id: base.id, updateRevision: 6, completed: 6, downloadedBytes: 600, changedRows: { 2: newest[2] } })
+    assert.equal(current().updateRevision, 4)
+    assert.equal(typeof resolveRefresh, 'function')
+    const firstRefresh = resolveRefresh
+    const latest = { ...newest[2], downloadSamplesMbps: [12, 20, 25] }
+    emitFixtureEvent(stream, { id: base.id, updateRevision: 8, completed: 7, downloadedBytes: 800, changedRows: { 2: latest } })
+    assert.equal(resolveRefresh, firstRefresh, 'at most one read should be in flight')
+    firstRefresh(payload({ ...snapshot, updateRevision: 6, results: newest,
+      progress: { ...snapshot.progress, completed: 6, downloadedBytes: 600 } }))
+    await setImmediate()
+    assert.equal(current().updateRevision, 6)
+    assert.notEqual(resolveRefresh, firstRefresh, 'the queued gap should trigger another read without another event')
+    resolveRefresh(payload({ ...snapshot, updateRevision: 7, results: newest,
+      progress: { ...snapshot.progress, completed: 6, downloadedBytes: 700 } }))
+    await setImmediate()
+    assert.equal(current().updateRevision, 8)
+    assert.deepEqual(current().results.map(row => row.downloadSamplesMbps), [[10, 20], [11, 20], [12, 20, 25]])
+  })
+}
+
+test('a gap after the first startup read is fetched when initialization finishes', async context => {
+  const config = defaultConfig()
+  const row = candidate('192.0.2.1')
+  const base = { ...finishedRun([row]), status: 'running', updateRevision: 1 }
+  const snapshot = { ...base, updateRevision: 3, results: [{ ...row, downloadSamplesMbps: [20] }] }
+  let scanReads = 0
+  let finishLoading
+  setWindowFixture({ async onCloseRequested() { return () => {} } })
+  setInvokeHandler(async command => {
+    if (command === 'load_state') return { config, lastRun: structuredClone(base) }
+    if (command === 'get_scan') return ++scanReads === 1 ? structuredClone(base) : snapshot
+    if (command === 'get_favorite_test') return new Promise(resolve => { finishLoading = resolve })
+    throw new Error(`Unexpected command: ${command}`)
+  })
+  const app = mount(context, App)
+  await setImmediate()
+  emitFixtureEvent('scan-update', { id: base.id, updateRevision: 3, downloadedBytes: 100 })
+  assert.equal(scanReads, 1)
+  finishLoading(null)
+  await setImmediate()
+  assert.equal(scanReads, 2)
+  assert.equal(app.run.value.updateRevision, 3)
+  assert.deepEqual(app.run.value.results[0].downloadSamplesMbps, [20])
 })
 
 test('favorite management updates or removes the selected folder entry', async context => {

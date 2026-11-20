@@ -35,6 +35,7 @@ const { outputFiles } = await build({
       export { stabilityFailureKind, summarizeScanResults } from './scan-result-summary'
       export { validateConfig } from './ui-state'
       export { setInvokeHandler } from '@tauri-apps/api/core'
+      export { emitFixtureEvent } from '@tauri-apps/api/event'
       export { setWindowFixture } from '@tauri-apps/api/window'
       export function mountComponent(component, props = {}) {
         let state
@@ -68,7 +69,17 @@ const { outputFiles } = await build({
       }))
       const modules = {
         '@tauri-apps/api/core': 'let handler; export const setInvokeHandler = value => { handler = value }; export const isTauri = () => true; export const invoke = (...args) => handler(...args);',
-        '@tauri-apps/api/event': 'export const listen = async () => () => {};',
+        '@tauri-apps/api/event': `
+          const listeners = new Map()
+          export const listen = async (event, listener) => {
+            if (!listeners.has(event)) listeners.set(event, new Set())
+            listeners.get(event).add(listener)
+            return () => listeners.get(event).delete(listener)
+          }
+          export const emitFixtureEvent = (event, payload) => {
+            for (const listener of listeners.get(event) ?? []) listener({ payload })
+          }
+        `,
         '@tauri-apps/api/window': 'let fixture; export const setWindowFixture = value => { fixture = value }; export const getCurrentWindow = () => fixture;',
         '@lucide/vue': [...icons].map(name => `export const ${name} = {};`).join('\n'),
         'popovers': 'export const dismissPopovers = () => {}; export const useDismissibleDetails = () => {}; export const useDismissiblePopover = () => {};',
@@ -91,4 +102,4 @@ try {
 } finally { await rm(directory, { recursive: true, force: true }) }
 
 export const { App, AllResultsPanel, FavoriteSaveDialog, FavoritesPanel, ScanHistoryPanel, favoriteTestChange, comparisonContextDifferences, preferredFavoriteFolder, rememberFavoriteFolder, compactScanProgress, scanModeLabel, readResultPreferences, defaultConfig, estimateScan, mountComponent, setInvokeHandler, setWindowFixture, stabilityFailureKind, summarizeScanResults, validateConfig } = fixture
-export const { reactive } = fixture
+export const { emitFixtureEvent, reactive } = fixture

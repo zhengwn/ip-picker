@@ -113,6 +113,7 @@ pub fn compare_ip(runs: Vec<(HistoryKind, &ScanRun)>, ip: &str) -> Vec<HistoryEn
                 result.ip == ip && (run.status == "completed" || was_attempted(result))
             })?;
             let comparison = ScanRun {
+                update_revision: run.update_revision,
                 quick_validation: run.quick_validation,
                 retest_ip: run.retest_ip.clone(),
                 download_only: run.download_only,

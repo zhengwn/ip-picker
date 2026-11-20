@@ -1,8 +1,9 @@
 use ipnet::Ipv4Net;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 #[path = "engine/pop.rs"]
 pub(crate) mod pop;
@@ -176,6 +177,10 @@ pub struct ScanConfig {
     pub download_budget_mi_b: u64,
     pub source: String,
     pub custom_ips: String,
+    /// Older scan records can lack the original source fields. Preserve that
+    /// distinction when saving them again with defaulted settings.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub candidate_source_unrecorded: bool,
     pub target_url: String,
 }
 
@@ -208,6 +213,7 @@ impl Default for ScanConfig {
             download_budget_mi_b: 400,
             source: "cloudflare".into(),
             custom_ips: String::new(),
+            candidate_source_unrecorded: false,
             target_url: "https://speed.cloudflare.com/__down?bytes=25000000".into(),
         }
     }
@@ -309,18 +315,7 @@ impl ScanConfig {
                 "TCP 稳定性延迟规则须为 average、p95 或 max",
             ));
         }
-        if !(100..=30000).contains(&self.connect_timeout_ms) {
-            return Err(Invalid::new(
-                "connectTimeoutMs",
-                "连接超时须为 100 至 30000 毫秒",
-            ));
-        }
-        if !(100..=60000).contains(&self.request_timeout_ms) {
-            return Err(Invalid::new(
-                "requestTimeoutMs",
-                "请求超时须为 100 至 60000 毫秒",
-            ));
-        }
+        self.validate_request_timeouts()?;
         if !matches!(self.precision_mode.as_str(), "adaptive" | "limited") {
             return Err(Invalid::new("precisionMode", "未知精测模式"));
         }
@@ -348,6 +343,46 @@ impl ScanConfig {
                 "HTTPS 验证次数须为 2 至 10",
             ));
         }
+        self.validate_download_plan()?;
+        if !matches!(self.source.as_str(), "cloudflare" | "custom") {
+            return Err(Invalid::new("source", "未知候选来源"));
+        }
+        let candidates = if self.source == "custom" {
+            Some(parse_custom_candidates(&self.custom_ips)?)
+        } else {
+            validate_custom_source_size(&self.custom_ips)?;
+            None
+        };
+        self.validate_target()?;
+        Ok(candidates)
+    }
+
+    pub(crate) fn validate_download_only(&self) -> Result<(), String> {
+        self.validate_request_timeouts()
+            .and_then(|()| self.validate_download_plan())
+            .and_then(|()| self.validate_target())
+            .map_err(|issue| issue.message)
+    }
+
+    fn validate_request_timeouts(&self) -> Result<(), ConfigValidationError> {
+        if !(100..=30000).contains(&self.connect_timeout_ms) {
+            return Err(ConfigValidationError::new(
+                "connectTimeoutMs",
+                "连接超时须为 100 至 30000 毫秒",
+            ));
+        }
+        if !(100..=60000).contains(&self.request_timeout_ms) {
+            return Err(ConfigValidationError::new(
+                "requestTimeoutMs",
+                "请求超时须为 100 至 60000 毫秒",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_download_plan(&self) -> Result<(), ConfigValidationError> {
+        use ConfigValidationError as Invalid;
+
         if !(2..=5).contains(&self.download_rounds) {
             return Err(Invalid::new("downloadRounds", "下载复测须为 2 至 5 轮"));
         }
@@ -363,15 +398,12 @@ impl ScanConfig {
                 "下载数据预算须为 1 至 4096 MiB",
             ));
         }
-        if !matches!(self.source.as_str(), "cloudflare" | "custom") {
-            return Err(Invalid::new("source", "未知候选来源"));
-        }
-        let candidates = if self.source == "custom" {
-            Some(parse_custom_candidates(&self.custom_ips)?)
-        } else {
-            validate_custom_source_size(&self.custom_ips)?;
-            None
-        };
+        Ok(())
+    }
+
+    fn validate_target(&self) -> Result<(), ConfigValidationError> {
+        use ConfigValidationError as Invalid;
+
         let url = url::Url::parse(&self.target_url)
             .map_err(|_| Invalid::new("targetUrl", "下载地址不是有效 URL"))?;
         if url.scheme() != "https" {
@@ -395,7 +427,7 @@ impl ScanConfig {
         if url.port_or_known_default() == Some(0) {
             return Err(Invalid::new("targetUrl", "测速端口不能为 0"));
         }
-        Ok(candidates)
+        Ok(())
     }
 
     pub fn download_budget_bytes(&self) -> Option<u64> {
@@ -449,11 +481,11 @@ pub struct ScanProgress {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_path: Option<crate::network::NetworkPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stability_batch: Option<StabilityBatch>,
+    pub stability_batch: Option<Arc<StabilityBatch>>,
     /// The candidates participating in the current precision batch, including
     /// candidates waiting for validation/download, not only active requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub precision_batch: Option<StabilityBatch>,
+    pub precision_batch: Option<Arc<StabilityBatch>>,
 }
 
 impl Default for ScanProgress {
@@ -520,6 +552,8 @@ pub struct IpResult {
     pub success_count: usize,
     pub attempts: usize,
     pub download_samples_mbps: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub download_sample_colos: Vec<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tcp_stability: Option<crate::stability::TcpStability>,
     /// Full HTTPS/download verification passed. Independent of the configured
@@ -552,6 +586,7 @@ impl IpResult {
             success_count: 0,
             attempts: 0,
             download_samples_mbps: Vec::new(),
+            download_sample_colos: Vec::new(),
             tcp_stability: None,
             measurement_passed: false,
             eligible: false,
@@ -583,6 +618,31 @@ impl IpResult {
                 .all(|value| value.is_finite() && *value > 0.0)
             && self.download_mbps.is_finite()
             && self.download_mbps > 0.0
+    }
+
+    pub(crate) fn download_pop_complete(&self, download_only: bool) -> Option<bool> {
+        if self.download_samples_mbps.is_empty() {
+            return None;
+        }
+        if download_only {
+            return Some(
+                self.download_sample_colos.len() == self.download_samples_mbps.len()
+                    && self
+                        .download_sample_colos
+                        .iter()
+                        .all(|colo| colo.as_deref().is_some_and(|colo| !colo.is_empty())),
+            );
+        }
+        // A full test rechecks any response without a POP. Its sample is
+        // already recorded if that recheck fails or is interrupted.
+        Some(match self.exclusion_code {
+            Some(ExclusionCode::PopRecheckIncomplete | ExclusionCode::PopRecheckFailure) => false,
+            Some(_) => true,
+            None => !self
+                .exclusion_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("下载后的 POP 复核")),
+        })
     }
 
     pub(crate) fn mark_cancelled(&mut self, config: &ScanConfig) {
@@ -860,28 +920,56 @@ pub fn compare_ip_results_with_metric(
     preference: &str,
     metric: &str,
 ) -> Ordering {
-    if preference == "download" {
-        b.download_mbps
-            .total_cmp(&a.download_mbps)
-            .then(tcp_failure_percent(a).total_cmp(&tcp_failure_percent(b)))
-            .then(
-                tcp_display_ms_with_metric(a, metric)
-                    .total_cmp(&tcp_display_ms_with_metric(b, metric)),
-            )
+    ResultRank::new(a, metric).compare(&ResultRank::new(b, metric), preference)
+}
+
+pub(crate) fn sort_result_indices(
+    indices: &mut [usize],
+    results: &[IpResult],
+    preference: &str,
+    metric: &str,
+) {
+    let mut ranks: Vec<_> = indices
+        .iter()
+        .map(|&index| (index, ResultRank::new(&results[index], metric)))
+        .collect();
+    ranks.sort_by(|(_, a), (_, b)| a.compare(b, preference));
+    for (destination, (index, _)) in indices.iter_mut().zip(ranks) {
+        *destination = index;
+    }
+}
+
+struct ResultRank<'a> {
+    result: &'a IpResult,
+    failure_percent: f64,
+    tcp_ms: f64,
+}
+
+impl<'a> ResultRank<'a> {
+    fn new(result: &'a IpResult, metric: &str) -> Self {
+        Self {
+            result,
+            failure_percent: tcp_failure_percent(result),
+            tcp_ms: tcp_display_ms_with_metric(result, metric),
+        }
+    }
+
+    fn compare(&self, other: &Self, preference: &str) -> Ordering {
+        let a = self.result;
+        let b = other.result;
+        let speed = b.download_mbps.total_cmp(&a.download_mbps);
+        let latency = self
+            .failure_percent
+            .total_cmp(&other.failure_percent)
+            .then(self.tcp_ms.total_cmp(&other.tcp_ms))
             .then(a.https_ms.total_cmp(&b.https_ms))
-            .then(a.jitter_ms.total_cmp(&b.jitter_ms))
-            .then(a.ip.cmp(&b.ip))
-    } else {
-        tcp_failure_percent(a)
-            .total_cmp(&tcp_failure_percent(b))
-            .then(
-                tcp_display_ms_with_metric(a, metric)
-                    .total_cmp(&tcp_display_ms_with_metric(b, metric)),
-            )
-            .then(a.https_ms.total_cmp(&b.https_ms))
-            .then(a.jitter_ms.total_cmp(&b.jitter_ms))
-            .then(b.download_mbps.total_cmp(&a.download_mbps))
-            .then(a.ip.cmp(&b.ip))
+            .then(a.jitter_ms.total_cmp(&b.jitter_ms));
+        let order = if preference == "download" {
+            speed.then(latency)
+        } else {
+            latency.then(speed)
+        };
+        order.then(a.ip.cmp(&b.ip))
     }
 }
 
@@ -889,6 +977,8 @@ pub fn compare_ip_results_with_metric(
 #[serde(rename_all = "camelCase")]
 pub struct ScanRun {
     pub id: String,
+    #[serde(default)]
+    pub update_revision: u64,
     /// Explicit run identity; missing legacy mode must not be guessed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quick_validation: Option<bool>,
@@ -900,6 +990,7 @@ pub struct ScanRun {
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_recorded_scan_config")]
     pub config: ScanConfig,
     pub progress: ScanProgress,
     pub results: Vec<IpResult>,
@@ -907,16 +998,27 @@ pub struct ScanRun {
     pub error: Option<String>,
 }
 
+fn deserialize_recorded_scan_config<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ScanConfig, D::Error> {
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    let source_was_recorded = raw
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+        && raw
+            .get("customIps")
+            .and_then(serde_json::Value::as_str)
+            .is_some();
+    let mut config: ScanConfig = serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+    config.candidate_source_unrecorded |= !source_was_recorded;
+    Ok(config)
+}
+
 impl ScanRun {
     pub(crate) fn record_observed_regions(&mut self) {
         for result in &self.results {
-            let region = &result.region_code;
-            if region.len() == 2
-                && region.bytes().all(|byte| byte.is_ascii_uppercase())
-                && !self.config.regions.contains(region)
-            {
-                self.config.regions.push(region.clone());
-            }
+            record_observed_region(&mut self.config.regions, &result.region_code);
         }
     }
 
@@ -925,6 +1027,15 @@ impl ScanRun {
             .network_path
             .clone()
             .or_else(|| self.progress.network_path.clone())
+    }
+}
+
+pub(crate) fn record_observed_region(regions: &mut Vec<String>, region: &str) {
+    if region.len() == 2
+        && region.bytes().all(|byte| byte.is_ascii_uppercase())
+        && !regions.iter().any(|existing| existing == region)
+    {
+        regions.push(region.into());
     }
 }
 
@@ -1317,14 +1428,14 @@ mod tests {
             .is_none());
         let progress = ScanProgress {
             stage: "stabilizing".into(),
-            stability_batch: Some(StabilityBatch {
+            stability_batch: Some(Arc::new(StabilityBatch {
                 number: 2,
                 candidate_ips: vec!["192.0.2.1".into()],
-            }),
-            precision_batch: Some(StabilityBatch {
+            })),
+            precision_batch: Some(Arc::new(StabilityBatch {
                 number: 2,
                 candidate_ips: vec!["192.0.2.1".into(), "192.0.2.2".into()],
-            }),
+            })),
             ..Default::default()
         };
         let json = serde_json::to_value(progress).unwrap();

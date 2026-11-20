@@ -138,7 +138,8 @@ test('download-only favorites use the latest speed and POP without changing the 
   entry.downloadTest = { runId: latest.id, config, result: download, testedAt: latest.startedAt }
   const job = {
     run: latest, favoriteIds: [entry.id],
-    baselines: [{ favoriteId: entry.id, testedAt: entry.savedAt, config, colo: 'HKG', measurementPassed: true, tcpP95Ms: 40, downloadMbps: 30 }],
+    baselines: [{ favoriteId: entry.id, testedAt: entry.savedAt, config, colo: 'HKG', observedColos: ['HKG'],
+      downloadPopComplete: true, measurementPassed: true, tcpP95Ms: 40, downloadMbps: 30 }],
   }
   const library = { folders: [{ id: 'home', name: '家用' }], entries: [entry] }
   const calls = []
@@ -163,11 +164,84 @@ test('download-only favorites use the latest speed and POP without changing the 
   assert.equal(calls[0][1].downloadOnly, true)
 })
 
+test('download comparison identifies mixed and missing round POPs even at the same speed', () => {
+  const config = defaultConfig()
+  const testedAt = '2026-11-15T00:00:00Z'
+  const measured = { ...result('104.16.0.1'), colo: 'LAX', observedColos: ['LAX', 'HKG'],
+    downloadMbps: 40, downloadSamplesMbps: [35, 45], downloadSampleColos: ['LAX', 'HKG'] }
+  const latest = { ...run([measured]), downloadOnly: true }
+  const entry = { id: 'saved', downloadTest: { runId: latest.id, config, result: measured, testedAt } }
+  const job = { run: latest, favoriteIds: ['saved'], baselines: [
+    { favoriteId: 'saved', testedAt, config, colo: 'LAX', observedColos: ['LAX'], downloadPopComplete: true, downloadMbps: 40 },
+  ] }
+  const mixed = favoriteTestChange(entry, job)
+  assert.equal(mixed.label, '接入机房条件待确认')
+  assert.equal(mixed.changed, true)
+  assert.ok(mixed.differences.includes('观测到多个接入机房'))
+  measured.observedColos = ['LAX']
+  measured.downloadSampleColos = ['LAX', null]
+  assert.ok(favoriteTestChange(entry, job).differences.includes('接入机房未完整记录'))
+  assert.equal(favoriteTestChange(entry, job).changed, false)
+  job.baselines[0].observedColos = ['LAX', 'HKG']
+  const partial = favoriteTestChange(entry, job)
+  assert.equal(partial.label, '接入机房条件待确认')
+  assert.equal(partial.changed, false)
+  assert.ok(!partial.differences.includes('接入机房不同'))
+  measured.colo = 'SJC'
+  measured.observedColos = ['SJC']
+  measured.downloadSampleColos = ['SJC', null]
+  assert.ok(favoriteTestChange(entry, job).differences.includes('接入机房不同'))
+  job.baselines[0].downloadPopComplete = false
+  assert.equal(favoriteTestChange(entry, job).changed, false)
+  measured.colo = ''
+  measured.observedColos = []
+  measured.downloadSampleColos = [null, null]
+  Object.assign(job.baselines[0], { colo: '', observedColos: [], downloadPopComplete: false })
+  const bothUnknown = favoriteTestChange(entry, job)
+  assert.equal(bothUnknown.label, '接入机房条件待确认')
+  assert.equal(bothUnknown.changed, false)
+  measured.colo = 'LAX'
+  measured.observedColos = ['LAX']
+  measured.downloadSampleColos = ['LAX', 'LAX']
+  Object.assign(job.baselines[0], { colo: 'LAX', observedColos: ['LAX'], downloadPopComplete: true })
+  assert.equal(favoriteTestChange(entry, job).changed, false)
+})
+
+test('a legacy favorite baseline does not imply that its first POP was the only POP', () => {
+  const config = defaultConfig()
+  const testedAt = '2026-11-15T00:00:00Z'
+  const measured = { ...result('104.16.0.1'), colo: 'LAX', observedColos: ['LAX', 'HKG'],
+    downloadMbps: 40, downloadSamplesMbps: [35, 45] }
+  const latest = run([measured])
+  const entry = { id: 'saved', runId: latest.id, config, result: measured }
+  const job = { run: latest, favoriteIds: [entry.id], baselines: [{ favoriteId: entry.id, testedAt, config,
+    colo: 'LAX', measurementPassed: measured.measurementPassed, tcpP95Ms: 60, downloadMbps: 40 }] }
+
+  const change = favoriteTestChange(entry, job)
+  assert.ok(change.differences.includes('接入机房未完整记录'))
+  assert.ok(!change.differences.includes('接入机房不同'))
+  assert.equal(change.changed, false)
+})
+
+test('download-only IPC sends the active download settings despite an invalid scan draft', async context => {
+  const config = { ...defaultConfig(), regions: [], stabilityAttempts: '', downloadSeconds: 7 }
+  const library = { folders: [], entries: [] }
+  setInvokeHandler(async (command, args) => {
+    assert.equal(command, 'start_favorite_test')
+    assert.equal(args.config, undefined)
+    assert.equal(args.downloadSettings.downloadSeconds, 7)
+    assert.equal(args.downloadSettings.stabilityAttempts, undefined)
+    return { favorites: library, job: { run: { ...run([]), status: 'running', downloadOnly: true }, favoriteIds: ['saved'] } }
+  })
+  const state = mount(context, FavoritesPanel, { desktop: true, config, library })
+  assert.equal(await state.startTest({ favoriteId: 'saved', downloadOnly: true }), true)
+})
+
 test('before/after comparisons distinguish changed conditions, partial data and untouched entries', () => {
   const config = defaultConfig()
   const networkPath = { interfaceName: 'en0', interfaceKind: 'wifi', tunnelInterface: false, sampleIp: '104.16.0.1' }
   const entry = { id: 'saved', runId: 'current', config, networkPath, result: result('104.16.0.1', 20, 40) }
-  const job = { run: run([entry.result]), favoriteIds: ['saved'], baselines: [{ favoriteId: 'saved', testedAt: '2026-11-15T00:00:00Z', config, networkPath, colo: 'HKG', measurementPassed: true, tcpP95Ms: 60, downloadMbps: 20 }] }
+  const job = { run: run([entry.result]), favoriteIds: ['saved'], baselines: [{ favoriteId: 'saved', testedAt: '2026-11-15T00:00:00Z', config, networkPath, colo: 'HKG', observedColos: ['HKG'], measurementPassed: true, tcpP95Ms: 60, downloadMbps: 20 }] }
   const change = favoriteTestChange(entry, job)
   assert.match(change.label, /P95 −20.0 ms.*下载 \+10.0 Mbps/)
   assert.deepEqual(change.differences, [])
@@ -212,7 +286,7 @@ test('legacy sort-only preferences preserve their chosen latency order', context
 test('retest comparison does not report missing evidence as unchanged or annotate a newer saved snapshot', () => {
   const config = defaultConfig()
   const entry = { id: 'saved', savedAt: '2026-11-15T00:00:00Z', runId: 'current', config, result: { ...result('104.16.0.1'), measurementPassed: false, tcpStability: undefined, downloadSamplesMbps: [] } }
-  const job = { run: run([entry.result]), favoriteIds: ['saved'], baselines: [{ favoriteId: 'saved', testedAt: entry.savedAt, config, colo: 'HKG', measurementPassed: false, tcpP95Ms: null, downloadMbps: null }] }
+  const job = { run: run([entry.result]), favoriteIds: ['saved'], baselines: [{ favoriteId: 'saved', testedAt: entry.savedAt, config, colo: 'HKG', observedColos: ['HKG'], measurementPassed: false, tcpP95Ms: null, downloadMbps: null }] }
   assert.equal(favoriteTestChange(entry, job).label, '暂无可比较的完整测量')
   entry.runId = 'newer-snapshot'
   entry.savedAt = '2026-11-17T00:00:00Z'

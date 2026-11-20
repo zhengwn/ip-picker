@@ -2,10 +2,11 @@ use crate::{
     model::{ExclusionCode, IpResult, ScanConfig, ScanRun},
     network::NetworkPath,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     net::Ipv4Addr,
+    sync::Arc,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -26,6 +27,10 @@ pub struct FavoriteTestBaseline {
     pub config: ScanConfig,
     pub network_path: Option<NetworkPath>,
     pub colo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_colos: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_pop_complete: Option<bool>,
     pub measurement_passed: bool,
     pub tcp_p95_ms: Option<f64>,
     pub download_mbps: Option<f64>,
@@ -68,6 +73,59 @@ pub struct FavoriteFolder {
     pub created_at: String,
 }
 
+/// Omitted by older writers, null for an inline list, or the ID of an
+/// independently stored list. A legacy null alone cannot prove emptiness.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum CandidateListSource {
+    #[default]
+    Unknown,
+    Inline,
+    Shared(String),
+}
+
+impl CandidateListSource {
+    pub(crate) fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    pub(crate) fn as_deref(&self) -> Option<&str> {
+        match self {
+            Self::Shared(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn lookup_reference<'a>(
+        &'a self,
+        run_id: &'a str,
+        recover_legacy_inline: bool,
+    ) -> Option<&'a str> {
+        match self {
+            Self::Unknown => Some(run_id),
+            Self::Inline if recover_legacy_inline => Some(run_id),
+            _ => self.as_deref(),
+        }
+    }
+}
+
+impl From<Option<String>> for CandidateListSource {
+    fn from(id: Option<String>) -> Self {
+        id.map_or(Self::Inline, Self::Shared)
+    }
+}
+
+impl Serialize for CandidateListSource {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_deref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CandidateListSource {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<String>::deserialize(deserializer).map(Self::from)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FavoriteEntry {
@@ -82,12 +140,25 @@ pub struct FavoriteEntry {
     pub run_finished_at: Option<String>,
     pub config: ScanConfig,
     pub result: IpResult,
+    #[serde(default, skip_serializing_if = "CandidateListSource::is_unknown")]
+    pub(crate) candidate_list_id: CandidateListSource,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) candidate_list_known_empty: bool,
     #[serde(default)]
     pub targeted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_path: Option<NetworkPath>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download_test: Option<FavoriteDownloadTest>,
+}
+
+impl FavoriteEntry {
+    pub(crate) fn candidate_source_reference(&self) -> Option<&str> {
+        self.candidate_list_id.lookup_reference(
+            &self.run_id,
+            self.config.custom_ips.is_empty() && !self.candidate_list_known_empty,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,6 +178,10 @@ pub struct FavoriteLibrary {
     pub revision: u64,
     pub folders: Vec<FavoriteFolder>,
     pub entries: Vec<FavoriteEntry>,
+    // The list is the largest part of a scan configuration and is fixed for
+    // the duration of a run. Keep it independently of the run's history entry.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub candidate_lists: BTreeMap<String, Arc<str>>,
 }
 
 impl Default for FavoriteLibrary {
@@ -123,11 +198,56 @@ impl Default for FavoriteLibrary {
                 })
                 .collect(),
             entries: Vec::new(),
+            candidate_lists: BTreeMap::new(),
         }
     }
 }
 
 impl FavoriteLibrary {
+    pub(crate) fn share_candidate_lists(&mut self) {
+        for entry in &mut self.entries {
+            if let Some(reference) = entry.candidate_list_id.as_deref() {
+                if uuid::Uuid::parse_str(reference).is_err() {
+                    if let Some(source) = self.candidate_lists.get(reference) {
+                        entry.config.custom_ips = source.to_string();
+                        entry.candidate_list_id = CandidateListSource::Inline;
+                    }
+                }
+                continue;
+            }
+            if entry.candidate_source_reference().is_none() {
+                continue;
+            }
+            if entry.config.custom_ips.is_empty() {
+                if self.candidate_lists.contains_key(&entry.run_id) {
+                    entry.candidate_list_id = CandidateListSource::Shared(entry.run_id.clone());
+                    entry.candidate_list_known_empty = false;
+                }
+            } else {
+                entry.candidate_list_id = share_candidate_list(
+                    &mut self.candidate_lists,
+                    &entry.run_id,
+                    &mut entry.config.custom_ips,
+                )
+                .into();
+            }
+        }
+        self.retain_candidate_lists();
+    }
+
+    fn retain_candidate_lists(&mut self) {
+        if self.candidate_lists.is_empty() {
+            return;
+        }
+        let used: HashSet<_> = self
+            .entries
+            .iter()
+            .filter_map(|entry| entry.candidate_list_id.as_deref())
+            .collect();
+        self.candidate_lists
+            .retain(|id, _| used.contains(id.as_str()));
+    }
+
     /// Allocate only at a saved-state commit boundary, never for an in-progress
     /// candidate edit. Keep JSON integers exact for the JavaScript UI guard.
     pub fn next_revision(&self) -> Result<u64, String> {
@@ -180,6 +300,7 @@ impl FavoriteLibrary {
         let index = self.folder_index(folder_id)?;
         self.folders.remove(index);
         self.entries.retain(|entry| entry.folder_id != folder_id);
+        self.retain_candidate_lists();
         Ok(())
     }
 
@@ -203,6 +324,38 @@ impl FavoriteLibrary {
             .entries
             .iter()
             .position(|entry| entry.folder_id == folder_id && entry.result.ip == ip);
+        let mut config = run.config.clone();
+        // Saving another observation from the same run must preserve source
+        // evidence already held by a favorite, including unresolved legacy data.
+        let previous = if config.custom_ips.is_empty() {
+            existing
+                .map(|index| &self.entries[index])
+                .filter(|entry| entry.run_id == run.id)
+                .or_else(|| self.entries.iter().find(|entry| entry.run_id == run.id))
+        } else {
+            None
+        };
+        if let Some(previous) = previous {
+            config.custom_ips.clone_from(&previous.config.custom_ips);
+        }
+        let (candidate_list_id, candidate_list_known_empty) = if !config.custom_ips.is_empty() {
+            (
+                share_candidate_list(&mut self.candidate_lists, &run.id, &mut config.custom_ips)
+                    .into(),
+                false,
+            )
+        } else if self.candidate_lists.contains_key(&run.id) {
+            (CandidateListSource::Shared(run.id.clone()), false)
+        } else if let Some(previous) = previous {
+            (
+                previous.candidate_list_id.clone(),
+                previous.candidate_list_known_empty,
+            )
+        } else if config.candidate_source_unrecorded {
+            (CandidateListSource::Unknown, false)
+        } else {
+            (CandidateListSource::Inline, true)
+        };
         let snapshot = FavoriteEntry {
             id: existing
                 .map(|index| self.entries[index].id.clone())
@@ -214,14 +367,20 @@ impl FavoriteLibrary {
             run_status: run.status.clone(),
             run_started_at: run.started_at.clone(),
             run_finished_at: run.finished_at.clone(),
-            config: run.config.clone(),
+            config,
             result: result.clone(),
+            candidate_list_id,
+            candidate_list_known_empty,
             targeted: false,
             network_path: run.path_for(result),
             download_test: None,
         };
         if let Some(index) = existing {
+            let old_source = self.entries[index].candidate_list_id.as_deref().is_some();
             self.entries[index] = snapshot;
+            if old_source {
+                self.retain_candidate_lists();
+            }
         } else {
             self.entries.push(snapshot);
         }
@@ -258,7 +417,15 @@ impl FavoriteLibrary {
             .iter()
             .position(|entry| entry.id == favorite_id)
             .ok_or("收藏记录不存在，请刷新后重试")?;
-        self.entries.remove(index);
+        if self
+            .entries
+            .remove(index)
+            .candidate_list_id
+            .as_deref()
+            .is_some()
+        {
+            self.retain_candidate_lists();
+        }
         Ok(())
     }
 
@@ -296,6 +463,8 @@ impl FavoriteLibrary {
             run_finished_at: None,
             config,
             result: IpResult::new(ip),
+            candidate_list_id: CandidateListSource::Inline,
+            candidate_list_known_empty: false,
             targeted: true,
             network_path: None,
             download_test: None,
@@ -384,7 +553,11 @@ impl FavoriteLibrary {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        run.config.validate()?;
+        if run.download_only {
+            run.config.validate_download_only()?;
+        } else {
+            run.config.validate()?;
+        }
         run.results = ips.iter().copied().map(IpResult::new).collect();
         if run.download_only {
             run.progress.stage = "downloading".into();
@@ -443,6 +616,9 @@ impl FavoriteLibrary {
                     config,
                     network_path: network_path.clone(),
                     colo: result.colo.clone(),
+                    observed_colos: Some(result.observed_colos.clone()),
+                    download_pop_complete: result
+                        .download_pop_complete(previous_download.is_some()),
                     measurement_passed: result.measurement_passed,
                     tcp_p95_ms: result
                         .tcp_stability
@@ -518,12 +694,38 @@ impl FavoriteLibrary {
             entry.run_started_at = job.run.started_at.clone();
             entry.run_finished_at = job.run.finished_at.clone();
             entry.config = config;
+            entry.candidate_list_id = CandidateListSource::Inline;
+            entry.candidate_list_known_empty = false;
             entry.result = result.clone();
             entry.targeted = true;
             entry.network_path = job.run.path_for(result);
             entry.download_test = None;
         }
+        if !job.run.download_only {
+            self.retain_candidate_lists();
+        }
     }
+}
+
+fn share_candidate_list(
+    lists: &mut BTreeMap<String, Arc<str>>,
+    run_id: &str,
+    source: &mut String,
+) -> Option<String> {
+    // Keep individual IPv4 addresses inline. Preserve conflicting legacy
+    // snapshots verbatim when they happen to share a run ID.
+    if source.len() <= "255.255.255.255".len() || uuid::Uuid::parse_str(run_id).is_err() {
+        return None;
+    }
+    if let Some(existing) = lists.get(run_id) {
+        if existing.as_ref() != source {
+            return None;
+        }
+        *source = String::new();
+    } else {
+        lists.insert(run_id.into(), Arc::from(std::mem::take(source)));
+    }
+    Some(run_id.into())
 }
 
 pub(crate) fn checked_ipv4(ip: &str) -> Result<Ipv4Addr, String> {
@@ -573,6 +775,7 @@ mod tests {
             vec![Some(20.0); 100],
         ));
         ScanRun {
+            update_revision: 0,
             quick_validation: Some(false),
             retest_ip: None,
             download_only: false,
@@ -658,6 +861,7 @@ mod tests {
         assert_eq!(job.baselines.len(), 1);
         assert_eq!(job.baselines[0].tcp_p95_ms, Some(20.0));
         assert_eq!(job.baselines[0].download_mbps, Some(35.0));
+        assert_eq!(job.baselines[0].download_pop_complete, Some(true));
         assert!(job.baselines[0].config.custom_ips.is_empty());
         library.update_entry(&id, &folder, "测速中修改").unwrap();
         job.run.status = "completed".into();

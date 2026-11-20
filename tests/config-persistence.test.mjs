@@ -141,6 +141,20 @@ test('ordinary edits made during a background write keep their own debounce', as
   assert.deepEqual(saves.map(config => config.maxTcpMs), [231, 233])
 })
 
+test('a due autosave of a newer edit proceeds after an older background write fails', async context => {
+  const firstWrite = deferred()
+  const { state, saves } = await fixture(context, { save: (_, attempt) => attempt === 1 ? firstWrite.promise : undefined })
+  state.config.value.maxTcpMs = 231
+  context.mock.timers.tick(500)
+  state.config.value.maxTcpMs = 232
+  context.mock.timers.tick(500)
+  assert.deepEqual(saves.map(config => config.maxTcpMs), [231])
+  firstWrite.reject(new Error('temporary storage failure'))
+  await setImmediate()
+  assert.deepEqual(saves.map(config => config.maxTcpMs), [231, 232])
+  assert.equal(state.configSaveError.value, '')
+})
+
 test('failed Done retains the drawer and pending settings for a successful retry', async context => {
   const { state, saves } = await fixture(context, { save: (_, attempt) => { if (attempt === 1) throw new Error('disk full') } })
   state.advancedOpen.value = true
