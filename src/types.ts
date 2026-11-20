@@ -119,6 +119,7 @@ export interface ScanRun {
   id: string
   quickValidation?: boolean | null
   retestIp?: string
+  downloadOnly?: boolean
   status: 'running' | 'completed' | 'cancelled' | 'failed'
   startedAt: string
   finishedAt?: string
@@ -134,6 +135,7 @@ export interface ScanHistoryEntry {
   kind: ScanHistoryKind
   quickValidation?: boolean | null
   retestIp?: string
+  downloadOnly?: boolean
   id: string
   status: ScanRun['status']
   startedAt: string

@@ -73,6 +73,7 @@ pub(crate) struct PreparedScan {
 enum ScanScope {
     Regional,
     Targeted,
+    DownloadOnly,
 }
 
 struct State {
@@ -229,6 +230,17 @@ pub async fn run_targeted_scan(
     run_candidates(config, ips, ScanScope::Targeted, cancellation, callback).await
 }
 
+pub(crate) async fn run_download_test(
+    config: ScanConfig,
+    ips: Vec<Ipv4Addr>,
+    cancellation: CancellationToken,
+    callback: UpdateCallback,
+) -> Result<EngineOutcome, String> {
+    config.validate()?;
+    let ips = unique_targeted_ips(ips)?;
+    run_candidates(config, ips, ScanScope::DownloadOnly, cancellation, callback).await
+}
+
 fn unique_targeted_ips(ips: Vec<Ipv4Addr>) -> Result<Vec<Ipv4Addr>, String> {
     let mut seen = HashSet::new();
     let ips: Vec<_> = ips.into_iter().filter(|ip| seen.insert(*ip)).collect();
@@ -267,6 +279,48 @@ async fn run_candidates(
         last_event: Instant::now(),
         last_emitted_results: None,
     };
+    if scope == ScanScope::DownloadOnly {
+        let schedule = DownloadQueue::from_batches(
+            (0..ips.len()).map(|index| vec![index]),
+            config.download_rounds,
+        );
+        state.stage(
+            "downloading",
+            schedule.remaining_rounds,
+            format!("对 {} 个收藏 IP 仅测下载", ips.len()),
+            &callback,
+        );
+        if !run_downloads(
+            &mut state,
+            schedule,
+            &ips,
+            &config,
+            &target,
+            scope,
+            &cancellation,
+            &callback,
+        )
+        .await
+        {
+            return Ok(state.cancel(&config, &callback));
+        }
+        state.progress.stage = "completed".into();
+        let completed = state
+            .results
+            .iter()
+            .filter(|item| item.has_complete_download(&config))
+            .count();
+        state.progress.message = format!(
+            "下载测速结束，{completed} / {} 个 IP 测完全部轮次",
+            ips.len()
+        );
+        state.emit(&callback, true);
+        return Ok(EngineOutcome {
+            progress: state.progress,
+            results: state.results,
+            cancelled: false,
+        });
+    }
     state.stage(
         "connecting",
         ips.len(),
@@ -512,10 +566,7 @@ async fn run_candidates(
             (region, entries)
         })
         .collect();
-    let mut schedule =
-        DownloadQueue::new(&verified_groups, &config.regions, config.download_rounds);
-    let total_budget = config.download_budget_bytes();
-    let mut used = 0_u64;
+    let schedule = DownloadQueue::new(&verified_groups, &config.regions, config.download_rounds);
     state.stage(
         "downloading",
         schedule.remaining_rounds,
@@ -530,85 +581,21 @@ async fn run_candidates(
         },
         &callback,
     );
-    while let Some(slot) = schedule.next(total_budget, used) {
-        if cancellation.is_cancelled() {
-            state.progress.downloaded_bytes = used;
-            return Ok(state.cancel(&config, &callback));
-        }
-        let (index, allowance) = match slot {
-            DownloadSlot::Round { index, allowance } => (index, allowance),
-            DownloadSlot::Unfunded(index) => {
-                state.results[index].exclude(
-                    ExclusionCode::DownloadBudget,
-                    "剩余下载预算不足以安排全部复测轮次",
-                );
-                state.progress.completed += config.download_rounds;
-                state.emit(&callback, false);
-                continue;
-            }
-        };
-        let label = if state.results[index].city.is_empty() {
-            state.results[index].colo.clone()
-        } else {
-            state.results[index].city.clone()
-        };
-        state.progress.message = format!(
-            "下载复测 {label} · {} · 第 {} / {} 轮",
-            state.results[index].ip,
-            state.results[index].download_samples_mbps.len() + 1,
-            config.download_rounds
-        );
-        state.emit(&callback, true);
-
-        // Poll the byte counter while streaming so progress and cancellation stay
-        // responsive even when a server delivers a slow or endless response.
-        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counter_for_probe = counter.clone();
-        let download = download_probe(&config, &target, ips[index], allowance, counter_for_probe);
-        tokio::pin!(download);
-        let mut ticker = tokio::time::interval(EVENT_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let measured = loop {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {
-                    state.progress.downloaded_bytes = used + counter.load(std::sync::atomic::Ordering::Relaxed);
-                    return Ok(state.cancel(&config, &callback));
-                }
-                result = &mut download => break result,
-                _ = ticker.tick() => {
-                    state.emit_download_bytes(&callback, used + counter.load(std::sync::atomic::Ordering::Relaxed));
-                }
-            }
-        };
-        used += counter.load(std::sync::atomic::Ordering::Relaxed);
-        state.progress.downloaded_bytes = used;
-        match measured {
-            Ok(sample) => {
-                if !record_download(
-                    &mut state.results[index],
-                    sample,
-                    &config,
-                    &cancellation,
-                    || trace_probe(&config, &target, ips[index]),
-                )
-                .await
-                {
-                    return Ok(state.cancel(&config, &callback));
-                }
-            }
-            Err(failure) => state.results[index].exclude(failure.code, failure.message),
-        }
-        if state.results[index].is_excluded() {
-            state.progress.completed += schedule.skip_remaining_rounds(index);
-        }
-        state.progress.completed += 1;
-        state.emit(&callback, false);
-    }
-
-    if cancellation.is_cancelled() {
+    if !run_downloads(
+        &mut state,
+        schedule,
+        &ips,
+        &config,
+        &target,
+        scope,
+        &cancellation,
+        &callback,
+    )
+    .await
+    {
         return Ok(state.cancel(&config, &callback));
     }
+
     for item in &mut state.results {
         if !item.is_excluded() && item.download_samples_mbps.len() < config.download_rounds {
             item.exclude(
@@ -660,6 +647,118 @@ async fn run_candidates(
         results: state.results,
         cancelled: false,
     })
+}
+
+async fn run_downloads(
+    state: &mut State,
+    mut schedule: DownloadQueue,
+    ips: &[Ipv4Addr],
+    config: &ScanConfig,
+    target: &Url,
+    scope: ScanScope,
+    cancellation: &CancellationToken,
+    callback: &UpdateCallback,
+) -> bool {
+    let total_budget = config.download_budget_bytes();
+    let mut used = 0_u64;
+    while let Some(slot) = schedule.next(total_budget, used) {
+        if cancellation.is_cancelled() {
+            state.progress.downloaded_bytes = used;
+            return false;
+        }
+        let (index, allowance) = match slot {
+            DownloadSlot::Round { index, allowance } => (index, allowance),
+            DownloadSlot::Unfunded(index) => {
+                state.results[index].exclude(
+                    ExclusionCode::DownloadBudget,
+                    "剩余下载预算不足以安排全部复测轮次",
+                );
+                state.progress.completed += config.download_rounds;
+                state.emit(callback, false);
+                continue;
+            }
+        };
+        let label = if state.results[index].city.is_empty() {
+            state.results[index].colo.clone()
+        } else {
+            state.results[index].city.clone()
+        };
+        let ip = &state.results[index].ip;
+        let address = if label.is_empty() {
+            ip.clone()
+        } else {
+            format!("{label} · {ip}")
+        };
+        state.progress.message = format!(
+            "下载复测 {address} · 第 {} / {} 轮",
+            state.results[index].download_samples_mbps.len() + 1,
+            config.download_rounds
+        );
+        state.emit(callback, true);
+
+        if scope == ScanScope::DownloadOnly && state.results[index].download_samples_mbps.is_empty()
+        {
+            let ip = ips[index];
+            state.results[index].network_path = tokio::select! {
+                _ = cancellation.cancelled() => return false,
+                path = tokio::task::spawn_blocking(move || crate::network::capture(ip)) => path.ok().flatten(),
+            };
+        }
+
+        // Poll the byte counter while streaming so progress and cancellation stay
+        // responsive even when a server delivers a slow or endless response.
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter_for_probe = counter.clone();
+        let download = download_probe(config, target, ips[index], allowance, counter_for_probe);
+        tokio::pin!(download);
+        let mut ticker = tokio::time::interval(EVENT_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let measured = loop {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    state.progress.downloaded_bytes = used + counter.load(std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                result = &mut download => break result,
+                _ = ticker.tick() => {
+                    state.emit_download_bytes(callback, used + counter.load(std::sync::atomic::Ordering::Relaxed));
+                }
+            }
+        };
+        used += counter.load(std::sync::atomic::Ordering::Relaxed);
+        state.progress.downloaded_bytes = used;
+        match measured {
+            Ok(sample) if scope == ScanScope::DownloadOnly => {
+                let item = &mut state.results[index];
+                record_download_sample(item, sample.mbps);
+                if let Some(colo) = sample.colo {
+                    record_observed_colo(item, &colo);
+                }
+            }
+            Ok(sample) => {
+                if !record_download(
+                    &mut state.results[index],
+                    sample,
+                    config,
+                    cancellation,
+                    || trace_probe(config, target, ips[index]),
+                )
+                .await
+                {
+                    return false;
+                }
+            }
+            Err(failure) => state.results[index].exclude(failure.code, failure.message),
+        }
+        if state.results[index].is_excluded() {
+            state.progress.completed += schedule.skip_remaining_rounds(index);
+        }
+        state.progress.completed += 1;
+        state.emit(callback, false);
+    }
+
+    !cancellation.is_cancelled()
 }
 
 fn apply_stability_snapshot(
@@ -953,6 +1052,11 @@ where
     (index, probe(ip).await)
 }
 
+fn record_download_sample(item: &mut IpResult, mbps: f64) {
+    item.download_samples_mbps.push(mbps);
+    item.download_mbps = median(&item.download_samples_mbps);
+}
+
 async fn record_download<F, Fut>(
     item: &mut IpResult,
     sample: DownloadProbe,
@@ -965,8 +1069,7 @@ where
     Fut: std::future::Future<Output = Result<TraceProbe, ProbeError>>,
 {
     // The download has finished even if its additional POP check is cancelled.
-    item.download_samples_mbps.push(sample.mbps);
-    item.download_mbps = median(&item.download_samples_mbps);
+    record_download_sample(item, sample.mbps);
     item.measurement_passed = false;
     if let Some(colo) = sample.colo {
         observe_colo(item, &colo);
@@ -1267,7 +1370,7 @@ fn ray_colo(headers: &header::HeaderMap) -> Option<String> {
         .then(|| suffix.to_string())
 }
 
-fn observe_colo(item: &mut IpResult, colo: &str) {
+fn record_observed_colo(item: &mut IpResult, colo: &str) {
     if !item.observed_colos.iter().any(|c| c == colo) {
         item.observed_colos.push(colo.into());
     }
@@ -1277,7 +1380,12 @@ fn observe_colo(item: &mut IpResult, colo: &str) {
             item.region_code = region.into();
             item.city = city.into();
         }
-    } else if colo != item.colo {
+    }
+}
+
+fn observe_colo(item: &mut IpResult, colo: &str) {
+    record_observed_colo(item, colo);
+    if colo != item.colo {
         match pop::location(colo) {
             Some((region, _)) if region != item.region_code => {
                 item.exclude(
@@ -1458,9 +1566,11 @@ struct DownloadQueue {
 
 impl DownloadQueue {
     fn new(groups: &BTreeMap<String, Vec<usize>>, regions: &[String], rounds: usize) -> Self {
-        let batches: VecDeque<VecDeque<_>> = download_batches(groups, regions)
-            .map(VecDeque::from)
-            .collect();
+        Self::from_batches(download_batches(groups, regions), rounds)
+    }
+
+    fn from_batches(batches: impl Iterator<Item = Vec<usize>>, rounds: usize) -> Self {
+        let batches: VecDeque<VecDeque<_>> = batches.map(VecDeque::from).collect();
         let remaining_rounds = batches.iter().map(VecDeque::len).sum::<usize>() * rounds;
         Self {
             batches,
@@ -3895,6 +4005,52 @@ mod tests {
         assert_eq!(outcome.results.len(), 1);
         assert!(!outcome.results[0].eligible);
         assert_eq!(outcome.results[0].role.as_deref(), Some("candidate"));
+    }
+
+    #[tokio::test]
+    async fn download_only_starts_with_a_tls_request_and_skips_stability_and_verification() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.read_u8().await.unwrap()
+        });
+        let config = ScanConfig {
+            target_url: format!("https://ip-picker-fixture.invalid:{port}/download"),
+            ..Default::default()
+        };
+        let stages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = stages.clone();
+        let outcome = run_download_test(
+            config.clone(),
+            vec![Ipv4Addr::LOCALHOST],
+            CancellationToken::new(),
+            Arc::new(move |update| captured.lock().unwrap().push(update.progress.stage)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            0x16
+        );
+        let stages = stages.lock().unwrap();
+        assert_eq!(stages.first().unwrap(), "downloading");
+        assert_eq!(stages.last().unwrap(), "completed");
+        assert!(stages
+            .iter()
+            .all(|stage| stage == "downloading" || stage == "completed"));
+        assert_eq!(outcome.progress.completed, config.download_rounds);
+        let row = &outcome.results[0];
+        assert_eq!(row.exclusion_code, Some(ExclusionCode::HttpsFailure));
+        assert_eq!(row.attempts, 0);
+        assert!(row.tcp_stability.is_none());
+        assert!(!row.measurement_passed);
+        assert!(!row.eligible);
     }
 
     #[tokio::test]

@@ -86,6 +86,17 @@ pub struct FavoriteEntry {
     pub targeted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_path: Option<NetworkPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_test: Option<FavoriteDownloadTest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FavoriteDownloadTest {
+    pub run_id: String,
+    pub tested_at: String,
+    pub config: ScanConfig,
+    pub result: IpResult,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,6 +218,7 @@ impl FavoriteLibrary {
             result: result.clone(),
             targeted: false,
             network_path: run.path_for(result),
+            download_test: None,
         };
         if let Some(index) = existing {
             self.entries[index] = snapshot;
@@ -286,6 +298,7 @@ impl FavoriteLibrary {
             result: IpResult::new(ip),
             targeted: true,
             network_path: None,
+            download_test: None,
         });
         Ok(())
     }
@@ -373,35 +386,65 @@ impl FavoriteLibrary {
             .join("\n");
         run.config.validate()?;
         run.results = ips.iter().copied().map(IpResult::new).collect();
-        run.progress.total = ips.len();
-        run.progress.message = format!("准备测试 {} 个收藏 IP", ips.len());
+        if run.download_only {
+            run.progress.stage = "downloading".into();
+            run.progress.total = ips.len() * run.config.download_rounds;
+            run.progress.message = format!("准备对 {} 个收藏 IP 仅测下载", ips.len());
+        } else {
+            run.progress.total = ips.len();
+            run.progress.message = format!("准备测试 {} 个收藏 IP", ips.len());
+        }
         let mut favorite_ids = favorite_ids;
         if let Some((folder_id, ip, note)) = manual_target {
-            self.save_snapshot(&folder_id, &run, &ip.to_string(), &note)?;
-            self.entries.last_mut().unwrap().targeted = true;
+            if run.download_only {
+                self.add_manual_ip(&folder_id, &ip.to_string(), &note, &run.config)?;
+            } else {
+                self.save_snapshot(&folder_id, &run, &ip.to_string(), &note)?;
+                self.entries.last_mut().unwrap().targeted = true;
+            }
             favorite_ids.push(self.entries.last().unwrap().id.clone());
         }
         let targeted_ids: HashSet<_> = favorite_ids.iter().collect();
         let baselines = self
             .entries
             .iter()
-            .filter(|entry| targeted_ids.contains(&entry.id) && was_attempted(&entry.result))
-            .map(|entry| {
-                let mut config = entry.config.clone();
+            .filter(|entry| targeted_ids.contains(&entry.id))
+            .filter_map(|entry| {
+                let previous_download = entry.download_test.as_ref().filter(|_| run.download_only);
+                let (result, config, network_path, tested_at) = match previous_download {
+                    Some(test) => (
+                        &test.result,
+                        &test.config,
+                        &test.result.network_path,
+                        &test.tested_at,
+                    ),
+                    None => (
+                        &entry.result,
+                        &entry.config,
+                        &entry.network_path,
+                        entry
+                            .run_finished_at
+                            .as_ref()
+                            .unwrap_or(&entry.run_started_at),
+                    ),
+                };
+                if !was_attempted(result) {
+                    return None;
+                }
+                let mut config = config.clone();
                 // Candidate sources do not affect a same-IP comparison.
                 config.custom_ips.clear();
-                FavoriteTestBaseline {
+                Some(FavoriteTestBaseline {
                     favorite_id: entry.id.clone(),
-                    tested_at: entry
-                        .run_finished_at
-                        .clone()
-                        .unwrap_or_else(|| entry.run_started_at.clone()),
+                    tested_at: tested_at.clone(),
+                    download_mbps: result
+                        .has_complete_download(&config)
+                        .then_some(result.download_mbps),
                     config,
-                    network_path: entry.network_path.clone(),
-                    colo: entry.result.colo.clone(),
-                    measurement_passed: entry.result.measurement_passed,
-                    tcp_p95_ms: entry
-                        .result
+                    network_path: network_path.clone(),
+                    colo: result.colo.clone(),
+                    measurement_passed: result.measurement_passed,
+                    tcp_p95_ms: result
                         .tcp_stability
                         .as_ref()
                         .filter(|stats| {
@@ -413,15 +456,7 @@ impl FavoriteLibrary {
                         .and_then(|stats| {
                             crate::stability::latency_metric_ms(&stats.probes_ms, "p95")
                         }),
-                    download_mbps: (entry.result.download_samples_mbps.len()
-                        >= entry.config.download_rounds
-                        && entry
-                            .result
-                            .download_samples_mbps
-                            .iter()
-                            .all(|speed| speed.is_finite() && *speed > 0.0))
-                    .then_some(entry.result.download_mbps),
-                }
+                })
             })
             .collect();
         Ok((
@@ -460,17 +495,33 @@ impl FavoriteLibrary {
             if job.run.status != "completed" && !was_attempted(result) && !is_new_placeholder {
                 continue;
             }
+            let config = ScanConfig {
+                custom_ips: result.ip.clone(),
+                ..snapshot_config.clone()
+            };
+            if job.run.download_only {
+                entry.download_test = Some(FavoriteDownloadTest {
+                    run_id: job.run.id.clone(),
+                    tested_at: job
+                        .run
+                        .finished_at
+                        .as_ref()
+                        .unwrap_or(&job.run.started_at)
+                        .clone(),
+                    config,
+                    result: result.clone(),
+                });
+                continue;
+            }
             entry.run_id = job.run.id.clone();
             entry.run_status = job.run.status.clone();
             entry.run_started_at = job.run.started_at.clone();
             entry.run_finished_at = job.run.finished_at.clone();
-            entry.config = ScanConfig {
-                custom_ips: result.ip.clone(),
-                ..snapshot_config.clone()
-            };
+            entry.config = config;
             entry.result = result.clone();
             entry.targeted = true;
             entry.network_path = job.run.path_for(result);
+            entry.download_test = None;
         }
     }
 }
@@ -484,6 +535,7 @@ pub(crate) fn checked_ipv4(ip: &str) -> Result<Ipv4Addr, String> {
 pub(crate) fn was_attempted(result: &IpResult) -> bool {
     result.tcp_ms > 0.0
         || result.attempts > 0
+        || !result.download_samples_mbps.is_empty()
         || result
             .tcp_stability
             .as_ref()
@@ -523,6 +575,7 @@ mod tests {
         ScanRun {
             quick_validation: Some(false),
             retest_ip: None,
+            download_only: false,
             id: "original-run".into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),

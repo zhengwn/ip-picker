@@ -912,6 +912,7 @@ mod tests {
         ScanRun {
             quick_validation: Some(false),
             retest_ip: None,
+            download_only: false,
             id: "legacy-run".into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),

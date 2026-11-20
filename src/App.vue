@@ -16,7 +16,7 @@ import ScanHistoryPanel from './components/ScanHistoryPanel.vue'
 import AllResultsPanel from './components/AllResultsPanel.vue'
 import FavoriteSaveDialog from './components/FavoriteSaveDialog.vue'
 import FavoritesPanel from './components/FavoritesPanel.vue'
-import { acceptsFavoriteLibrary, defaultFavoriteLibrary, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from './favorites'
+import { acceptsFavoriteLibrary, defaultFavoriteLibrary, favoriteTestPassedCount, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from './favorites'
 import { displayForLatencySort, latencySortForDisplay, readResultPreferences, saveResultPreferences } from './result-preferences'
 import { compactScanProgress, sameScanConfig, singleIpConfig } from './scan-experience'
 
@@ -425,8 +425,9 @@ function receiveFavoriteTest(next: FavoriteTestJob) {
   favoriteTest.value = next
   if (next.run.status !== 'running' && stoppingRunId.value === next.run.id) stoppingRunId.value = null
   if (finishedNow) {
-    const passed = next.run.results.filter(result => result.measurementPassed).length
-    notify(next.run.status === 'completed' ? `收藏复测完成，${passed} / ${next.favoriteIds.length} 个 IP 完整测速通过`
+    const passed = favoriteTestPassedCount(next.run)
+    const completed = next.run.downloadOnly ? '个 IP 测完全部下载轮次' : '个 IP 完整测速通过'
+    notify(next.run.status === 'completed' ? `收藏复测完成，${passed} / ${next.favoriteIds.length} ${completed}`
       : next.run.status === 'cancelled' ? '收藏复测已停止；未开始的 IP 保留原测试记录'
       : next.run.error ?? '收藏复测失败，请查看详情', next.run.status === 'failed')
     void refreshFavorites()

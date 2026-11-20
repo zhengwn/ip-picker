@@ -14,8 +14,8 @@ mod storage;
 
 use crate::{
     engine::{
-        prepare_ip_retest, prepare_scan, run_targeted_scan, EngineOutcome, EngineUpdate,
-        PreparedScan, UpdateCallback,
+        prepare_ip_retest, prepare_scan, run_download_test, run_targeted_scan, EngineOutcome,
+        EngineUpdate, PreparedScan, UpdateCallback,
     },
     favorites::{checked_ipv4, FavoriteLibrary, FavoriteTestJob, FavoriteTestStart},
     history::{HistoryKind, HistoryMatch, HistorySummary, ScanHistory, HISTORY_LIMIT},
@@ -137,6 +137,7 @@ impl RuntimeState {
         let run = ScanRun {
             quick_validation: Some(!persist_config && target.is_none()),
             retest_ip: target.map(|ip| ip.to_string()),
+            download_only: false,
             id: uuid::Uuid::new_v4().to_string(),
             status: "running".into(),
             started_at: chrono::Utc::now().to_rfc3339(),
@@ -229,6 +230,7 @@ impl RuntimeState {
     fn begin_favorite_test(
         &mut self,
         config: ScanConfig,
+        download_only: bool,
         folder_id: Option<&str>,
         favorite_id: Option<&str>,
         ip: Option<&str>,
@@ -251,6 +253,7 @@ impl RuntimeState {
             ScanRun {
                 quick_validation: Some(false),
                 retest_ip: None,
+                download_only,
                 id: uuid::Uuid::new_v4().to_string(),
                 status: "running".into(),
                 started_at: chrono::Utc::now().to_rfc3339(),
@@ -749,6 +752,7 @@ fn delete_favorite(
 #[tauri::command]
 async fn start_favorite_test(
     config: ScanConfig,
+    download_only: Option<bool>,
     folder_id: Option<String>,
     favorite_id: Option<String>,
     ip: Option<String>,
@@ -758,11 +762,13 @@ async fn start_favorite_test(
 ) -> Result<FavoriteTestStart, String> {
     let _gate = state.shutdown_gate.try_lock().map_err(|_| "窗口正在关闭")?;
     let cancellation = CancellationToken::new();
+    let download_only = download_only.unwrap_or(false);
     let (done, worker) = watch::channel(());
     let (started, ips) = {
         let mut inner = state.inner.lock().map_err(|_| "应用状态不可用")?;
         let started = inner.begin_favorite_test(
             config,
+            download_only,
             folder_id.as_deref(),
             favorite_id.as_deref(),
             ip.as_deref(),
@@ -809,7 +815,11 @@ async fn start_favorite_test(
                 let _ = callback_app.emit("favorite-test-update", payload);
             }
         });
-        let outcome = run_targeted_scan(config, ips, cancellation.clone(), callback).await;
+        let outcome = if download_only {
+            run_download_test(config, ips, cancellation.clone(), callback).await
+        } else {
+            run_targeted_scan(config, ips, cancellation.clone(), callback).await
+        };
         let _ = forwarder.await;
         let _ = checkpoint_writer.await;
         let completed = owned_state.inner.lock().ok().and_then(|mut inner| {
@@ -1068,6 +1078,7 @@ mod lifecycle_tests {
         ScanRun {
             quick_validation: Some(false),
             retest_ip: None,
+            download_only: false,
             id: id.into(),
             status: "completed".into(),
             started_at: "2026-10-23T00:00:00Z".into(),
@@ -1195,6 +1206,7 @@ mod lifecycle_tests {
             let (started, _) = inner
                 .begin_favorite_test(
                     ScanConfig::default(),
+                    false,
                     Some(&folder),
                     None,
                     Some(ip),
@@ -1401,6 +1413,93 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn download_only_persists_downloads_and_preserves_full_snapshots_and_unstarted_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut inner = RuntimeState {
+            saved: SavedState::default(),
+            cancellation: None,
+            worker: None,
+        };
+        let config = ScanConfig::default();
+        let folder = inner.saved.favorites.folders[0].id.clone();
+        let mut full = run("full");
+        for ip in ["104.16.1.1", "104.16.1.2", "104.16.1.3"] {
+            let mut row = model::IpResult::new(ip.parse().unwrap());
+            row.tcp_stability = Some(stability::summarize(10, 200.0, vec![Some(50.0); 10]));
+            row.download_samples_mbps = vec![30.0, 30.0];
+            row.download_mbps = 30.0;
+            full.results.push(row);
+            inner
+                .saved
+                .favorites
+                .save_snapshot(&folder, &full, ip, "")
+                .unwrap();
+        }
+        let original = serde_json::to_value(&inner.saved.favorites.entries).unwrap();
+        let (started, ips) = inner
+            .begin_favorite_test(
+                config,
+                true,
+                Some(&folder),
+                None,
+                None,
+                None,
+                CancellationToken::new(),
+                &path,
+            )
+            .unwrap();
+        assert_eq!(ips.len(), 3);
+        assert_eq!(started.job.run.progress.stage, "downloading");
+        let mut results = started.job.run.results.clone();
+        results[0].download_samples_mbps = vec![47.0, 49.0];
+        results[0].download_mbps = 48.0;
+        results[1].download_samples_mbps = vec![52.0];
+        results[1].download_mbps = 52.0;
+        inner
+            .complete_favorite_test(
+                &started.job.run.id,
+                Ok(EngineOutcome {
+                    results,
+                    progress: started.job.run.progress.clone(),
+                    cancelled: true,
+                }),
+                true,
+                &path,
+            )
+            .unwrap();
+
+        let saved = storage::load(&path).unwrap();
+        let history = saved.recent_history();
+        assert!(history[0].1.download_only);
+        assert_eq!(
+            saved.history_comparison("104.16.1.1")[0].entry.run.results[0].download_mbps,
+            48.0
+        );
+        for (index, (entry, expected)) in saved
+            .favorites
+            .entries
+            .iter()
+            .zip([Some(48.0), Some(52.0), None])
+            .enumerate()
+        {
+            assert_eq!(
+                entry
+                    .download_test
+                    .as_ref()
+                    .map(|test| test.result.download_mbps),
+                expected
+            );
+            let mut full_snapshot = entry.clone();
+            full_snapshot.download_test = None;
+            assert_eq!(
+                serde_json::to_value(full_snapshot).unwrap(),
+                original[index]
+            );
+        }
+    }
+
+    #[test]
     fn start_completion_and_later_note_snapshots_have_a_durable_total_order() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.json");
@@ -1413,6 +1512,7 @@ mod lifecycle_tests {
         let (late_start_response, _) = inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                false,
                 Some(&folder),
                 None,
                 Some("104.16.1.1"),
@@ -1453,6 +1553,7 @@ mod lifecycle_tests {
         let (note_update, _) = inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                false,
                 Some(&folder),
                 None,
                 Some("104.16.1.1"),
@@ -1533,6 +1634,7 @@ mod lifecycle_tests {
         let (started, _) = inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                false,
                 Some(&folder),
                 None,
                 Some("104.16.1.1"),
@@ -1790,6 +1892,7 @@ mod lifecycle_tests {
         inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                false,
                 Some(&folder),
                 None,
                 Some("104.16.1.1"),
@@ -1806,6 +1909,7 @@ mod lifecycle_tests {
         assert!(inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                false,
                 Some(&folder),
                 None,
                 Some("104.16.1.2"),
@@ -1829,6 +1933,7 @@ mod lifecycle_tests {
         assert!(inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                false,
                 Some(&folder),
                 None,
                 Some("104.16.1.2"),
@@ -1865,6 +1970,7 @@ mod lifecycle_tests {
             let (started, _) = inner
                 .begin_favorite_test(
                     config,
+                    false,
                     Some(&folder),
                     None,
                     Some("104.16.1.1"),
@@ -1912,6 +2018,7 @@ mod lifecycle_tests {
         let (started, _) = inner
             .begin_favorite_test(
                 config,
+                false,
                 Some(&folder),
                 None,
                 Some("104.16.1.1"),
@@ -1946,6 +2053,7 @@ mod lifecycle_tests {
                     max_tcp_ms: Some(231.0),
                     ..ScanConfig::default()
                 },
+                false,
                 Some(&folder),
                 None,
                 Some("104.16.1.1"),
@@ -1985,6 +2093,7 @@ mod lifecycle_tests {
         let (started, _) = inner
             .begin_favorite_test(
                 ScanConfig::default(),
+                false,
                 Some(&folder),
                 None,
                 None,

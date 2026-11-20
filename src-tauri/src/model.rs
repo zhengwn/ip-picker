@@ -575,6 +575,16 @@ impl IpResult {
         self.exclusion_code.is_some() || self.exclusion_reason.is_some()
     }
 
+    pub(crate) fn has_complete_download(&self, config: &ScanConfig) -> bool {
+        self.download_samples_mbps.len() >= config.download_rounds
+            && self
+                .download_samples_mbps
+                .iter()
+                .all(|value| value.is_finite() && *value > 0.0)
+            && self.download_mbps.is_finite()
+            && self.download_mbps > 0.0
+    }
+
     pub(crate) fn mark_cancelled(&mut self, config: &ScanConfig) {
         if !self.is_excluded() && self.download_samples_mbps.len() < config.download_rounds {
             self.exclude(ExclusionCode::Cancelled, "测试已停止，验证或下载复测未完成");
@@ -606,13 +616,7 @@ impl IpResult {
     pub fn has_complete_measurement(&self, config: &ScanConfig) -> bool {
         self.success_count == self.attempts
             && self.attempts >= config.verification_attempts
-            && self.download_samples_mbps.len() >= config.download_rounds
-            && self
-                .download_samples_mbps
-                .iter()
-                .all(|value| value.is_finite() && *value > 0.0)
-            && self.download_mbps.is_finite()
-            && self.download_mbps > 0.0
+            && self.has_complete_download(config)
             && self.tcp_ms.is_finite()
             && self.tcp_ms >= 0.0
             && config.accepts_initial_tcp_ms(self.tcp_ms)
@@ -890,6 +894,8 @@ pub struct ScanRun {
     pub quick_validation: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retest_ip: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub download_only: bool,
     pub status: String,
     pub started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]

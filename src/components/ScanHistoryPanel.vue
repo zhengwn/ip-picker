@@ -123,7 +123,9 @@ const history = computed(() => content.value?.mode === 'recent' ? content.value.
 const matches = computed(() => content.value?.mode === 'compare' ? content.value.matches : [])
 const baseline = computed(() => matches.value.find(match => match.baseline))
 const baselineConfig = computed(() => {
-  const config = baseline.value?.run.config
+  const baselineRun = baseline.value?.run
+  if (baselineRun?.downloadOnly) return null
+  const config = baselineRun?.config
   if (!config?.stabilityFirst || config.tcpLatencyScreening) return null
   const snapshot = singleIpConfig(config, comparedIp.value)
   return validateConfig(snapshot) ? null : snapshot
@@ -155,7 +157,7 @@ function retestBaseline() {
 const runRows = computed(() => {
   const current = run.value
   if (!current) return []
-  const results = runScope.value === 'precision' ? current.results.filter(hasPrecisionMeasurement) : current.results
+  const results = runScope.value === 'precision' && !current.downloadOnly ? current.results.filter(hasPrecisionMeasurement) : current.results
   return results.map(result => ({
     result,
     pop: result.colo || result.observedColos[0] || '',
@@ -207,7 +209,7 @@ watch([runScope, runIpQuery, runPop, runStatus, currentPage], async () => {
   if (table.value) table.value.scrollTop = 0
 })
 
-function comparisonSettings(config: ScanConfig) {
+function comparisonSettings({ config, downloadOnly }: ScanRun) {
   const initialScreening = config.tcpLatencyScreening
     ? config.maxTcpMs == null ? '开启 · 无延迟上限' : `开启 · 单次延迟 ≤ ${config.maxTcpMs} ms`
     : '关闭 · 仅检查连通性'
@@ -216,16 +218,16 @@ function comparisonSettings(config: ScanConfig) {
   const budget = config.downloadBudgetEnabled === false ? '不限流量' : `${config.downloadBudgetMiB} MiB`
   return [
     { label: '测速目标', value: config.targetUrl },
-    { label: 'TCP 初筛', value: initialScreening },
-    { label: 'TCP 探测', value: `${probes} · 超时 ${config.connectTimeoutMs} ms` },
-    { label: 'TCP 判定', value: config.stabilityAttempts == null ? '无稳定性判定' : `${threshold} · 失败率 ≤ ${config.maxStabilityFailurePercent}%` },
-    { label: 'HTTPS 验证', value: `${config.verificationAttempts} 次 · 超时 ${config.requestTimeoutMs} ms` },
+    { label: 'TCP 初筛', value: downloadOnly ? '跳过' : initialScreening },
+    { label: 'TCP 探测', value: downloadOnly ? '跳过' : `${probes} · 超时 ${config.connectTimeoutMs} ms` },
+    { label: 'TCP 判定', value: downloadOnly ? '跳过' : config.stabilityAttempts == null ? '无稳定性判定' : `${threshold} · 失败率 ≤ ${config.maxStabilityFailurePercent}%` },
+    { label: 'HTTPS 验证', value: downloadOnly ? '跳过' : `${config.verificationAttempts} 次 · 超时 ${config.requestTimeoutMs} ms` },
     { label: '下载计划', value: `${config.downloadRounds} 轮 × ${config.downloadSeconds} 秒 · ${budget}` },
   ]
 }
 
-const settingsByRun = computed(() => new Map(matches.value.map(({ run }) => [run.id, comparisonSettings(run.config)])))
-const runSettings = computed(() => run.value ? comparisonSettings(run.value.config) : [])
+const settingsByRun = computed(() => new Map(matches.value.map(({ run }) => [run.id, comparisonSettings(run)])))
+const runSettings = computed(() => run.value ? comparisonSettings(run.value) : [])
 const changedSettings = computed(() => {
   const settings = [...settingsByRun.value.values()]
   return new Set(settings[0]?.filter((field, index) => settings.some(fields => fields[index].value !== field.value)).map(field => field.label))
@@ -238,6 +240,7 @@ const comparisonWarnings = computed(() => {
     { config: first.config, networkPath: pathFor(first, first.results[0]), colo: first.results[0]?.colo ?? '' },
     { config: run.config, networkPath: pathFor(run, run.results[0]), colo: run.results[0]?.colo ?? '' },
     comparedIp.value,
+    first.downloadOnly && run.downloadOnly,
   ))
   if (matches.value.some(({ run }) => {
     const path = pathFor(run, run.results[0])
@@ -317,7 +320,7 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
       <section v-if="infoOpen && (run || matches.length)" id="history-info-panel" ref="infoPanel" class="history-info-panel" aria-labelledby="history-info-title" tabindex="0">
         <template v-if="run">
           <h3 id="history-info-title">本轮详情</h3>
-          <p>{{ view.mode === 'run' && view.kind === 'favorite' ? '收藏复测' : scanModeLabel(run) }} · {{ favoriteDate(run.startedAt) }} · {{ statusText[run.status] }}</p>
+          <p>{{ run.downloadOnly ? '仅测下载' : view.mode === 'run' && view.kind === 'favorite' ? '收藏复测' : scanModeLabel(run) }} · {{ favoriteDate(run.startedAt) }} · {{ statusText[run.status] }}</p>
           <p v-if="run.error" class="history-detail-error">{{ run.error }}</p>
           <dl class="history-settings-list"><div v-for="setting in runSettings" :key="setting.label"><dt>{{ setting.label }}</dt><dd>{{ setting.value }}</dd></div></dl>
           <p>{{ interfaceLabel(run.progress.networkPath) }} · {{ interfaceDetail(run.progress.networkPath) }}</p>
@@ -344,11 +347,12 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
         <span id="baseline-retest-cost" :title="baselineEstimate.detail">{{ baselineEstimate.duration }} · 下载正文 {{ baselineEstimate.download }}</span>
         <button type="button" class="button" :disabled="retestDisabled" aria-describedby="baseline-retest-cost" @click="retestBaseline"><RotateCcw :size="12" aria-hidden="true" />按基线参数复测</button>
       </template>
+      <span v-else-if="baseline.run.downloadOnly">仅测下载</span>
       <span v-else>该轮参数与当前测速规则不兼容</span>
       <button ref="baselineAction" type="button" class="text-button" :aria-disabled="savingBaseline" @click="setBaseline(null)">取消固定</button>
     </div>
     <div v-if="run?.results.length" class="history-filters" role="group" aria-label="筛选本轮测速记录">
-      <SelectControl compact><select v-model="runScope" aria-label="本轮结果范围"><option value="precision">精测记录</option><option value="all">全部 IP</option></select></SelectControl>
+      <SelectControl v-if="!run.downloadOnly" compact><select v-model="runScope" aria-label="本轮结果范围"><option value="precision">精测记录</option><option value="all">全部 IP</option></select></SelectControl>
       <label class="history-search-field history-run-search"><span class="visually-hidden">搜索本轮 IP 地址</span><Search :size="14" aria-hidden="true" /><input v-model="runIpQuery" type="search" autocomplete="off" spellcheck="false" placeholder="搜索本轮 IP" /></label>
       <SelectControl compact><select v-model="runPop" aria-label="本轮机房（POP）"><option value="">全部 POP</option><option v-for="pop in runPopOptions" :key="pop" :value="pop">{{ pop }}</option></select></SelectControl>
       <SelectControl compact><select v-model="runStatus" aria-label="本轮测速状态"><option value="">全部状态</option><option v-for="status in runStatusOptions" :key="status" :value="status">{{ status }}</option></select></SelectControl>
@@ -361,7 +365,7 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
         <thead><tr><th scope="col">开始时间</th><th scope="col">测速类型</th><th scope="col" title="本轮开始时采集的路由接口">网络接口</th><th scope="col">状态</th><th scope="col">记录 IP 数</th><th scope="col">目标</th><th scope="col"><span class="visually-hidden">操作</span></th></tr></thead>
         <tbody><tr v-for="entry in history.entries" :key="entry.id">
           <td class="history-time"><time :datetime="entry.startedAt">{{ favoriteDate(entry.startedAt) }}</time></td>
-          <td>{{ entry.kind === 'scan' ? scanModeLabel(entry) : kindText[entry.kind] }}</td>
+          <td>{{ entry.downloadOnly ? '仅测下载' : entry.kind === 'scan' ? scanModeLabel(entry) : kindText[entry.kind] }}</td>
           <td><span class="history-network" :title="interfaceDetail(entry.networkPath)">{{ interfaceLabel(entry.networkPath) }}</span></td>
           <td><span :class="['status-label', statusClass[entry.status]]">{{ statusText[entry.status] }}</span></td>
           <td class="history-number">{{ entry.resultCount.toLocaleString('zh-CN') }}</td>
@@ -411,7 +415,8 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
                   <section class="history-detail-settings" aria-label="本轮实际参数"><h4>测试参数</h4><dl class="history-settings-list"><div v-for="setting in row.settings" :key="setting.label" :class="{ 'setting-diff': view.mode === 'compare' && changedSettings.has(setting.label) }"><dt>{{ setting.label }}</dt><dd>{{ setting.value }}</dd></div></dl></section>
                   <section aria-label="本轮网络采样"><h4>网络与初筛</h4><dl class="history-settings-list"><div><dt>初筛延迟</dt><dd>{{ row.initial }} ms</dd></div><div><dt>路由接口</dt><dd>{{ interfaceLabel(row.networkPath) }}</dd></div><template v-if="row.networkPath"><div><dt>采样 IP</dt><dd class="mono">{{ row.networkPath.sampleIp }}{{ row.networkPath.sampleIp === row.result.ip ? '（本 IP）' : '（其他 IP 的路径样本）' }}</dd></div><div><dt>采样时间</dt><dd>{{ favoriteDate(row.networkPath.capturedAt) }}</dd></div></template><div><dt>观测 POP</dt><dd>{{ row.result.observedColos.join(' / ') || '未记录' }}</dd></div></dl></section>
                 </div>
-                <TcpDiagnostics :result="row.result" :config="row.run.config" />
+                <p v-if="row.run.downloadOnly && row.result.downloadSamplesMbps.length">下载样本 {{ row.result.downloadSamplesMbps.map(favoriteNumber).join(' / ') }} Mbps</p>
+                <TcpDiagnostics v-if="!row.run.downloadOnly" :result="row.result" :config="row.run.config" />
               </section>
             </td></tr>
           </template>

@@ -371,8 +371,22 @@ export function summarizeMeasurementCoverage(results: IpResult[], config: ScanCo
   }
 }
 
+export function hasCompleteDownload(result: IpResult, config: ScanConfig): boolean {
+  return result.downloadSamplesMbps.length >= config.downloadRounds
+    && result.downloadSamplesMbps.every(sample => Number.isFinite(sample) && sample > 0)
+    && Number.isFinite(result.downloadMbps) && result.downloadMbps > 0
+}
+
+export function downloadMeasurementStatus(result: IpResult, config: ScanConfig, running = false): string {
+  if (hasCompleteDownload(result, config)) return '下载测速完成'
+  if (result.exclusionCode === 'cancelled' || result.exclusionCode === 'downloadBudget') return '下载测速未完成'
+  if (result.exclusionCode || result.exclusionReason) return '下载测速失败'
+  return running ? '下载测速中' : '下载测速未完成'
+}
+
 /** Report evidence actually obtained, independently of why a candidate was excluded. */
 export function candidateMeasurementStatus(result: IpResult, run: ScanRun): string {
+  if (run.downloadOnly) return downloadMeasurementStatus(result, run.config, run.status === 'running')
   if (quickRetestAdvice(result, run)) return '建议完整复测'
   if (isDownloadShortlistExclusion(result)) return '稳定性已完成 · 未入选下载'
   if (isRegionalAdmissionExclusion(result)) return '未入围 · 未精测'

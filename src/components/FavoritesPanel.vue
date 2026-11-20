@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { Check, ChevronDown, ChevronRight, CircleAlert, Clipboard, FolderOpen, History, LoaderCircle, Pencil, Plus, RotateCcw, Search, Settings2, Square, Star, Trash2, X } from '@lucide/vue'
+import { Check, ChevronDown, ChevronRight, CircleAlert, Clipboard, Download, FolderOpen, History, LoaderCircle, Pencil, Plus, RotateCcw, Search, Settings2, Square, Star, Trash2, X } from '@lucide/vue'
 import { regionName, type ScanConfig } from '../types'
 import { validManualIpv4 } from '../custom-ips'
-import { candidateExclusionReason, candidateMeasurementStatus, precisionPolicyLabel, targetHost } from '../ui-state'
-import { favoriteDate, favoriteError, favoriteHasTestData, favoriteNumber, favoriteRunStatus, favoriteSnapshotRun, favoriteTestDate, favoriteTestChanges, favoriteTestPhase, type FavoriteEntry, type FavoriteFolder, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from '../favorites'
+import { candidateExclusionReason, candidateMeasurementStatus, downloadMeasurementStatus, hasCompleteDownload, precisionPolicyLabel, targetHost } from '../ui-state'
+import { favoriteDate, favoriteError, favoriteHasTestData, favoriteNumber, favoriteRunStatus, favoriteSnapshotRun, favoriteTestDate, favoriteTestChanges, favoriteTestPassedCount, favoriteTestPhase, type FavoriteEntry, type FavoriteFolder, type FavoriteLibrary, type FavoriteTestJob, type FavoriteTestStart } from '../favorites'
 import { preferredFavoriteFolder, rememberFavoriteFolder } from '../favorite-preferences'
 import { useDismissiblePopover } from '../popovers'
 import type { TcpDisplayMetric } from '../result-preferences'
@@ -58,11 +58,16 @@ const entries = computed(() => props.library.entries.filter(entry => !selectedFo
 const tcpScaleMaxMs = computed(() => tcpLatencyChartScale(entries.value.map(entry => entry.result)))
 const folderEntryCount = (id: string) => props.library.entries.filter(entry => entry.folderId === id).length
 const folderName = (id: string) => props.library.folders.find(folder => folder.id === id)?.name ?? '未知收藏夹'
+const latestDownload = (entry: FavoriteEntry) => entry.downloadTest?.result ?? entry.result
 const visibleEntries = computed(() => {
   const query = search.value.trim().toLocaleLowerCase()
-  return entries.value.filter(entry => (!showChangesOnly.value || changes.value.get(entry.id)?.changed)
-    && (!query || [entry.result.ip, entry.result.colo, entry.result.city, entry.result.regionCode, regionName(entry.result.regionCode), ...entry.result.observedColos, entry.note, folderName(entry.folderId)]
-    .some(value => value.toLocaleLowerCase().includes(query))))
+  return entries.value.filter(entry => {
+    if (showChangesOnly.value && !changes.value.get(entry.id)?.changed) return false
+    if (!query) return true
+    const { ip, colo, city, regionCode, observedColos } = latestDownload(entry)
+    return [ip, colo, city, regionCode, regionName(regionCode), ...observedColos, entry.note, folderName(entry.folderId)]
+      .some(value => value.toLocaleLowerCase().includes(query))
+  })
 })
 const folderAction = computed(() => action.value === 'createFolder' || action.value === 'renameFolder')
 const deleting = computed(() => action.value === 'deleteFolder' || action.value === 'deleteEntry')
@@ -81,7 +86,9 @@ watch(() => job.value?.run.id, () => { showChangesOnly.value = false })
 const formInvalid = computed(() => folderAction.value ? invalidName.value : action.value === 'editEntry' ? !folderId.value || duplicateEntry.value || note.value.length > 500 : action.value === 'addIp' ? !folderId.value || !validManualIpv4(manualIp.value) || note.value.length > 500 : false)
 const currentSettings = computed(() => `${targetHost(props.config.targetUrl)} · TCP ${props.config.stabilityAttempts ?? '默认'} 次 · HTTPS ${props.config.verificationAttempts} 次 · 下载 ${props.config.downloadRounds} 轮 × ${props.config.downloadSeconds} 秒 · ${downloadBudgetLabel(props.config)}`)
 const testTargetCount = computed(() => job.value?.favoriteIds.length ?? 0)
-const testPassedCount = computed(() => job.value?.run.results.filter(result => result.measurementPassed).length ?? 0)
+const testPassedCount = computed(() => job.value ? favoriteTestPassedCount(job.value.run) : 0)
+const testPassedLabel = computed(() => job.value?.run.downloadOnly ? '下载完成' : '完整通过')
+const folderTestDisabled = computed(() => testDisabled.value || !selectedFolder.value || !entries.value.length)
 const testPercent = computed(() => {
   if (!job.value || !job.value.run.progress.total) return 0
   return Math.min(100, Math.round(job.value.run.progress.completed / job.value.run.progress.total * 100))
@@ -92,8 +99,16 @@ const testTargetFolders = computed(() => {
   return [...new Set(props.library.entries.filter(entry => ids.has(entry.id)).map(entry => folderName(entry.folderId)))].join('、')
 })
 const isEntryTesting = (entry: FavoriteEntry) => !!testRunning.value && !!job.value?.favoriteIds.includes(entry.id)
+function entryPassed(entry: FavoriteEntry) {
+  if (isEntryTesting(entry)) return false
+  return entry.downloadTest ? hasCompleteDownload(entry.downloadTest.result, entry.downloadTest.config) : entry.result.measurementPassed
+}
 function entryState(entry: FavoriteEntry) {
-  if (isEntryTesting(entry)) return favoriteHasTestData(entry) ? '复测中 · 显示上次结果' : '等待测速结果'
+  if (isEntryTesting(entry)) {
+    const label = job.value?.run.downloadOnly ? '仅测下载中' : '复测中'
+    return entry.downloadTest || favoriteHasTestData(entry) ? `${label} · 显示上次结果` : label
+  }
+  if (entry.downloadTest) return downloadMeasurementStatus(entry.downloadTest.result, entry.downloadTest.config)
   return favoriteHasTestData(entry) ? candidateMeasurementStatus(entry.result, favoriteSnapshotRun(entry)) : '尚未测速'
 }
 function detailId(id: string) { return `favorite-detail-${encodeURIComponent(id)}` }
@@ -199,7 +214,7 @@ function revealSavedAddress(folder: string) {
   showChangesOnly.value = false
 }
 
-async function startTest(target: { folderId?: string; favoriteId?: string; ip?: string; note?: string }, inDialog = false): Promise<boolean> {
+async function startTest(target: { folderId?: string; favoriteId?: string; ip?: string; note?: string; downloadOnly?: boolean }, inDialog = false): Promise<boolean> {
   if (testDisabled.value) return false
   const updating = !!target.ip && !!existingManualEntry.value
   starting.value = true
@@ -213,7 +228,13 @@ async function startTest(target: { folderId?: string; favoriteId?: string; ip?: 
     if (target.folderId) selectedFolderId.value = target.folderId
     if (target.ip && target.folderId) revealSavedAddress(target.folderId)
     const finishedBeforeResponse = job.value?.run.id === start.job.run.id && job.value.run.status !== 'running'
-    if (!finishedBeforeResponse) emit('notify', target.ip ? (updating ? '已开始重新测速，完成后更新此收藏' : '已收藏 IP 并开始测速') : `已开始复测 ${start.job.favoriteIds.length} 个收藏 IP`)
+    if (!finishedBeforeResponse) {
+      const count = start.job.favoriteIds.length
+      const message = target.downloadOnly ? `已开始测量 ${count} 个收藏 IP 的下载速度`
+        : target.ip ? (updating ? '已开始重新测速，完成后更新此收藏' : '已收藏 IP 并开始测速')
+          : `已开始复测 ${count} 个收藏 IP`
+      emit('notify', message)
+    }
     return true
   } catch (cause) {
     if (inDialog) error.value = favoriteError(cause)
@@ -255,7 +276,7 @@ onBeforeUnmount(() => {
         <div v-if="testRunning && job" class="favorite-active-task" role="status" aria-live="polite">
           <LoaderCircle :size="12" class="spinning" aria-hidden="true" /><strong>{{ favoriteTestPhase(job) }}</strong>
           <span v-if="job.run.progress.total">当前阶段 {{ job.run.progress.completed }} / {{ job.run.progress.total }}</span>
-          <span>完整通过 {{ testPassedCount }} / {{ testTargetCount }}</span><span>{{ (job.run.progress.downloadedBytes / 1024 / 1024).toFixed(1) }} MiB</span>
+          <span>{{ testPassedLabel }} {{ testPassedCount }} / {{ testTargetCount }}</span><span>{{ (job.run.progress.downloadedBytes / 1024 / 1024).toFixed(1) }} MiB</span>
           <button class="button stop-button favorite-active-stop" :disabled="stopping" @click="emit('stop-test')"><Square :size="11" aria-hidden="true" />{{ stopping ? '正在停止…' : '停止复测' }}</button>
           <div v-if="job.run.progress.total" class="progress-track favorite-test-track" role="progressbar" aria-label="收藏复测当前阶段进度" :aria-valuenow="testPercent" aria-valuemin="0" aria-valuemax="100"><span :style="{ width: `${testPercent}%` }" /></div>
         </div>
@@ -267,7 +288,8 @@ onBeforeUnmount(() => {
           </nav>
           <div class="favorite-folder-tools">
             <label v-if="job && !testRunning" class="check-field favorite-change-filter"><input v-model="showChangesOnly" type="checkbox" aria-label="仅看复测变化" /><span>仅看变化<span class="favorite-filter-count">{{ changedCount }}</span></span></label>
-            <button class="button favorite-retest-folder" :disabled="testDisabled || !selectedFolder || !entries.length" :title="!selectedFolder ? '先选择一个收藏夹，再测试其中全部 IP' : measurementBusy ? '等待当前测试结束后可复测' : `复测本夹全部 ${entries.length} 个 IP，搜索和变化筛选不影响测试范围`" :aria-label="selectedFolder ? `一键复测本夹 ${selectedFolder.name}（${entries.length} 个 IP）` : '复测本夹（先选择收藏夹）'" @click="selectedFolder && startTest({ folderId: selectedFolder.id })"><RotateCcw :size="12" aria-hidden="true" />复测本夹</button>
+            <button class="button favorite-retest-folder" :disabled="folderTestDisabled" :title="!selectedFolder ? '先选择一个收藏夹，再测试其中全部 IP' : measurementBusy ? '等待当前测试结束后可复测' : `复测本夹全部 ${entries.length} 个 IP，搜索和变化筛选不影响测试范围`" :aria-label="selectedFolder ? `一键复测本夹 ${selectedFolder.name}（${entries.length} 个 IP）` : '复测本夹（先选择收藏夹）'" @click="selectedFolder && startTest({ folderId: selectedFolder.id })"><RotateCcw :size="12" aria-hidden="true" />复测本夹</button>
+            <button class="button favorite-download-folder" :disabled="folderTestDisabled" :title="selectedFolder ? `仅测本夹全部 ${entries.length} 个 IP 的下载速度` : '请先选择一个收藏夹'" :aria-label="selectedFolder ? `仅测 ${selectedFolder.name} 的下载速度（${entries.length} 个 IP）` : '仅测下载（先选择收藏夹）'" @click="selectedFolder && startTest({ folderId: selectedFolder.id, downloadOnly: true })"><Download :size="12" aria-hidden="true" />仅测下载</button>
             <button ref="moreTrigger" class="button favorite-more-trigger" :class="{ 'is-active': moreOpen }" :disabled="closing" :aria-expanded="moreOpen" aria-controls="favorite-more-panel" title="查看复测记录、参数和收藏夹管理" @click="moreOpen = !moreOpen"><Settings2 :size="13" aria-hidden="true" />更多<ChevronDown :size="12" aria-hidden="true" /></button>
           </div>
           <section v-if="moreOpen" id="favorite-more-panel" ref="morePanel" class="favorite-more-panel" aria-labelledby="favorite-more-title" tabindex="0">
@@ -278,9 +300,9 @@ onBeforeUnmount(() => {
             </div>
             <p v-else>选择一个收藏夹后，可整夹复测、重命名或删除。</p>
             <div v-if="job" class="favorite-more-section">
-              <h4><Check v-if="job.run.status === 'completed'" :size="12" aria-hidden="true" />{{ testRunning ? '当前复测' : '最近一次复测' }} · {{ favoriteRunStatus(job.run.status) }}</h4>
+              <h4><Check v-if="job.run.status === 'completed'" :size="12" aria-hidden="true" />{{ testRunning ? '当前复测' : '最近一次复测' }}<template v-if="job.run.downloadOnly"> · 仅测下载</template> · {{ favoriteRunStatus(job.run.status) }}</h4>
               <p>{{ testTargetFolders || '收藏 IP' }} · {{ testTargetCount }} 个 IP · {{ favoriteDate(job.run.startedAt) }}</p>
-              <p>完整通过 {{ testPassedCount }} / {{ testTargetCount }} · 下载正文 {{ (job.run.progress.downloadedBytes / 1024 / 1024).toFixed(1) }} MiB · {{ downloadBudgetLabel(job.run.config) }}</p>
+              <p>{{ testPassedLabel }} {{ testPassedCount }} / {{ testTargetCount }} · 下载正文 {{ (job.run.progress.downloadedBytes / 1024 / 1024).toFixed(1) }} MiB · {{ downloadBudgetLabel(job.run.config) }}</p>
               <p v-if="job.run.error" class="favorite-form-error">{{ job.run.error }}</p><p v-if="job.run.progress.message">{{ job.run.progress.message }}</p>
               <p>{{ testRunning ? '复测期间显示上次快照，结束后更新取得的结果。' : job.run.status === 'cancelled' ? '已保留停止前取得的结果；尚未开始的 IP 保留原快照。' : '列表显示最近保存的快照；点击行内“变化”可查看复测差值。' }}</p>
             </div>
@@ -302,38 +324,44 @@ onBeforeUnmount(() => {
           <tbody>
             <template v-for="(entry, index) in visibleEntries" :key="entry.id">
               <tr class="favorite-data-row" :class="{ 'is-alt': index % 2 === 1, 'is-expanded': expandedEntryId === entry.id, 'is-testing': isEntryTesting(entry) }">
-                <td><button :id="toggleId(entry.id)" class="favorite-row-toggle" :aria-expanded="expandedEntryId === entry.id" :aria-controls="detailId(entry.id)" :aria-label="`${expandedEntryId === entry.id ? '收起' : '展开'} ${entry.result.ip} 在${folderName(entry.folderId)}中的测试详情`" :title="entryState(entry)" @click="toggleEntry(entry)"><ChevronRight :size="12" class="favorite-expand-icon" :class="{ expanded: expandedEntryId === entry.id }" aria-hidden="true" /><span class="favorite-state-dot" :class="{ good: entry.result.measurementPassed && !isEntryTesting(entry), testing: isEntryTesting(entry) }" aria-hidden="true" /><span class="mono">{{ entry.result.ip }}</span></button></td>
+                <td><button :id="toggleId(entry.id)" class="favorite-row-toggle" :aria-expanded="expandedEntryId === entry.id" :aria-controls="detailId(entry.id)" :aria-label="`${expandedEntryId === entry.id ? '收起' : '展开'} ${entry.result.ip} 在${folderName(entry.folderId)}中的测试详情`" :title="entryState(entry)" @click="toggleEntry(entry)"><ChevronRight :size="12" class="favorite-expand-icon" :class="{ expanded: expandedEntryId === entry.id }" aria-hidden="true" /><span class="favorite-state-dot" :class="{ good: entryPassed(entry), testing: isEntryTesting(entry) }" aria-hidden="true" /><span class="mono">{{ entry.result.ip }}</span></button></td>
                 <td><span class="favorite-table-folder" :title="folderName(entry.folderId)">{{ folderName(entry.folderId) }}</span></td>
-                <td><span class="favorite-table-location" :title="`${entry.result.city || '城市未识别'} · ${roleLabel(entry)}`"><span>{{ favoriteHasTestData(entry) ? regionName(entry.result.regionCode) || '地区未识别' : '待测速' }}</span><span v-if="entry.result.colo" class="favorite-pop">{{ entry.result.colo }}</span></span></td>
+                <td><span class="favorite-table-location" :title="`${latestDownload(entry).city || '城市未识别'} · ${entry.downloadTest ? '仅测下载' : roleLabel(entry)}`"><span>{{ favoriteHasTestData(entry) || entry.downloadTest ? regionName(latestDownload(entry).regionCode) || '地区未识别' : '待测速' }}</span><span v-if="latestDownload(entry).colo" class="favorite-pop">{{ latestDownload(entry).colo }}</span></span></td>
                 <td class="favorite-tcp-cell"><TcpLatencyCell :result="entry.result" :display-metric="tcpDisplayMetric" :scale-max-ms="tcpScaleMaxMs" :run-metric="entry.config.stabilityLatencyMetric ?? 'max'" label-run-metric /></td>
-                <td class="favorite-speed-cell"><span class="favorite-table-speed" :class="{ measured: entry.result.downloadSamplesMbps.length > 0 }">{{ entry.result.downloadSamplesMbps.length ? favoriteNumber(entry.result.downloadMbps) : '—' }}</span></td>
-                <td class="favorite-freshness" :title="favoriteHasTestData(entry) ? favoriteDate(entry.runFinishedAt || entry.runStartedAt) : '保存后尚未测试'">
+                <td class="favorite-speed-cell"><span class="favorite-table-speed" :class="{ measured: latestDownload(entry).downloadSamplesMbps.length > 0 }">{{ latestDownload(entry).downloadSamplesMbps.length ? favoriteNumber(latestDownload(entry).downloadMbps) : '—' }}</span></td>
+                <td class="favorite-freshness" :title="entry.downloadTest ? favoriteDate(entry.downloadTest.testedAt) : favoriteHasTestData(entry) ? favoriteDate(entry.runFinishedAt || entry.runStartedAt) : '保存后尚未测试'">
                   <div class="favorite-freshness-main"><span class="favorite-last-tested">{{ favoriteTestDate(entry) }}</span><button v-if="changes.get(entry.id)?.changed" class="text-button favorite-change-link" :class="{ 'has-context-difference': changes.get(entry.id)?.differences.length }" :title="`${changes.get(entry.id)?.label}；${changes.get(entry.id)?.differences.join(' · ') || '点击查看完整变化'}`" :aria-label="`查看 ${entry.result.ip} 在${folderName(entry.folderId)}中的复测变化`" :aria-expanded="expandedEntryId === entry.id" :aria-controls="expandedEntryId === entry.id ? detailId(entry.id) : undefined" @click="showEntryChange(entry)">变化</button></div>
-                  <small v-if="favoriteHasTestData(entry) || isEntryTesting(entry)" :title="entryState(entry)">{{ entryState(entry) }}</small>
+                  <small v-if="entry.downloadTest || favoriteHasTestData(entry) || isEntryTesting(entry)" :title="entryState(entry)">{{ entryState(entry) }}</small>
                 </td>
                 <td><div class="favorite-row-actions">
                   <button class="icon-button" :disabled="!desktop" :aria-label="`复制收藏的 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="复制 IP" @click="copyIp(entry.result.ip)"><Clipboard :size="13" aria-hidden="true" /></button>
                   <button class="icon-button" :disabled="!desktop" :aria-label="`对比 IP ${entry.result.ip} 的测速历史（${folderName(entry.folderId)}）`" title="对比该 IP 历史" @click="emit('compare-history', entry.result.ip)"><History :size="13" aria-hidden="true" /></button>
                   <button class="icon-button" :disabled="testDisabled" :aria-label="`重新测速 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="重新测速" @click="startTest({ favoriteId: entry.id })"><RotateCcw :size="13" aria-hidden="true" /></button>
+                  <button class="icon-button" :disabled="testDisabled" :aria-label="`仅测 ${entry.result.ip} 的下载速度（${folderName(entry.folderId)}）`" title="仅测下载" @click="startTest({ favoriteId: entry.id, downloadOnly: true })"><Download :size="13" aria-hidden="true" /></button>
                   <button class="icon-button" :disabled="disabled" :aria-label="`编辑收藏 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="编辑分类与备注" @click="showDialog('editEntry', null, entry)"><Pencil :size="13" aria-hidden="true" /></button>
                   <button class="icon-button favorite-danger" :disabled="testDisabled" :aria-label="`移除收藏 ${entry.result.ip}（${folderName(entry.folderId)}）`" title="移除本条收藏" @click="showDialog('deleteEntry', null, entry)"><Trash2 :size="13" aria-hidden="true" /></button>
                 </div></td>
               </tr>
-              <tr v-if="expandedEntryId === entry.id" class="favorite-detail-row"><td colspan="7"><section :id="detailId(entry.id)" class="favorite-inline-detail" :aria-label="`${entry.result.ip} 在${folderName(entry.folderId)}中的测试详情`"><div class="favorite-detail-heading"><div><strong class="mono">{{ entry.result.ip }}</strong><span class="favorite-detail-status" :class="{ passed: entry.result.measurementPassed && !isEntryTesting(entry) }">{{ entryState(entry) }}</span><span>{{ folderName(entry.folderId) }}</span></div><button class="text-button" :aria-label="`收起 ${entry.result.ip} 的详情`" @click="collapseEntry">收起<ChevronDown :size="12" class="favorite-collapse-icon" /></button></div>
+              <tr v-if="expandedEntryId === entry.id" class="favorite-detail-row"><td colspan="7"><section :id="detailId(entry.id)" class="favorite-inline-detail" :aria-label="`${entry.result.ip} 在${folderName(entry.folderId)}中的测试详情`"><div class="favorite-detail-heading"><div><strong class="mono">{{ entry.result.ip }}</strong><span class="favorite-detail-status" :class="{ passed: entryPassed(entry) }">{{ entryState(entry) }}</span><span>{{ folderName(entry.folderId) }}</span></div><button class="text-button" :aria-label="`收起 ${entry.result.ip} 的详情`" @click="collapseEntry">收起<ChevronDown :size="12" class="favorite-collapse-icon" /></button></div>
             <div v-if="changes.get(entry.id)" class="favorite-comparison" tabindex="-1" :aria-label="`${entry.result.ip} 的复测变化`"><strong>{{ changes.get(entry.id)?.label }}</strong><p>{{ changes.get(entry.id)?.detail }}</p><p v-if="changes.get(entry.id)?.differences.length">{{ changes.get(entry.id)?.differences.join(' · ') }}；数值差异不能直接归因于网络质量。</p></div>
             <div class="favorite-tcp-diagnostics"><TcpDiagnostics :result="entry.result" :config="entry.config" /></div>
             <dl class="favorite-detail-grid">
-              <div><dt>收藏时间</dt><dd>{{ favoriteDate(entry.savedAt) }}</dd></div><div><dt>最近测试</dt><dd>{{ favoriteHasTestData(entry) ? `${favoriteDate(entry.runFinishedAt || entry.runStartedAt)} · ${favoriteRunStatus(entry.runStatus)}` : '尚无测试记录' }}</dd></div>
-              <div><dt>地区 / 城市 / POP</dt><dd>{{ regionName(entry.result.regionCode) || '地区未识别' }} · {{ entry.result.city || '城市未识别' }} · {{ entry.result.colo || 'POP 未识别' }}</dd></div><div><dt>收藏时角色</dt><dd>{{ roleLabel(entry) }}</dd></div>
+              <div><dt>收藏时间</dt><dd>{{ favoriteDate(entry.savedAt) }}</dd></div><div><dt>最近完整测速</dt><dd>{{ favoriteHasTestData(entry) ? `${favoriteDate(entry.runFinishedAt || entry.runStartedAt)} · ${favoriteRunStatus(entry.runStatus)}` : '尚无测试记录' }}</dd></div>
+              <div><dt>{{ entry.downloadTest ? '完整测速地区 / 城市 / POP' : '地区 / 城市 / POP' }}</dt><dd>{{ regionName(entry.result.regionCode) || '地区未识别' }} · {{ entry.result.city || '城市未识别' }} · {{ entry.result.colo || 'POP 未识别' }}</dd></div><div><dt>收藏时角色</dt><dd>{{ roleLabel(entry) }}</dd></div>
               <div v-if="entry.note" class="favorite-full"><dt>备注</dt><dd class="favorite-note-full">{{ entry.note }}</dd></div>
-              <div class="favorite-full"><dt>测速结论</dt><dd>{{ candidateExclusionReason(entry.result) || (entry.result.measurementPassed ? '测速通过' : '尚未完成完整测速') }}{{ entry.result.eligible ? ' · 符合本次优选条件' : '' }}</dd></div>
+              <div class="favorite-full"><dt>完整测速结论</dt><dd>{{ candidateExclusionReason(entry.result) || (entry.result.measurementPassed ? '测速通过' : '尚未完成完整测速') }}{{ entry.result.eligible ? ' · 符合本次优选条件' : '' }}</dd></div>
               <div><dt>HTTPS 冷连接首响</dt><dd>{{ entry.result.successCount ? `${favoriteNumber(entry.result.httpsMs)} ms` : '尚无成功数据' }}</dd></div>
               <div><dt>测试开始</dt><dd>{{ favoriteHasTestData(entry) ? favoriteDate(entry.runStartedAt) : '尚未测速' }}</dd></div><div><dt>测试结束</dt><dd>{{ !favoriteHasTestData(entry) ? '尚未测速' : entry.runFinishedAt ? favoriteDate(entry.runFinishedAt) : '收藏时尚未结束' }}</dd></div>
               <div class="favorite-full"><dt>测速地址</dt><dd class="mono">{{ entry.config.targetUrl }}</dd></div>
               <div><dt>测试偏好</dt><dd>{{ entry.config.preference === 'daily' ? `日常优选 · 至少 ${entry.config.minDownloadMbps} Mbps` : '下载优先' }}</dd></div><div><dt>本次观测 POP</dt><dd>{{ entry.result.observedColos.join(' / ') || entry.result.colo || '未识别' }}</dd></div>
               <div class="favorite-full"><dt>精测策略</dt><dd>{{ entry.targeted ? `指定 IP 复测 · 全部测试，不按地区或前 10 名筛选；累计 2 次连接失败立即淘汰，${entry.config.downloadBudgetEnabled !== false ? '下载预算用尽、全部 IP 测完或主动停止时结束。' : '不限制流量，全部 IP 测完或主动停止时结束。'}` : precisionPolicyLabel(entry.config) }}</dd></div>
               <div><dt>HTTPS 服务校验</dt><dd>成功 {{ entry.result.successCount }} / 已测 {{ entry.result.attempts }} · 计划 {{ entry.config.verificationAttempts }} 次</dd></div><div><dt>HTTPS 首响波动</dt><dd>{{ entry.result.successCount ? `${favoriteNumber(entry.result.jitterMs)} ms` : '尚无成功数据' }}</dd></div>
-              <div><dt>下载样本</dt><dd>{{ entry.result.downloadSamplesMbps.length ? entry.result.downloadSamplesMbps.map(favoriteNumber).join(' / ') + ' Mbps' : '尚无下载样本' }}</dd></div><div><dt>下载计划</dt><dd>{{ entry.config.downloadRounds }} 轮 × {{ entry.config.downloadSeconds }} 秒 · {{ downloadBudgetLabel(entry.config) }}</dd></div>
+              <template v-if="entry.downloadTest">
+                <div class="favorite-full"><dt>最近一次仅测下载</dt><dd>{{ favoriteDate(entry.downloadTest.testedAt) }} · {{ downloadMeasurementStatus(entry.downloadTest.result, entry.downloadTest.config) }}<template v-if="candidateExclusionReason(entry.downloadTest.result)"> · {{ candidateExclusionReason(entry.downloadTest.result) }}</template></dd></div>
+                <div class="favorite-full"><dt>下载测速地址</dt><dd class="mono">{{ entry.downloadTest.config.targetUrl }}</dd></div>
+                <div><dt>下载观测 POP</dt><dd>{{ entry.downloadTest.result.observedColos.join(' / ') || '未识别' }}</dd></div>
+              </template>
+              <div><dt>下载样本</dt><dd>{{ latestDownload(entry).downloadSamplesMbps.length ? latestDownload(entry).downloadSamplesMbps.map(favoriteNumber).join(' / ') + ' Mbps' : '尚无下载样本' }}</dd></div><div><dt>下载计划</dt><dd>{{ (entry.downloadTest?.config ?? entry.config).downloadRounds }} 轮 × {{ (entry.downloadTest?.config ?? entry.config).downloadSeconds }} 秒 · {{ downloadBudgetLabel(entry.downloadTest?.config ?? entry.config) }}</dd></div>
               <div><dt>HTTPS 请求超时</dt><dd>{{ entry.config.requestTimeoutMs }} ms</dd></div>
               <template v-if="entry.networkPath"><div><dt>测试网络接口</dt><dd>{{ entry.networkPath.interfaceName }}{{ entry.networkPath.tunnelInterface ? ' · 隧道接口' : '' }}</dd></div><div><dt>网络路径采样</dt><dd>{{ entry.networkPath.sampleIp }}{{ entry.networkPath.sampleIp === entry.result.ip ? '（本 IP）' : '（其他 IP）' }} · {{ favoriteDate(entry.networkPath.capturedAt) }}</dd></div></template>
               <div class="favorite-full"><dt>测试记录 ID</dt><dd class="mono">{{ entry.runId }}</dd></div>
@@ -425,9 +453,9 @@ onBeforeUnmount(() => {
 .favorite-danger:hover:not(:disabled) { color: var(--error); background: var(--error-bg); }
 .favorites-table { flex: 1 1 0; min-height: 0; min-width: 0; overflow: auto; overscroll-behavior: contain; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: var(--panel); scrollbar-gutter: stable; }
 .favorites-table table { width: 100%; min-width: 930px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 13px; }
-.favorite-col-ip { width: 18%; }
-.favorite-col-folder { width: 10%; }
-.favorite-col-region { width: 11%; }
+.favorite-col-ip { width: 17%; }
+.favorite-col-folder { width: 9%; }
+.favorite-col-region { width: 10%; }
 .favorite-col-tcp { width: 18%; }
 .favorite-col-speed { width: 8%; }
 .favorite-data-row>td:last-child { position: sticky; right: 0; background: var(--panel); border-left: 1px solid var(--line); }
@@ -440,7 +468,7 @@ onBeforeUnmount(() => {
 .favorite-change-link { flex: none; min-height: 16px; height: 16px; padding: 0; font-size: 10px; line-height: 16px; }
 .favorite-change-link.has-context-difference { color: var(--warn); }
 .favorite-save-only-hint { padding: 8px 16px; }
-.favorite-col-actions { width: 15%; }
+.favorite-col-actions { width: 18%; }
 .favorites-table th { position: sticky; top: 0; z-index: 2; height: 32px; padding: 5px 20px; border-bottom: 1px solid var(--line); background: linear-gradient(var(--bg),color-mix(in srgb,var(--bg) 65%,var(--panel))); color: var(--muted); font-size: 11px; font-weight: 500; line-height: 21px; white-space: nowrap; }
 .favorites-table th.favorite-tcp-cell, .favorites-table th.favorite-speed-cell { text-align: right; }
 .favorites-table th:last-child { right: 0; z-index: 4; padding-inline: 8px; text-align: center; }
@@ -464,7 +492,7 @@ onBeforeUnmount(() => {
 .favorite-table-speed.measured { color: var(--brand); font-weight: 600; }
 .favorite-data-row>td:last-child { min-width: 0; max-width: none; padding-inline: 8px; }
 .favorite-row-actions { display: flex; justify-content: center; align-items: center; gap: 1px; }
-.favorite-row-actions>.icon-button { width: 26px; height: 26px; min-height: 26px; padding: 6px; color: var(--muted); }
+.favorite-row-actions>.icon-button { width: 24px; height: 26px; min-height: 26px; padding: 5px; color: var(--muted); }
 .favorite-row-actions>.icon-button:hover:not(:disabled) { color: var(--brand); background: var(--soft); }
 .favorite-row-actions>.favorite-danger { color: var(--error); }
 .favorite-row-actions>.favorite-danger:hover:not(:disabled) { color: var(--error); background: var(--error-bg); }
@@ -533,7 +561,7 @@ onBeforeUnmount(() => {
   .favorite-data-row>td:nth-child(2), .favorite-data-row>td:nth-child(3), .favorites-table th:nth-child(2), .favorites-table th:nth-child(3) { padding-inline: 8px; }
   .favorite-col-tcp { width: 13%; }
   .favorite-col-freshness { width: 21%; }
-  .favorite-col-actions { width: 19%; }
+  .favorite-col-actions { width: 22%; }
   .favorites-table :deep(.tcp-latency-chart), .favorites-table :deep(.tcp-latency-heading>span:first-child) { display: none; }
   .favorite-data-row>td.favorite-freshness, .favorites-table th:nth-child(6) { padding-inline: 8px; }
 }

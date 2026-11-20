@@ -124,6 +124,45 @@ test('favorite changes count follows the selected folder while retesting keeps t
   assert.equal(calls[0][1].favoriteId, undefined)
 })
 
+test('download-only favorites use the latest speed and POP without changing the saved TCP result', async context => {
+  const config = defaultConfig()
+  const entry = {
+    id: 'saved', folderId: 'home', runId: 'previous', runStatus: 'completed', note: '',
+    runStartedAt: '2026-11-15T00:00:00Z', savedAt: '2026-11-15T00:00:00Z',
+    config, result: result('104.16.0.1', 20, 40),
+  }
+  const download = { ...entry.result, colo: 'SJC', city: 'San Jose', regionCode: 'US', observedColos: ['SJC'],
+    tcpMs: 0, tcpStability: undefined, successCount: 0, attempts: 0, eligible: false, measurementPassed: false,
+    downloadMbps: 44, downloadSamplesMbps: [42, 46] }
+  const latest = { ...run([download]), downloadOnly: true }
+  entry.downloadTest = { runId: latest.id, config, result: download, testedAt: latest.startedAt }
+  const job = {
+    run: latest, favoriteIds: [entry.id],
+    baselines: [{ favoriteId: entry.id, testedAt: entry.savedAt, config, colo: 'HKG', measurementPassed: true, tcpP95Ms: 40, downloadMbps: 30 }],
+  }
+  const library = { folders: [{ id: 'home', name: '家用' }], entries: [entry] }
+  const calls = []
+  setInvokeHandler(async (command, args) => {
+    calls.push([command, args])
+    return { favorites: library, job: { ...job, run: { ...latest, id: 'next', status: 'running' } } }
+  })
+  const state = mount(context, FavoritesPanel, { desktop: true, config, library, testJob: job })
+  assert.equal(state.entryState(entry), '下载测速完成')
+  assert.equal(state.testPassedCount.value, 1)
+  assert.equal(state.latestDownload(entry).downloadMbps, 44)
+  assert.equal(entry.result.tcpStability.p95Ms, 40)
+  assert.equal(favoriteTestChange(entry, job).label, '下载 +14.0 Mbps')
+  assert.ok(favoriteTestChange(entry, job).differences.includes('接入机房不同'))
+  state.search.value = 'SJC'
+  assert.deepEqual(state.visibleEntries.value.map(item => item.id), [entry.id])
+  state.search.value = 'HKG'
+  assert.equal(state.visibleEntries.value.length, 0)
+  await state.startTest({ favoriteId: entry.id, downloadOnly: true })
+  assert.equal(calls[0][0], 'start_favorite_test')
+  assert.equal(calls[0][1].favoriteId, entry.id)
+  assert.equal(calls[0][1].downloadOnly, true)
+})
+
 test('before/after comparisons distinguish changed conditions, partial data and untouched entries', () => {
   const config = defaultConfig()
   const networkPath = { interfaceName: 'en0', interfaceKind: 'wifi', tunnelInterface: false, sampleIp: '104.16.0.1' }

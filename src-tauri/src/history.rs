@@ -38,6 +38,8 @@ pub struct HistorySummary {
     quick_validation: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retest_ip: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    download_only: bool,
     id: String,
     status: String,
     started_at: String,
@@ -55,6 +57,7 @@ impl HistorySummary {
             kind,
             quick_validation: run.quick_validation,
             retest_ip: run.retest_ip.clone(),
+            download_only: run.download_only,
             id: run.id.clone(),
             status: run.status.clone(),
             started_at: run.started_at.clone(),
@@ -112,6 +115,7 @@ pub fn compare_ip(runs: Vec<(HistoryKind, &ScanRun)>, ip: &str) -> Vec<HistoryEn
             let comparison = ScanRun {
                 quick_validation: run.quick_validation,
                 retest_ip: run.retest_ip.clone(),
+                download_only: run.download_only,
                 id: run.id.clone(),
                 status: run.status.clone(),
                 started_at: run.started_at.clone(),

@@ -1,5 +1,5 @@
 import type { IpResult, NetworkPathSnapshot, ScanConfig, ScanRun } from './types'
-import { completedTcpMetricValue, stabilityMetricLabel } from './ui-state'
+import { completedTcpMetricValue, hasCompleteDownload, stabilityMetricLabel } from './ui-state'
 
 export interface FavoriteFolder {
   id: string
@@ -21,6 +21,12 @@ export interface FavoriteEntry {
   networkPath?: NetworkPathSnapshot | null
   /** This snapshot was produced by explicitly testing saved IPs. */
   targeted?: boolean
+  downloadTest?: {
+    runId: string
+    testedAt: string
+    config: ScanConfig
+    result: IpResult
+  }
 }
 
 export interface FavoriteLibrary {
@@ -58,11 +64,13 @@ export interface FavoriteTestBaseline {
 }
 
 const comparisonFields: (keyof ScanConfig)[] = ['targetUrl', 'connectTimeoutMs', 'requestTimeoutMs', 'tcpConcurrency', 'stabilityAttempts', 'stabilityIntervalMs', 'stabilityLatencyMetric', 'maxTcpMs', 'maxStabilityFailurePercent', 'tcpLatencyScreening', 'stabilityFirst', 'verificationAttempts', 'downloadRounds', 'downloadSeconds', 'downloadBudgetEnabled', 'downloadBudgetMiB']
+const downloadComparisonFields: (keyof ScanConfig)[] = ['targetUrl', 'connectTimeoutMs', 'requestTimeoutMs', 'downloadRounds', 'downloadSeconds', 'downloadBudgetEnabled', 'downloadBudgetMiB']
 export const indirectRouteWarning = '部分接口来自其他 IP 的采样'
 
-export function comparisonContextDifferences(before: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, after: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, ip?: string): string[] {
+export function comparisonContextDifferences(before: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, after: { config: ScanConfig; networkPath?: NetworkPathSnapshot | null; colo: string }, ip?: string, downloadOnly = false): string[] {
   const differences: string[] = []
-  if (comparisonFields.some(field => !(field === 'downloadBudgetMiB' && before.config.downloadBudgetEnabled === false && after.config.downloadBudgetEnabled === false) && before.config[field] !== after.config[field])) differences.push('测速参数不同')
+  const fields = downloadOnly ? downloadComparisonFields : comparisonFields
+  if (fields.some(field => !(field === 'downloadBudgetMiB' && before.config.downloadBudgetEnabled === false && after.config.downloadBudgetEnabled === false) && before.config[field] !== after.config[field])) differences.push('测速参数不同')
   const previousPath = before.networkPath
   const currentPath = after.networkPath
   if (!previousPath || !currentPath) differences.push('网络路径未完整记录')
@@ -90,18 +98,24 @@ export function favoriteTestChanges(entries: FavoriteEntry[], job?: FavoriteTest
 }
 
 function compareFavoriteEntry(entry: FavoriteEntry, job: FavoriteTestJob, baseline?: FavoriteTestBaseline) {
+  const download = job.run.downloadOnly ? entry.downloadTest : undefined
+  const runId = job.run.downloadOnly ? download?.runId : entry.runId
   // An explicit save after this job may replace the same favorite with another
   // snapshot. Do not describe that newer snapshot as an untouched retest target.
-  if (entry.runId !== job.run.id && Date.parse(entry.savedAt) > Date.parse(job.run.startedAt)) return null
-  if (entry.runId !== job.run.id) return { label: '本轮未更新', detail: '保留上次测试记录', changed: false, differences: [] as string[] }
+  if (runId !== job.run.id && Date.parse(entry.savedAt) > Date.parse(job.run.startedAt)) return null
+  if (runId !== job.run.id) return { label: '本轮未更新', detail: '保留上次测试记录', changed: false, differences: [] as string[] }
   if (!baseline) return { label: '本轮已更新', detail: '可在测速历史查看已保留的记录', changed: true, differences: [] as string[] }
-  const differences = comparisonContextDifferences(baseline, { config: entry.config, networkPath: entry.networkPath, colo: entry.result.colo }, entry.result.ip)
+  const { config, result } = download ?? entry
+  const networkPath = download ? result.networkPath : entry.networkPath
+  const differences = comparisonContextDifferences(baseline, { config, networkPath, colo: result.colo }, result.ip, !!download)
   const parts: string[] = []
-  if (baseline.measurementPassed !== entry.result.measurementPassed) parts.push(entry.result.measurementPassed ? '本次完整通过' : '本次未通过完整测速')
-  const p95 = completedTcpMetricValue(entry.result, 'p95')
-  const speed = entry.result.downloadSamplesMbps.length >= entry.config.downloadRounds && entry.result.downloadSamplesMbps.every(value => Number.isFinite(value) && value > 0) ? entry.result.downloadMbps : null
-  const comparable = (baseline.tcpP95Ms != null && p95 != null) || (baseline.downloadMbps != null && speed != null)
-  for (const [label, before, after, unit] of [['P95', baseline.tcpP95Ms, p95, 'ms'], ['下载', baseline.downloadMbps, speed, 'Mbps']] as const) {
+  if (!download && baseline.measurementPassed !== result.measurementPassed) parts.push(result.measurementPassed ? '本次完整通过' : '本次未通过完整测速')
+  const p95 = download ? null : completedTcpMetricValue(result, 'p95')
+  const speed = hasCompleteDownload(result, config) ? result.downloadMbps : null
+  const metrics = [['P95', baseline.tcpP95Ms, p95, 'ms'], ['下载', baseline.downloadMbps, speed, 'Mbps']] as const
+  const compared = download ? metrics.slice(1) : metrics
+  const comparable = compared.some(([, before, after]) => before != null && after != null)
+  for (const [label, before, after, unit] of compared) {
     if (before != null && after != null && Math.abs(after - before) >= 0.1) parts.push(`${label} ${after > before ? '+' : '−'}${Math.abs(after - before).toFixed(1)} ${unit}`)
     else if (before != null && after == null) parts.push(`${label}本次未测满`)
     else if (before == null && after != null) parts.push(`${label}本次已测满`)
@@ -110,8 +124,8 @@ function compareFavoriteEntry(entry: FavoriteEntry, job: FavoriteTestJob, baseli
 }
 
 export function favoriteTestDate(entry: FavoriteEntry): string {
-  if (!favoriteHasTestData(entry)) return '尚未测速'
-  const value = entry.runFinishedAt || entry.runStartedAt
+  if (!entry.downloadTest && !favoriteHasTestData(entry)) return '尚未测速'
+  const value = entry.downloadTest?.testedAt ?? (entry.runFinishedAt || entry.runStartedAt)
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? '时间未记录' : date.toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
 }
@@ -129,7 +143,12 @@ export function favoriteHasTestData(entry: FavoriteEntry): boolean {
 
 export function favoriteTestPhase(job: FavoriteTestJob): string {
   if (job.run.status !== 'running') return favoriteRunStatus(job.run.status)
+  if (job.run.downloadOnly) return '仅测下载'
   return ({ connecting: 'TCP 连通性检查', discovering: '识别地区与 POP', stabilizing: 'TCP 稳定性测试', verifying: 'HTTPS 服务校验', downloading: '下载测速', completed: '测试已完成', cancelled: '测试已停止', failed: '测试失败' })[job.run.progress.stage]
+}
+
+export function favoriteTestPassedCount(run: ScanRun): number {
+  return run.results.filter(result => run.downloadOnly ? hasCompleteDownload(result, run.config) : result.measurementPassed).length
 }
 
 /** The native store supplies stable folder IDs; these are browser-preview placeholders. */
