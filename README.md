@@ -1,18 +1,48 @@
 # IP Picker
 
-面向 macOS 和 Windows 的 Cloudflare IPv4 优选工具。选择国家／地区，一键完成真实连接筛选、HTTPS 验证、下载测速和分区推荐，查看全部测试结果并筛选、收藏或复制 IP。界面采用 Vue 3 + TypeScript，桌面外壳采用 Tauri 2，测速核心使用 Rust 实现。
+面向 macOS 和 Windows 的 Cloudflare IPv4 优选工具。在当前网络下按地区查找候选 IP，测量 TCP 稳定性和下载速度，并收藏、复测或对比历史结果。
 
-从源码启动桌面应用请参阅[开发环境](#开发环境)。
+[使用流程](#使用流程) · [常见问题](#常见问题) · [本地数据与备份](#本地数据与备份) · [开发与维护](docs/development.md)
+
+## 安装
+
+从项目的 GitHub Releases 下载对应平台的安装包。本文以 `main` 分支为准，已发布版本的功能见对应的发布说明。 [GitHub Releases](https://github.com/zhengwn/ip-picker/releases)
+
+- **macOS（Apple Silicon）** 打开 `*-macOS-AppleSilicon.dmg`，将 IP Picker 拖入「应用程序」。
+- **Windows（x64）** 运行 `*-Windows-x64-setup.exe`，按安装向导操作。
+
+升级前先退出旧版本。 [本地数据与备份](#本地数据与备份) · [从源码启动](docs/development.md#开发环境)
+
+<details>
+<summary>校验安装包</summary>
+
+将安装包和同名的 `.sha256` 文件放在同一目录，在该目录打开终端。以下命令以 v0.1.2 为例，其他版本请替换文件名。
+
+macOS 终端中运行以下命令。校验通过时会显示 `OK`。
+
+```sh
+shasum -a 256 -c IP-Picker-0.1.2-macOS-AppleSilicon.dmg.sha256
+```
+
+Windows PowerShell 中，比较第一条命令的 `Hash` 与第二条命令输出中的第一段字符。两者应一致，字母大小写可忽略。
+
+```powershell
+Get-FileHash .\IP-Picker-0.1.2-Windows-x64-setup.exe -Algorithm SHA256
+Get-Content .\IP-Picker-0.1.2-Windows-x64-setup.exe.sha256
+```
+
+</details>
 
 ## 使用流程
 
-1. 测速地区选项只保留香港、日本、新加坡、美国，按需选择。参数区不再设置每区保留数量或推荐偏好，直接在结果表筛选 IP。
-2. 使用内置 Cloudflare 网段，或在高级设置中导入自己的 IPv4 / CIDR 列表。
-3. 首次试用时，点「快速验证」。需要更大覆盖时，点「开始完整优选」。按钮下方显示两种模式的预计耗时、下载正文量和预算状态，可在此一键开启预算。预算额度在高级设置中调整。测速或收藏复测期间，切换页面后仍可查看进度和累计下载量，也可以停止测试。
-4. 精测结果表显示 IP、地区、延迟、下载速度和收藏按钮。地区同时显示 POP 代码，例如“美国 · LAX”。测速结束后可查看本轮各区统计和未取得结果的原因，也可在结果表展开单个 IP 的状态与原因。探测和下载样本继续随测量记录保存。
-5. 在“测试结果”中按地区、POP、状态、IP / POP / 地区搜索、下载速率和 TCP 延迟筛选；POP 下拉列出本轮实际显示的代码（如 LAX、SJC），并随地区选择联动。各状态旁的数字会反映当前其他筛选条件。有完成下载的结果时，默认勾选“仅完成下载”，包含低于目标速率的结果。一轮结束后若没有完成下载，直接显示已取得的精测记录。默认按本次 TCP 稳定性延迟从低到高排列，也可按下载速度、初筛 TCP 或 IP 地址排序。下载完成开关和排序会记住你的选择，重新打开应用或开始新测试后继续沿用。点击 IP 旁的复制图标即可复制地址，也可直接收藏需要的 IP；收藏夹中仍可查看测试详情并复制 IP。
+1. 打开桌面应用，选择香港、日本、新加坡或美国。候选地址默认来自内置 Cloudflare 网段，也可在高级设置中导入自己的 IPv4 / CIDR 列表。
+2. 首次试用点击「快速验证」，需要覆盖更多候选时点击「开始完整优选」。启动前可在按钮下方查看预计耗时、下载正文量和预算状态，也可在这里开启预算。
+3. 在「测试结果」中查看地区、POP（接入机房，例如 LAX）、TCP 延迟和下载速度。默认按 TCP 稳定性延迟升序排列。展开结果行可查看该 IP 的状态和原因。
+4. 点击 IP 旁的复制图标或星标，复制或收藏该地址。需要了解为什么某个地区没有结果时，打开「本轮详情」查看各阶段统计。
 
-高级设置的“筛选与下载”中提供“限制下载流量预算”开关与预算金额，默认关闭；启用后的预设预算为 400 MiB。应用会保存你的开关选择，下次打开继续沿用。关闭预算时，每轮下载仍按设定轮数和时长执行。高级设置可调整候选数量、并发、超时、测试目标和复测次数。测速需要在 Tauri 桌面窗口内运行；浏览器预览用于界面开发。
+结果可按地区、POP、状态和速率或延迟阈值筛选，也可按 IP、POP 或地区搜索。POP 下拉随所选地区联动，状态计数随其他筛选条件更新。有完成下载的记录时，默认勾选「仅完成下载」，其中也包含低于速率目标的记录。整轮没有完成下载的记录时，直接显示已取得的精测记录。
+
+高级设置的「筛选与下载」中可以调整流量预算额度。预算默认关闭，启用后的预设额度为 400 MiB，开关选择会保存。每轮下载均受设置的轮数和时长约束。高级设置还可调整候选数量、并发、超时、测试目标和复测次数。
 
 首次进入时，界面突出「快速验证」，并说明两种模式的用途。快速验证仅覆盖少量候选。开启预算后，当前额度会同时应用到快速验证和完整优选。
 
@@ -46,7 +76,7 @@
 
 列表最多 2 MiB（按 UTF-8 字节计）和 20,000 个 IP / 网段条目，候选上限 `maxCandidates` 为 1–10,000。粘贴或导入后即可检查列表，错误会标出对应字段及无效条目的行号。保存和开始测速也会执行同样的校验。明确 IP 按输入顺序去重并优先保留，超过候选上限时只取前面的地址。剩余名额从合并重叠范围后的 CIDR 抽样，跳过已保留的明确 IP。耗时和流量估算也按去重后的地址容量计算。抽样直接在网段范围内取地址。这些示例地址仅用于演示输入格式。
 
-修改测速目标时，URL 和响应须满足以下条件：
+修改完整测速的目标时，URL 和响应须满足以下条件。
 
 - 使用 HTTPS 域名，可带端口，不能使用 IP 字面量或包含用户名、密码、URL 片段；证书须对目标域名有效。
 - 同一目标域名和端口的 `/cdn-cgi/trace` 须返回匹配目标域名的 `h` 和有效的 `colo`。普通下载站即使能打开，也未必满足 POP 识别要求。请求不跟随重定向，非成功 HTTP 状态会被拒绝。
@@ -58,7 +88,9 @@
 
 每条收藏独立保留测试时间、测试目标与配置、地区 / POP、TCP 探测明细与失败次数、HTTPS 验证和下载样本，以及本轮采集到的网络路径。普通分区优选、修改设置或重启应用不会覆盖已有快照。测试中、已停止或失败的观测也可以收藏，详情会保留当时的状态和完成程度。收藏夹与测试设置一起保存在本机；删除收藏夹会同时移除其中的收藏，不影响测试结果。
 
-收藏夹内支持三种直接测速：点击“手动添加 IP”，输入单个 IPv4 后选择“仅收藏”或“收藏并测速”；点击某条收藏的“重新测速”；或选中一个收藏夹后点击“一键复测本夹”，测试其中全部 IP。这些操作使用当前测试参数与本轮预算设置，直接测试指定地址，不经过候选抽样、地区筛选、每区 20 个入围或前 10 名下载限制。仍遵守累计 2 次连接失败淘汰及完整验证规则，开启预算限制且预算不足时明确保留未完成状态；关闭后不受下载数据量限制。
+收藏夹内有三个完整测速入口。点击「手动添加 IP」，输入单个 IPv4 并选择「收藏并测速」，也可以点击某条收藏的「重新测速」，或选中一个收藏夹后点击「一键复测本夹」。这些入口按当前参数直接测试指定地址，执行 TCP 稳定性、HTTPS 校验和下载测速。稳定性探测仍执行累计 2 次连接失败淘汰规则。开启预算后，额度不足的下载会标记为未完成。
+
+只需要查看下载速度时，点击收藏行右侧的下载图标。要测整夹，先选中收藏夹，再点工具栏的「仅测下载」。此功能在 v0.1.2 发布后加入。它使用当前的下载目标、超时、轮数、时长和预算，直接发起 HTTPS 下载，并从能识别 POP 的响应中记录机房。收藏列表显示这次的下载结果和 POP，展开详情可查看原有完整测速及 TCP 数据。
 
 收藏复测与普通分区优选共用测试资源，同一时间只运行一轮，可随时停止。测速期间仍可仅保存 IP、编辑备注、新建或重命名收藏夹；移动、删除和启动新测试等待当前测试结束。仅收藏已有 IP 只更新备注，保留实测快照。成功收藏后会记住上次选择的收藏夹；该偏好保存在本机 WebView，收藏夹被删除时回退到可用分类。已有收藏在复测进行中保留原快照，结束后更新对应 IP 的测试记录；失败结果也会如实保存。停止或关闭应用时，尚未开始的已有 IP 保留原记录。收藏时间、分类和备注保持不变，最新测试时间在列表直接显示；手动添加的 IP 即使测速失败也保留在收藏夹。收藏复测记录与最近一次分区优选分开保存。最近一次复测同时保存精简的前次测量摘要，可通过“仅看变化”筛选所选收藏夹中发生变化的记录；点击行内“变化”可看完整差值及对比时间。参数、网络接口或机房不同会单独提示，部分样本不会与完整结果混作有效差值；两次观测的差值不代表长期趋势。
 
@@ -70,9 +102,9 @@
 
 ## 测速历史
 
-顶部的「测速历史」保留最近 10 轮已结束的地区优选、单 IP 复测和收藏复测，包括保留了观测数据的已停止或失败任务。打开一轮后默认查看精测记录，也可以切换到全部候选，并按本轮 IP、POP 和状态筛选。输入完整 IPv4 地址，或从收藏行打开「对比历史」，即可查看该 IP 在各轮的 TCP 探测次数、失败次数、测满后的 P95 和下载结果。历史随应用数据保存在本机，升级后可查看旧版本保存的最近一轮地区优选和最近一次收藏复测。
+顶部的「测速历史」保留最近 10 轮已结束的地区优选、单 IP 复测和收藏复测，包括保留了观测数据的已停止或失败任务。打开完整测速的一轮后默认查看精测记录，也可以切换到全部候选，并按本轮 IP、POP 和状态筛选。输入完整 IPv4 地址，或从收藏行打开「对比历史」，即可查看该 IP 在各轮的 TCP 探测次数、失败次数、测满后的 P95 和下载结果。「仅测下载」也进入历史，TCP 栏显示「—」。历史随应用数据保存在本机，升级后可查看旧版本保存的最近一轮地区优选和最近一次收藏复测。
 
-对比同一台 4G 路由器的有线和 Wi‑Fi 时，可在 IP 对比表展开一条结果并点击「固定为基线」。每个 IP 可固定一条记录。该 IP 的样本在完整轮次移出最近 10 轮后仍可查看。切换网络，再点「按基线参数复测」，即可沿用当时的目标、探测和下载设置测试同一 IP。旧版规则不兼容的记录仍可固定并查看。
+对比同一台 4G 路由器的有线和 Wi‑Fi 时，可在 IP 对比表展开一条结果并点击「固定为基线」。每个 IP 可固定一条记录。该 IP 的样本在完整轮次移出最近 10 轮后仍可查看。需要在切换网络后沿用当时的目标、探测和下载设置时，请固定一条与当前规则兼容的完整测速记录，再点「按基线参数复测」。
 
 对比表集中显示时间、目标、网络 / POP、TCP 探测与下载结果。参数或网络条件有差异时，点击顶部提示可查看细节。每条结果可展开完整参数、初筛延迟、TCP 明细与路由采样。单 IP 复测和收藏复测会分别采集各目标 IP 的路由接口。整轮采样来自其他 IP 时，列表仍标记「采样」，行详情记录采样地址和时间。
 
@@ -133,6 +165,12 @@ macOS 和 Windows 在每轮测试开始时读取首个候选 IP 的系统路由�
 
 应用使用普通 TCP / HTTPS，不发送原始 ICMP 报文，也不修改 hosts、DNS 或系统代理。日常测速无需管理员权限。
 
+## 常见问题
+
+- **选了地区却没有结果。** 打开「本轮详情」，查看「各地区统计」和「本轮排除或未完成原因」。如果快速验证没有识别到该地区的 POP，可用完整优选扩大抽样。实际接入机房由当前网络路径决定。 [地区与网络路径](#地区与网络路径)
+- **测完后表格为空。** 清除临时筛选，再取消「仅完成下载」或点「查看已取得的记录」，以查看部分精测结果。若候选在初筛阶段就失败，从「本轮详情」里的「查看初筛异常」检查连接超时和系统连接错误。
+- **结果提示下载预算不足。** 打开「本轮详情」确认实际预算，再点「调整预算后重测」修改下次的配置。只关心某个 IP 时，可以收藏后单独复测。
+
 ## 本地数据与备份
 
 应用标识为 `com.ippicker.desktop`。`state.json` 保存测试设置、收藏库、当前或最近一次地区优选、当前或最近一次收藏复测，以及较早历史的引用。较早的测速记录按轮保存在同一应用数据目录下的 `state.history/` 中。`state.favorite-sources/` 备份收藏的共享候选列表，旧版回写 `state.json` 后，新版可用这些文件恢复列表原文。缺少独立文件时，新版也可按测速轮次从现有恢复备份读取内嵌的候选列表。
@@ -153,127 +191,3 @@ macOS 和 Windows 在每轮测试开始时读取首个候选 IP 的系统路由�
 若启动时本地设置无法解析，应用会先将原始内容保存为同目录下唯一的 `state.json.recovery-*.bak` 文件，并将现有的收藏候选列表保存到 `state.recovery-favorite-sources/`（如有）。完成备份后才使用默认状态。后续收藏更新不会移除恢复副本需要的候选列表。原文件读取失败或无法完成备份时会停止启动，保留原文件。恢复时先退出应用，将修复后的备份放回 `state.json`。迁移恢复副本时一并复制 `state.recovery-favorite-sources/`。
 
 “仅完成下载”和排序偏好保存在 WebView 的 `localStorage`（键为 `ip-picker.result-preferences`），不包含在 `state.json` 备份内。浏览器界面预览也有自己的偏好存储，不会读取桌面的收藏或测试记录。
-
-## 代码结构
-
-| 入口 | 职责 |
-| --- | --- |
-| [src/App.vue](src/App.vue)、[src/components/](src/components/) | 参数设置、任务事件与结果／收藏界面 |
-| [src/types.ts](src/types.ts)、[src/ui-state.ts](src/ui-state.ts) | 前端类型、默认设置、参数校验与测量状态解释 |
-| [src/result-preferences.ts](src/result-preferences.ts) | 结果筛选开关与排序偏好的本地存储 |
-| [src-tauri/src/lib.rs](src-tauri/src/lib.rs) | Tauri 命令、任务互斥、事件桥接和关闭恢复 |
-| [src-tauri/src/model.rs](src-tauri/src/model.rs)、[src-tauri/src/engine.rs](src-tauri/src/engine.rs) | Rust 配置／测量模型、候选抽样与测速流程 |
-| [src-tauri/src/stability.rs](src-tauri/src/stability.rs)、[src-tauri/src/network.rs](src-tauri/src/network.rs) | TCP 稳定性探测与网络路径快照 |
-| [src-tauri/src/favorites.rs](src-tauri/src/favorites.rs)、[src-tauri/src/storage.rs](src-tauri/src/storage.rs) | 收藏快照、复测任务、状态迁移和原子写入 |
-| [tests/](tests/)、[.github/workflows/ci.yml](.github/workflows/ci.yml) | 前端回归测试和跨平台检查；Rust 单元测试在各模块内 |
-
-修改配置字段、默认值或校验规则时，同步检查前端和 Rust 的 `ScanConfig`，并更新两端共用的[校验用例](tests/fixtures/config-validation.json)。Tauri 的保存设置与开始测速命令用 `{ field, message }` 返回设置错误，界面据此定位字段。新测量的排除或未完成记录保留可读的 `exclusionReason`，并以 `exclusionCode` 供界面分类。没有原因码的旧记录继续按当时的文字兼容显示。
-
-## 开发环境
-
-共同依赖包括 Node.js 22.12 或更新的 22.x、npm 和 Rust stable（锁定的依赖要求至少 1.90）。首次安装依赖和构建需要访问 npm 与 crates.io。 [Rust 安装](https://rustup.rs/)
-
-macOS 仅开发桌面应用时，可以安装 Xcode Command Line Tools：
-
-```sh
-xcode-select --install
-```
-
-Windows 需要 Visual Studio 的 **Desktop development with C++** 工作负载、Microsoft Edge WebView2 Runtime，以及 Rust **MSVC** 工具链。安装后重新打开终端。完整安装步骤参见 [Tauri 官方环境要求](https://v2.tauri.app/start/prerequisites/)。
-
-在项目目录运行：
-
-```sh
-npm ci
-npm run tauri -- dev
-```
-
-仅开发前端界面：
-
-```sh
-npm run dev
-```
-
-## 检查与构建
-
-```sh
-npm run build
-npm run test:frontend
-cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-cargo test --manifest-path src-tauri/Cargo.toml --locked
-```
-
-`npm test` 是 Rust 测试命令的快捷入口。前端回归测试通过 `npm run test:frontend` 单独运行。
-
-在有图形桌面的环境中运行 `npm run test:desktop-smoke`，会启动真实 Tauri 窗口，验证开始测速、停止、收藏、关闭后重开，以及字段错误和收藏快照持久化。测试使用独立临时数据目录和固定测量样本。
-
-`npm run test:desktop-performance` 在真实 Tauri 窗口里加载 1,000 和 10,000 个模拟候选，输出完整结果和下载进度事件的 JSON 大小、IP 筛选响应时间中位数，以及从点击停止到窗口显示「已停止」的耗时。筛选耗时截至匹配行更新，停止耗时包含测试结果的本地保存。
-
-编译当前操作系统的桌面程序，不制作安装包：
-
-```sh
-npm run tauri -- build --no-bundle
-```
-
-按 Tauri 配置制作本机安装包：
-
-```sh
-npm run tauri -- build
-```
-
-产物位于 `src-tauri/target/release/`，安装包位于其 `bundle/` 子目录。不同操作系统的安装包应在各自系统上构建。更多选项见 [Tauri 构建文档](https://v2.tauri.app/distribute/)。
-
-`.github/workflows/ci.yml` 在 macOS / Windows 上运行前端构建与回归、Rust 检查和桌面冒烟。macOS 还会编译桌面程序，Windows 会构建 NSIS 安装包。真实网络结果需要在实际运行环境验证。
-
-当前没有配置 macOS 开发者签名、公证或 Windows 代码签名。跨平台 CI 配置本身不代表 Windows 实机验收已完成；Windows 窗口交互、实际网络和安装包仍需在 Windows 上验证，macOS 对外分发也需另外配置签名和公证。
-
-## 小规模网络诊断
-
-命令行诊断入口调用与桌面相同的 Rust 测速核心，不写入桌面设置或测试历史。必须显式提供 JSON 配置文件；不带参数只显示用法并退出，不会启动默认网段扫描。配置字段使用 camelCase，与 [Rust `ScanConfig`](src-tauri/src/model.rs) 一致，省略字段采用其默认值。Rust 保留的推荐默认值与桌面有差异，例如 `ipsPerRegion` 为 3、`minDownloadMbps` 为 20；下面显式设为 1 和 0，使结果不受最低推荐速率门槛限制。
-
-将下面内容保存为 `scan-config.json`。它只对列出的 4 个候选 IP 做初筛；`limited` 模式配合 `candidatesPerRegion: 1`，使每个所选地区最多 1 个候选进入精测，不保证 4 个地址都进入下载。下载正文总预算为 8 MiB，每轮正文读取最多 1 秒，共 2 轮，HTTPS 验证 2 次。地区列表与桌面提供的香港、日本、新加坡、美国一致，实际可能只发现其中少数地区。这些 IP 只是测试输入，并非预先推荐的结果。
-
-```json
-{
-  "regions": ["HK", "JP", "SG", "US"],
-  "source": "custom",
-  "customIps": "104.16.1.1\n104.17.1.1\n104.18.1.1\n104.19.1.1",
-  "maxCandidates": 4,
-  "maxTcpMs": 230,
-  "tcpLatencyScreening": false,
-  "stabilityFirst": true,
-  "stabilityAttempts": 100,
-  "stabilityIntervalMs": 200,
-  "maxStabilityFailurePercent": 1,
-  "stabilityLatencyMetric": "p95",
-  "tcpConcurrency": 4,
-  "ipsPerRegion": 1,
-  "preference": "daily",
-  "minDownloadMbps": 0,
-  "candidatesPerRegion": 1,
-  "regionalCandidateLimit": 20,
-  "precisionMode": "limited",
-  "verificationAttempts": 2,
-  "downloadRounds": 2,
-  "downloadSeconds": 1,
-  "downloadBudgetEnabled": true,
-  "downloadBudgetMiB": 8,
-  "targetUrl": "https://speed.cloudflare.com/__down?bytes=1048576"
-}
-```
-
-运行诊断：
-
-```sh
-cargo run --manifest-path src-tauri/Cargo.toml --example scan -- ./scan-config.json
-```
-
-阶段和简短进度写入标准错误，最终 `{ "progress": ..., "results": ... }` JSON 写入标准输出，可在命令末尾添加 `> scan-result.json` 保存。配置错误、文件错误或测速核心错误返回非零退出码；测试完成但没有可用 IP 时仍应查看 JSON 中的实际结果。诊断入口保留证书验证，不提供跳过 TLS 校验的选项。
-
-另有单地址 TCP 对照入口，用于比较应用探测与标准库阻塞 socket 的结果，不执行 HTTPS 或下载，也不写应用历史：
-
-```sh
-cargo run --manifest-path src-tauri/Cargo.toml --example tcp_compare -- 104.16.1.1:443 20
-```
-
-必须提供目标地址和端口；次数默认为每组 20 次，可设 1–100。两组同时运行，每组内部串行探测，启动间隔 200 ms，连接超时 1,500 ms，输出含 `applicationProbe`、`blockingSocketBaseline` 及可采集到的运行前后网络路径。该工具测满指定次数，统计超限样本使用固定 200 ms 阈值，不执行桌面当前的累计 2 次失败淘汰规则，不能直接作为地区优选通过判定。
