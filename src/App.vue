@@ -42,6 +42,8 @@ type Workspace = 'scan' | 'favorites' | 'history'
 const workspace = ref<Workspace>('scan')
 const historyRevision = ref(0)
 const favoriteTest = ref<FavoriteTestJob | null>(null)
+const favoriteStarting = ref(false)
+const replacedFavoriteRuns = new Set<string>()
 const favoriteTesting = computed(() => favoriteTest.value?.run.status === 'running')
 const favoritesPanel = ref<HTMLElement | null>(null)
 const historyPanel = ref<HTMLElement | null>(null)
@@ -96,7 +98,7 @@ async function onSettingsTabKey(event: KeyboardEvent) {
 const targetHost = computed(() => {
   try { return new URL(config.value.targetUrl).hostname } catch { return '请设置测速地址' }
 })
-const scanActionLabel = computed(() => loading.value ? '正在加载…' : starting.value ? '正在启动…' : run.value ? '重新完整优选' : '开始完整优选')
+const scanActionLabel = computed(() => loading.value ? '正在加载…' : favoriteStarting.value ? '正在启动复测…' : starting.value ? '正在启动…' : run.value ? '重新完整优选' : '开始完整优选')
 watch(advancedOpen, open => {
   if (open && !settingsDialog.value?.open) settingsDialog.value?.showModal()
   if (!open && settingsDialog.value?.open) {
@@ -108,7 +110,8 @@ const toast = ref<{ text: string; error: boolean } | null>(null)
 const pageError = ref('')
 const storageWarning = ref('')
 const fileInput = ref<HTMLInputElement | null>(null)
-const progressPanel = ref<HTMLElement | null>(null)
+const progressPanel = ref<HTMLDetailsElement | null>(null)
+const progressDetailsOpen = ref(false)
 const now = ref(Date.now())
 let unlisten: UnlistenFn | undefined
 let unlistenStorage: UnlistenFn | undefined
@@ -119,6 +122,7 @@ let disposed = false
 let clock: ReturnType<typeof setInterval> | undefined
 let saveTimer: ReturnType<typeof setTimeout> | undefined
 let toastTimer: ReturnType<typeof setTimeout> | undefined
+let pendingIpImport: symbol | undefined
 let previousRunIdForStart: string | undefined
 const scanProgressBuffer = createProgressBuffer()
 const favoriteProgressBuffer = createProgressBuffer()
@@ -129,6 +133,7 @@ let drainConfigSaves = false
 let configSaveDue = false
 
 const running = computed(() => run.value?.status === 'running')
+watch(running, active => { if (!active) progressDetailsOpen.value = false })
 const activeMeasurement = computed(() => {
   if (run.value?.status === 'running') return { workspace: 'scan', run: run.value, cancel: 'cancel_scan' } as const
   const retest = favoriteTest.value?.run
@@ -147,9 +152,10 @@ const activePhase = computed(() => {
   return stageProgressText(active)
 })
 const activeDownloaded = computed(() => formatDownloadedMiB(activeMeasurement.value?.run.progress.downloadedBytes ?? 0))
-const measurementActive = computed(() => starting.value || !!activeMeasurement.value)
+const measurementActive = computed(() => starting.value || favoriteStarting.value || !!activeMeasurement.value)
 const scanPhaseTitle = computed(() => run.value ? stageProgressText(run.value).title : '')
-const locked = computed(() => loading.value || starting.value || running.value || favoriteTesting.value || stopping.value || finishingSettings.value || windowClosing.value)
+const locked = computed(() => loading.value || measurementActive.value || stopping.value || finishingSettings.value || windowClosing.value)
+watch([advancedOpen, locked, () => config.value.source, () => config.value.customIps], () => { pendingIpImport = undefined }, { flush: 'sync' })
 const dirty = computed(() => !!run.value && !run.value.retestIp && !sameScanConfig(run.value.quickValidation ? quickConfig.value : config.value, run.value.config))
 const scanProgress = computed(() => run.value ? compactScanProgress(run.value) : null)
 const validationIssue = computed(() => validateConfig(config.value) ?? nativeValidationIssue.value)
@@ -307,13 +313,21 @@ async function importIps(event: Event) {
   const input = event.target as HTMLInputElement
   const file = input.files?.[0]
   if (!file) return
+  input.value = ''
+  if (locked.value || !advancedOpen.value) return
+  const request = Symbol()
+  pendingIpImport = request
   try {
     if (file.size > MAX_CUSTOM_IP_BYTES) throw new Error('列表文件不能超过 2 MiB')
-    config.value.customIps = await file.text()
-    config.value.source = 'custom'
+    const customIps = await file.text()
+    if (disposed || pendingIpImport !== request) return
+    config.value = { ...config.value, customIps, source: 'custom' }
     notify(`已载入 ${file.name}，开始前可检查 IP 列表`)
-  } catch (error) { notify(`导入失败：${errorText(error)}`, true) }
-  finally { input.value = '' }
+  } catch (error) {
+    if (!disposed && pendingIpImport === request) notify(`导入失败：${errorText(error)}`, true)
+  } finally {
+    if (pendingIpImport === request) pendingIpImport = undefined
+  }
 }
 function receiveRun(next: ScanRun, allowNewerSnapshot = false) {
   // Events can finish a short scan before an earlier command snapshot arrives.
@@ -491,7 +505,12 @@ async function refreshFavorites() {
 function receiveFavoriteTest(next: FavoriteTestJob) {
   const current = favoriteTest.value
   if (staleRunningSnapshot(current?.run, next.run)) return
-  if (current && current.run.id !== next.run.id && Date.parse(next.run.startedAt) < Date.parse(current.run.startedAt)) return
+  if (replacedFavoriteRuns.has(next.run.id)) return
+  if (current && current.run.id !== next.run.id) {
+    // A local start defines a new run even if the system clock has moved back.
+    if (!favoriteStarting.value && Date.parse(next.run.startedAt) < Date.parse(current.run.startedAt)) return
+    replacedFavoriteRuns.add(current.run.id)
+  }
   if (current?.run.id === next.run.id && next.run.status === 'running'
     && current.run.progress?.downloadedBytes > next.run.progress?.downloadedBytes) {
     next = { ...next, run: { ...next.run, progress: { ...next.run.progress, downloadedBytes: current.run.progress.downloadedBytes } } }
@@ -520,7 +539,7 @@ function onFavoriteTestStarted(start: FavoriteTestStart) {
   if (current?.run.id !== start.job.run.id) receiveFavoriteTest(start.job)
 }
 function openFavorite(result: IpResult, event: MouseEvent) {
-  if (!desktop || loading.value || favoriteTesting.value || windowClosing.value || favoriteTarget.value || !run.value) return
+  if (!desktop || loading.value || favoriteStarting.value || favoriteTesting.value || windowClosing.value || favoriteTarget.value || !run.value) return
   favoriteTrigger = event.currentTarget instanceof HTMLElement ? event.currentTarget : null
   favoriteTarget.value = { runId: run.value.id, ip: result.ip }
 }
@@ -634,7 +653,7 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
 
 
       <div v-show="workspace === 'favorites'" id="favorites-library" ref="favoritesPanel" tabindex="-1" class="favorites-view">
-        <FavoritesPanel v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric" :library="favorites" :desktop="desktop" :loading="loading" :config="config" :test-job="favoriteTest" :scan-busy="!!running || starting" :closing="windowClosing" :stopping="stopping || windowClosing" @change="updateFavorites" @test-started="onFavoriteTestStarted" @stop-test="stopMeasurement" @compare-history="compareFavoriteHistory" @notify="notify" />
+        <FavoritesPanel v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric" :library="favorites" :desktop="desktop" :loading="loading" :config="config" :test-job="favoriteTest" :scan-busy="!!running || starting" :closing="windowClosing" :stopping="stopping || windowClosing" @change="updateFavorites" @test-starting="favoriteStarting = $event" @test-started="onFavoriteTestStarted" @stop-test="stopMeasurement" @compare-history="compareFavoriteHistory" @notify="notify" />
       </div>
       <div v-show="workspace === 'history'" id="scan-history" ref="historyPanel" tabindex="-1" class="history-view">
         <ScanHistoryPanel ref="historyView" v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric" :desktop="desktop" :active="workspace === 'history'" :revision="historyRevision" :retest-disabled="locked" @retest="replayBaseline" />
@@ -653,7 +672,7 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
               <button type="button" class="button quick-scan-button" :class="{ primary: !run }" :disabled="!desktop || locked || !!validation" :aria-describedby="quickEstimate ? 'quick-scan-detail' : undefined" @click="startScan(true)">快速验证</button>
               <button ref="settingsTrigger" class="button advanced-trigger workspace-secondary-action" :aria-expanded="advancedOpen" :title="`下次测速设置：${targetHost} · 抽样 ${config.maxCandidates} · TCP ${stabilityMetricLabel(config.stabilityLatencyMetric)} ≤ ${config.maxTcpMs} ms`" aria-controls="advanced-settings" @click="advancedOpen = true"><Settings2 :size="14" />高级设置</button>
               <button v-if="running" class="button stop-button start-button workspace-primary-action" :disabled="stopping || windowClosing" @click="stopMeasurement"><LoaderCircle v-if="stopping" :size="14" class="spinning" /><Square v-else :size="12" />{{ stopping ? '正在停止…' : '停止测速' }}</button>
-              <button v-else class="button start-button workspace-primary-action" :class="{ primary: !!run }" :disabled="!desktop || locked || !!validation" :aria-describedby="scanEstimate ? 'scan-estimate-detail' : undefined" @click="startScan()"><LoaderCircle v-if="starting || loading" :size="14" class="spinning" /><Play v-else :size="12" fill="currentColor" />{{ scanActionLabel }}</button>
+              <button v-else class="button start-button workspace-primary-action" :class="{ primary: !!run }" :disabled="!desktop || locked || !!validation" :aria-describedby="scanEstimate ? 'scan-estimate-detail' : undefined" @click="startScan()"><LoaderCircle v-if="starting || favoriteStarting || loading" :size="14" class="spinning" /><Play v-else :size="12" fill="currentColor" />{{ scanActionLabel }}</button>
             </div>
           </div>
           <div v-if="quickEstimate && scanEstimate" class="scan-costs" aria-label="开跑前估算">
@@ -665,13 +684,13 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
         </section>
 
           <div v-if="measurementActive || validationIssue || run?.status === 'failed'" class="scan-status-slot" :class="{ 'is-error': !measurementActive && (!!validationIssue || run?.status === 'failed'), 'is-active': measurementActive }">
-            <details v-if="run && running" ref="progressPanel" class="scan-progress-disclosure" aria-label="测速进度" tabindex="-1">
+            <details v-if="run && running" ref="progressPanel" class="scan-progress-disclosure" aria-label="测速进度" tabindex="-1" @toggle="progressDetailsOpen = progressPanel?.open ?? false">
               <summary><LoaderCircle :size="12" class="spinning" /><span>{{ scanProgress?.step }} · {{ scanPhaseTitle }}</span><span>{{ scanProgress?.caption }}</span><span class="progress-result-count">完整结果 {{ scanProgress?.complete }} 个</span><span class="muted">{{ elapsed }}</span><span class="downloaded-total">{{ scanDownloaded }}</span><span class="scan-progress-label">详情<ChevronDown :size="12" /></span></summary>
-              <div class="scan-progress-popover"><ScanProgressPanel :run="run" :elapsed="elapsed" /></div>
+              <div v-if="progressDetailsOpen" class="scan-progress-popover"><ScanProgressPanel :run="run" :elapsed="elapsed" /></div>
             </details>
             <div v-else-if="favoriteTesting" class="scan-status-content"><LoaderCircle :size="12" class="spinning" /><span role="status">收藏复测进行中，结束后可开始优选。</span><strong class="downloaded-total">累计下载 {{ favoriteDownloaded }}</strong></div>
+            <div v-else-if="starting || favoriteStarting" class="scan-status-content" role="status"><LoaderCircle :size="12" class="spinning" /><span>{{ favoriteStarting ? '正在启动收藏复测…' : '正在启动测速…' }}</span></div>
             <div v-else-if="validationIssue" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span id="config-validation" :title="validation">{{ validation }}</span><button class="text-button" @click="focusSetting(validationIssue.field)">定位问题<ArrowRight :size="12" /></button></div>
-            <div v-else-if="starting" class="scan-status-content" role="status"><LoaderCircle :size="12" class="spinning" /><span>正在启动测速…</span></div>
             <div v-else-if="run?.status === 'failed'" class="scan-status-content" role="alert"><CircleAlert :size="13" /><span :title="run.error || run.progress.message">{{ run.error || run.progress.message || '测试未完成，请检查网络和测速地址。' }}</span></div>
             <button v-if="running" class="text-button progress-records-button" @click="resultsView?.showObservations()">查看记录</button>
           </div>
@@ -681,7 +700,7 @@ onBeforeUnmount(() => { disposed = true; unlisten?.(); unlistenStorage?.(); unli
             v-model:tcp-display-metric="resultPreferences.tcpDisplayMetric"
             v-model:sort-by="resultPreferences.sortBy"
             v-model:completed-download-only="resultPreferences.completedDownloadOnly"
-            :run="run" :settings-differ="dirty" :settings-disabled="locked" :retest-disabled="locked || !!validation" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteTesting || windowClosing"
+            :run="run" :settings-differ="dirty" :settings-disabled="locked" :retest-disabled="locked || !!validation" :saved-ips="savedIps" :favorite-disabled="!desktop || loading || favoriteStarting || favoriteTesting || windowClosing"
             @favorite="openFavorite" @notify="notify" @action="handleResultAction" @reuse-config="reuseRunConfig" @retest="startFullRetest" />
           <section v-else class="initial-empty" aria-labelledby="welcome-title">
             <Network :size="32" :stroke-width="1.2" /><h1 id="welcome-title">先验证网络，再挑选合适的 IP</h1>

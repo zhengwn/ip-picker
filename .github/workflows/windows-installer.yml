@@ -1,12 +1,12 @@
 name: Build Windows installer
-run-name: Windows x64 installer for ${{ inputs.tag }}
+run-name: Windows x64 installer for ${{ inputs.tag || github.sha }}
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build
-        required: true
+        description: Release tag to build. Leave blank to verify the selected branch commit.
+        required: false
         type: string
 
 permissions:
@@ -21,15 +21,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: refs/tags/${{ inputs.tag }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           persist-credentials: false
-      - name: Check the release version
-        run: |
-          $Version = (Get-Content -Raw 'src-tauri/tauri.conf.json' | ConvertFrom-Json).version
-          if ("v$Version" -cne $env:IP_PICKER_RELEASE_TAG) {
-            throw "The release tag must match the application version v$Version."
-          }
-          Write-Host "Building $env:IP_PICKER_RELEASE_TAG from $(git rev-parse HEAD)"
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -37,6 +30,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Check the release version
+        run: |
+          $Version = (Get-Content -Raw 'src-tauri/tauri.conf.json' | ConvertFrom-Json).version
+          if ($env:IP_PICKER_RELEASE_TAG -and "v$Version" -cne $env:IP_PICKER_RELEASE_TAG) {
+            throw "The release tag must match the application version v$Version."
+          }
+
+          $Package = Get-Content -Raw 'package.json' | ConvertFrom-Json
+          $PackageLock = Get-Content -Raw 'package-lock.json' | ConvertFrom-Json -AsHashtable
+          $CargoJson = cargo metadata --manifest-path src-tauri/Cargo.toml --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Unable to read the Rust package version.'
+          }
+          $CargoPackage = ($CargoJson | ConvertFrom-Json).packages | Where-Object { $_.name -ceq 'ip-picker' }
+          $Versions = [ordered]@{
+            'package.json' = $Package.version
+            'package-lock.json' = $PackageLock.version
+            'package-lock.json root package' = $PackageLock.packages[''].version
+            'src-tauri/Cargo.toml' = $CargoPackage.version
+          }
+          foreach ($Entry in $Versions.GetEnumerator()) {
+            if ($Entry.Value -cne $Version) {
+              throw "$($Entry.Key) must use release version $Version (found '$($Entry.Value)')."
+            }
+          }
+          Write-Host "Building v$Version from $(git rev-parse HEAD)"
       - name: Install frontend dependencies
         run: npm ci
       - name: Build the x64 release installer
@@ -106,6 +125,6 @@ jobs:
           Write-Host "Installer signature status is $((Get-AuthenticodeSignature -FilePath $AssetPath).Status)."
       - uses: actions/upload-artifact@v7
         with:
-          name: ip-picker-${{ inputs.tag }}-windows-x64
+          name: ip-picker-${{ inputs.tag || github.sha }}-windows-x64
           path: release-assets/
           if-no-files-found: error

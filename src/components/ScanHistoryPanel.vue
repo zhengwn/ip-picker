@@ -27,6 +27,7 @@ const selectedRun = ref<{ id: string; kind: ScanHistoryKind } | null>(null)
 const view = computed<View>(() => selectedRun.value ? { mode: 'run', ...selectedRun.value }
   : comparedIp.value ? { mode: 'compare', ip: comparedIp.value } : { mode: 'recent' })
 const content = shallowRef<Content | null>(null)
+let loadedView: View | undefined
 const loading = ref(false)
 const loadError = ref('')
 const retry = ref(0)
@@ -62,10 +63,13 @@ watch([() => props.active, () => props.revision, view, retry], async ([active, ,
   onCleanup(() => { currentRequest = false })
   loading.value = true
   loadError.value = ''
-  content.value = null
+  if (loadedView !== current) content.value = null
   try {
     const loaded = await fetchView(current)
-    if (currentRequest) content.value = loaded
+    if (currentRequest) {
+      loadedView = current
+      content.value = loaded
+    }
   } catch (error) {
     if (currentRequest) loadError.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -313,13 +317,13 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
 </script>
 
 <template>
-  <section class="history-panel" aria-labelledby="scan-history-title">
+  <section class="history-panel" aria-labelledby="scan-history-title" :aria-busy="loading">
     <header class="history-toolbar">
       <div class="history-heading">
         <button v-if="view.mode !== 'recent'" ref="backButton" type="button" class="text-button history-back" @click="goBack"><ArrowLeft :size="13" aria-hidden="true" />{{ view.mode === 'run' && comparedIp ? '返回对比' : '返回历史' }}</button>
         <h2 id="scan-history-title">{{ view.mode === 'compare' ? 'IP 对比' : view.mode === 'run' ? '本轮结果' : '测速历史' }}</h2>
         <span v-if="history" class="history-count">最近 {{ history.limit }} 轮</span>
-        <template v-if="view.mode === 'compare'"><strong class="mono history-current-ip">{{ view.ip }}</strong><span v-if="!loading && !loadError" class="history-count">{{ matches.length }} 轮</span></template>
+        <template v-if="view.mode === 'compare'"><strong class="mono history-current-ip">{{ view.ip }}</strong><span v-if="content && !loadError" class="history-count">{{ matches.length }} 轮</span></template>
         <template v-if="run"><time class="history-current-time" :datetime="run.startedAt" :title="favoriteDate(run.startedAt)">{{ favoriteDate(run.startedAt) }}</time><span :class="['status-label', statusClass[run.status]]">{{ statusText[run.status] }}</span></template>
       </div>
       <form class="history-search" role="search" aria-label="按 IP 对比测速历史" @submit.prevent="compareIp()">
@@ -368,7 +372,7 @@ function failurePercentLabel(value: number | null) { return value == null ? '未
       <SelectControl compact><select v-model="runStatus" aria-label="本轮测速状态"><option value="">全部状态</option><option v-for="status in runStatusOptions" :key="status" :value="status">{{ status }}</option></select></SelectControl>
     </div>
 
-    <div v-if="loading" class="history-empty" role="status"><LoaderCircle :size="20" class="spinning" aria-hidden="true" /><p>正在读取测速历史…</p></div>
+    <div v-if="loading && !content" class="history-empty" role="status"><LoaderCircle :size="20" class="spinning" aria-hidden="true" /><p>正在读取测速历史…</p></div>
     <div v-else-if="loadError" class="history-empty"><div role="alert"><h3>读取测速历史失败</h3><p>{{ loadError }}</p></div><button type="button" class="button" @click="retry++">重试</button></div>
     <div v-else-if="history?.entries.length" class="history-table-wrap" role="region" aria-label="最近测速记录" tabindex="0">
       <table class="history-table run-list">

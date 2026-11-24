@@ -1,5 +1,5 @@
 use crate::{
-    model::{ExclusionCode, IpResult, ScanConfig, ScanRun},
+    model::{deserialize_recorded_scan_config, ExclusionCode, IpResult, ScanConfig, ScanRun},
     network::NetworkPath,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -24,6 +24,7 @@ pub struct FavoriteTestJob {
 pub struct FavoriteTestBaseline {
     pub favorite_id: String,
     pub tested_at: String,
+    #[serde(deserialize_with = "deserialize_recorded_scan_config")]
     pub config: ScanConfig,
     pub network_path: Option<NetworkPath>,
     pub colo: String,
@@ -138,6 +139,7 @@ pub struct FavoriteEntry {
     pub run_started_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_finished_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_recorded_scan_config")]
     pub config: ScanConfig,
     pub result: IpResult,
     #[serde(default, skip_serializing_if = "CandidateListSource::is_unknown")]
@@ -166,6 +168,7 @@ impl FavoriteEntry {
 pub struct FavoriteDownloadTest {
     pub run_id: String,
     pub tested_at: String,
+    #[serde(deserialize_with = "deserialize_recorded_scan_config")]
     pub config: ScanConfig,
     pub result: IpResult,
 }
@@ -371,7 +374,7 @@ impl FavoriteLibrary {
             result: result.clone(),
             candidate_list_id,
             candidate_list_known_empty,
-            targeted: false,
+            targeted: run.retest_ip.is_some(),
             network_path: run.path_for(result),
             download_test: None,
         };
@@ -744,12 +747,21 @@ pub(crate) fn was_attempted(result: &IpResult) -> bool {
             .is_some_and(|stats| !stats.probes_ms.is_empty())
         || result.exclusion_code.map_or_else(
             || {
-                result
-                    .exclusion_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason != "测试已停止，验证或下载复测未完成")
+                result.exclusion_reason.as_deref().is_some_and(|reason| {
+                    !matches!(
+                        reason,
+                        "测试已停止，验证或下载复测未完成"
+                            | "剩余下载预算不足以安排全部复测轮次"
+                            | "下载预算不足，未完成必要复测"
+                    )
+                })
             },
-            |code| code != ExclusionCode::Cancelled,
+            |code| {
+                !matches!(
+                    code,
+                    ExclusionCode::Cancelled | ExclusionCode::DownloadBudget
+                )
+            },
         )
 }
 
@@ -764,6 +776,17 @@ fn checked_note(note: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_from_a_single_ip_retest_keeps_its_targeted_policy() {
+        let mut library = FavoriteLibrary::default();
+        let folder = library.folders[0].id.clone();
+        let mut run = sample_run();
+        let ip = run.results[0].ip.clone();
+        run.retest_ip = Some(ip.clone());
+        library.save_snapshot(&folder, &run, &ip, "").unwrap();
+        assert!(library.entries[0].targeted);
+    }
 
     pub(super) fn sample_run() -> ScanRun {
         let mut result = IpResult::new("104.16.1.1".parse().unwrap());

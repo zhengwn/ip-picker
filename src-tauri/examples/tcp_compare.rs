@@ -10,20 +10,18 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() {
-    let arguments: Vec<_> = std::env::args().skip(1).collect();
-    let Some(address) = arguments
-        .first()
-        .and_then(|value| value.parse::<SocketAddr>().ok())
-    else {
-        eprintln!("Usage: tcp_compare <IPv4:port> [count=20]");
-        std::process::exit(2);
-    };
-    let count = match arguments.get(1) {
-        Some(value) => value.parse::<usize>().ok(),
+    let mut arguments = std::env::args_os().skip(1);
+    let address = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<SocketAddr>().ok());
+    let count = match arguments.next() {
+        Some(value) => value.to_str().and_then(|value| value.parse::<usize>().ok()),
         None => Some(20),
     }
     .filter(|value| (1..=100).contains(value));
-    let Some(count) = count else {
+    let (Some(address), Some(count), None) = (address, count, arguments.next()) else {
+        eprintln!("Usage: tcp_compare <IPv4:port or [IPv6]:port> [count=20, range 1-100]");
         std::process::exit(2);
     };
     let cadence = Duration::from_millis(200);

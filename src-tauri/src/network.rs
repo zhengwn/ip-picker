@@ -24,6 +24,13 @@ pub enum InterfaceKind {
     Other,
 }
 
+pub(crate) async fn capture_async(ip: Ipv4Addr) -> Option<NetworkPath> {
+    tokio::task::spawn_blocking(move || capture(ip))
+        .await
+        .ok()
+        .flatten()
+}
+
 #[cfg(target_os = "macos")]
 pub fn capture(ip: Ipv4Addr) -> Option<NetworkPath> {
     // Read the existing route. Never alter routes, bind to a different network,

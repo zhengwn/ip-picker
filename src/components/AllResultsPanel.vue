@@ -3,7 +3,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { Activity, BarChart3, ChevronDown, ChevronLeft, ChevronRight, Copy, Search, SearchX, SlidersHorizontal } from '@lucide/vue'
 import { regionName, type IpResult, type ScanRun } from '../types'
-import { candidateExclusionReason, candidateMeasurementStatus, completeMeasurement, completedTcpMetricValue, hasPrecisionMeasurement, initialTcpFailureReason, isDownloadShortlistExclusion, observedFailurePercent, observedTcpMs, quickRetestAdvice, regionalPrecisionLimit, stabilityMetricLabel, stabilityVerdict, summarizeExclusions } from '../ui-state'
+import { candidateExclusionReason, candidateMeasurementStatus, completeMeasurement, completedTcpMetricValue, hasCompleteDownload, hasPrecisionMeasurement, initialTcpFailureReason, isDownloadShortlistExclusion, observedFailurePercent, observedTcpMs, quickRetestAdvice, regionalPrecisionLimit, stabilityMetricLabel, stabilityVerdict, summarizeExclusions } from '../ui-state'
 import type { ResultSortBy, TcpDisplayMetric } from '../result-preferences'
 import { displayForLatencySort, latencySortForDisplay } from '../result-preferences'
 import { describeResultRow, tcpLatencyChartScale } from '../result-row-display'
@@ -108,11 +108,7 @@ function downloadValue(result: IpResult): number | null {
   return result.downloadSamplesMbps.length && Number.isFinite(result.downloadMbps) ? result.downloadMbps : null
 }
 function completeDownloadValue(result: IpResult): number | null {
-  const value = downloadValue(result)
-  return value != null && value > 0
-    && result.downloadSamplesMbps.length >= props.run.config.downloadRounds
-    && result.downloadSamplesMbps.every(sample => Number.isFinite(sample) && sample > 0)
-    ? value : null
+  return hasCompleteDownload(result, props.run.config) ? result.downloadMbps : null
 }
 function initialTcp(result: IpResult): number | null {
   return Number.isFinite(result.tcpMs) && (result.tcpMs > 0 || result.attempts > 0 || !!result.colo) ? result.tcpMs : null

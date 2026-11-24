@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { IpResult, ScanConfig } from '../types'
-import { completedTcpMetricValue, initialTcpFailureReason, stabilityMetricLabel, tcpConnectionFailureLabels } from '../ui-state'
+import { completedTcpMetricValue, initialTcpFailureReason, observedFailurePercent, stabilityMetricLabel, tcpConnectionFailureLabels } from '../ui-state'
 
 const props = defineProps<{ result: IpResult; config: ScanConfig }>()
 const stats = computed(() => props.result.tcpStability)
@@ -25,6 +25,7 @@ const initialTime = computed(() => {
   return tcpMs > 0 || (tcpMs === 0 && (attempts > 0 || !!colo)) ? milliseconds(tcpMs) : ''
 })
 const completeP95 = computed(() => milliseconds(completedTcpMetricValue(props.result, 'p95')))
+const failurePercent = computed(() => observedFailurePercent(stats.value)?.toFixed(1))
 const failureBreakdown = computed(() => {
   const details = stats.value?.failureDetails
   if (!details?.length || !stats.value) return ''
@@ -99,7 +100,7 @@ function syncSamplesOpen(event: Event) {
           <dt>稳定性探测</dt>
           <dd>
             已测 {{ stats.attempted }} / {{ stats.requested }} 次 · 成功 {{ stats.succeeded }} 次
-            <span class="tcp-subtext">失败 {{ stats.failed }} 次（已测样本的 {{ (stats.failed / stats.attempted * 100).toFixed(1) }}%）</span>
+            <span class="tcp-subtext">失败 {{ stats.failed }} 次<template v-if="failurePercent !== undefined">（已测样本的 {{ failurePercent }}%）</template></span>
             <span v-if="failureBreakdown" class="tcp-subtext">{{ failureBreakdown }}</span>
           </dd>
         </div>

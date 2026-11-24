@@ -1529,7 +1529,7 @@ mod lifecycle_tests {
         let config = ScanConfig::default();
         let folder = inner.saved.favorites.folders[0].id.clone();
         let mut full = run("full");
-        for ip in ["104.16.1.1", "104.16.1.2", "104.16.1.3"] {
+        for ip in ["104.16.1.1", "104.16.1.2", "104.16.1.3", "104.16.1.4"] {
             let mut row = model::IpResult::new(ip.parse().unwrap());
             row.tcp_stability = Some(stability::summarize(10, 200.0, vec![Some(50.0); 10]));
             row.download_samples_mbps = vec![30.0, 30.0];
@@ -1555,13 +1555,17 @@ mod lifecycle_tests {
                 &path,
             )
             .unwrap();
-        assert_eq!(ips.len(), 3);
+        assert_eq!(ips.len(), 4);
         assert_eq!(started.job.run.progress.stage, "downloading");
         let mut results = started.job.run.results.clone();
         results[0].download_samples_mbps = vec![47.0, 49.0];
         results[0].download_mbps = 48.0;
         results[1].download_samples_mbps = vec![52.0];
         results[1].download_mbps = 52.0;
+        results[2].exclude(
+            model::ExclusionCode::DownloadBudget,
+            "剩余下载预算不足以安排全部复测轮次",
+        );
         inner
             .complete_favorite_test(
                 &started.job.run.id,
@@ -1582,11 +1586,12 @@ mod lifecycle_tests {
             saved.history_comparison("104.16.1.1")[0].entry.run.results[0].download_mbps,
             48.0
         );
+        assert!(saved.history_comparison("104.16.1.3").is_empty());
         for (index, (entry, expected)) in saved
             .favorites
             .entries
             .iter()
-            .zip([Some(48.0), Some(52.0), None])
+            .zip([Some(48.0), Some(52.0), None, None])
             .enumerate()
         {
             assert_eq!(

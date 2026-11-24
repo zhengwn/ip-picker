@@ -55,7 +55,17 @@ async function exercise() {
   const quick = await button('.quick-scan-button', '快速验证')
   quick.click()
   await button('.start-button', '停止测速')
-  await waitFor('quick run context and visible stage progress', () => document.querySelector('.run-mode-label')?.textContent.includes('快速验证') && document.querySelector('.scan-progress-disclosure summary')?.textContent.includes('阶段 3 / 5'))
+  await waitFor('quick run context and incremental stability progress', () => {
+    const progress = document.querySelector('.scan-progress-disclosure summary')?.textContent
+    return document.querySelector('.run-mode-label')?.textContent.includes('快速验证') &&
+      progress?.includes('阶段 3 / 5') && progress.includes('已探测 2 / 100 次')
+  })
+  const progressSummary = await element('.scan-progress-disclosure summary')
+  if (document.querySelector('.scan-progress-popover')) throw new Error('Closed progress details are still mounted')
+  progressSummary.click()
+  await element('.scan-progress-popover')
+  progressSummary.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+  await waitFor('progress details unmount on close', () => !document.querySelector('.scan-progress-popover'))
   const completedOnly = await element('input[aria-describedby="completed-download-help"]')
   if (completedOnly.checked) completedOnly.click()
   await element('.all-results-table .favorite-button')

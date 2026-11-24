@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { setImmediate } from 'node:timers/promises'
 import test from 'node:test'
-import { App, defaultConfig, mountComponent, setInvokeHandler, setWindowFixture } from './support/component-fixture.mjs'
+import { App, FavoritesPanel, defaultConfig, mountComponent, setInvokeHandler, setWindowFixture } from './support/component-fixture.mjs'
 
 function deferred() {
   let resolve, reject
@@ -35,6 +35,7 @@ async function fixture(context, options = {}) {
     if (command === 'load_state') return { config: defaultConfig(), favorites: { revision: 0, folders: [], entries: [] } }
     if (command === 'get_scan' || command === 'get_favorite_test') return null
     if (command === 'start_scan' && options.start) return options.start(args.config, args.persistConfig)
+    if (command === 'start_favorite_test' && options.startFavorite) return options.startFavorite()
     if (command === 'prepare_shutdown') return options.prepareShutdown?.()
     if (command === 'save_config') {
       const snapshot = structuredClone(args.config)
@@ -63,6 +64,52 @@ test('pending user settings are saved when a favorite retest starts before debou
   assert.equal(saves[0].maxTcpMs, 231)
   assert.equal(saves[0].source, 'cloudflare')
   assert.equal(saves[0].customIps, '')
+})
+
+test('a pending favorite start blocks competing scans before the first update and unlocks on failure', async context => {
+  const favoriteStart = deferred()
+  const { state } = await fixture(context, { startFavorite: () => favoriteStart.promise })
+  const panel = mountComponent(FavoritesPanel, {
+    library: state.favorites.value, desktop: true, config: state.config.value,
+    onTestStarting: starting => { state.favoriteStarting.value = starting },
+    onTestStarted: state.onFavoriteTestStarted,
+  })
+  context.after(panel.unmount)
+
+  const start = panel.state.startTest({ favoriteId: 'saved' })
+  assert.equal(state.measurementActive.value, true)
+  assert.equal(state.locked.value, true)
+  assert.equal(state.scanEstimate.value, null)
+  await state.startScan()
+  assert.equal(state.pageError.value, '')
+  favoriteStart.reject(new Error('unable to start'))
+  assert.equal(await start, false)
+  assert.equal(state.locked.value, false)
+  assert.equal(panel.state.testError.value, 'unable to start')
+})
+
+test('an IP import cannot overwrite a newer file or change settings during window close', async context => {
+  const { state, saves, requestClose } = await fixture(context)
+  const input = (name, contents) => ({ target: { value: name, files: [{ name, size: 11, text: () => contents }] } })
+  state.advancedOpen.value = true
+  const first = deferred()
+  const last = deferred()
+  const firstImport = state.importIps(input('first.txt', first.promise))
+  const lastImport = state.importIps(input('last.txt', last.promise))
+  last.resolve('192.0.2.2')
+  await lastImport
+  first.resolve('192.0.2.1')
+  await firstImport
+  assert.equal(state.config.value.customIps, '192.0.2.2')
+  assert.equal(state.config.value.source, 'custom')
+
+  const duringClose = deferred()
+  const interrupted = state.importIps(input('too-late.txt', duringClose.promise))
+  const { completion } = requestClose()
+  duringClose.resolve('192.0.2.3')
+  await Promise.all([completion, interrupted])
+  assert.equal(state.config.value.customIps, '192.0.2.2')
+  assert.deepEqual(saves.map(config => config.customIps), ['192.0.2.2'])
 })
 
 test('shared latency selection stays aligned even before a scan result table exists', async context => {

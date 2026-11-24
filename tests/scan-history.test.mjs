@@ -185,6 +185,38 @@ test('a historical run starts with precision records and applies IP, POP and sta
   assert.equal(state.filteredRunRows.value.length, 53)
 })
 
+test('refreshing a viewed history run preserves its page and open result', async context => {
+  const { run } = match('104.16.0.1', 'history-run')
+  run.results = Array.from({ length: 51 }, (_, index) => ({ ...run.results[0], ip: `192.0.2.${index + 1}`, attempts: 2 }))
+  let runReads = 0
+  let finishRefresh
+  setInvokeHandler(async command => {
+    if (command === 'get_scan_history') return { limit: 10, entries: [] }
+    if (++runReads === 1) return run
+    return new Promise(resolve => { finishRefresh = resolve })
+  })
+  const mounted = mountComponent(ScanHistoryPanel, { desktop: true, active: true, revision: 0 })
+  context.after(mounted.unmount)
+  const { state } = mounted
+  state.openRun(run.id, 'scan')
+  await setImmediate()
+  state.page.value = 2
+  await setImmediate()
+  const open = state.rows.value[0].key
+  state.expandedResult.value = open
+
+  state.retry.value++
+  await setImmediate()
+  assert.equal(state.loading.value, true)
+  assert.equal(state.currentPage.value, 2)
+  assert.equal(state.expandedResult.value, open)
+  finishRefresh(structuredClone(run))
+  await setImmediate()
+  assert.equal(state.loading.value, false)
+  assert.equal(state.rows.value[0].key, open)
+  assert.equal(state.expandedResult.value, open)
+})
+
 
 test('an indirect route sample remains visible as uncertainty after comparison metadata is collapsed', async context => {
   const ip = '104.16.0.1'

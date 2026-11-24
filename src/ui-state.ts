@@ -318,7 +318,7 @@ export function stabilityMetricLabel(metric: ScanConfig['stabilityLatencyMetric'
 
 export function measuredTcpFailure(result: IpResult): number {
   const stability = result.tcpStability
-  return stability?.completed && stability.attempted === stability.requested && stability.attempted > 0 ? stability.failed / stability.attempted * 100 : Infinity
+  return stability?.completed && stability.attempted === stability.requested ? observedFailurePercent(stability) ?? Infinity : Infinity
 }
 
 export function observedTcpMs(stability: TcpStability | undefined, metric: 'medianMs' | 'averageMs' | 'maxMs'): number | null {
@@ -331,15 +331,14 @@ export function observedFailurePercent(stability?: TcpStability): number | null 
   if (!stability) return null
   const { attempted, failed } = stability
   return Number.isInteger(attempted) && attempted > 0 && Number.isInteger(failed) && failed >= 0 && failed <= attempted
-    ? failed / attempted * 100 : null
+    ? failed * 100 / attempted : null
 }
 
 export function completeMeasurement(result: IpResult, config: ScanConfig): boolean {
   return result.measurementPassed && completeStability(result, config)
     && (config.stabilityAttempts == null || stabilityVerdict(result, config) === 'passed')
     && result.attempts >= config.verificationAttempts && result.successCount === result.attempts
-    && result.downloadSamplesMbps.length >= config.downloadRounds
-    && result.downloadSamplesMbps.every(sample => Number.isFinite(sample) && sample > 0)
+    && hasCompleteDownload(result, config)
 }
 
 /** POP discovery and a queued stability object alone are not precision measurements. */

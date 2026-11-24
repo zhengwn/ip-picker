@@ -95,11 +95,45 @@ struct State {
     last_event: Instant,
 }
 
-struct DownloadUpdates {
+struct ProgressUpdates<'a> {
+    callback: &'a UpdateCallback,
     changed: BTreeSet<usize>,
     completed: usize,
     downloaded_bytes: u64,
     message: String,
+}
+
+impl<'a> ProgressUpdates<'a> {
+    fn new(state: &State, callback: &'a UpdateCallback) -> Self {
+        Self {
+            callback,
+            changed: BTreeSet::new(),
+            completed: state.progress.completed,
+            downloaded_bytes: state.progress.downloaded_bytes,
+            message: state.progress.message.clone(),
+        }
+    }
+
+    fn emit(&mut self, state: &mut State, force: bool) {
+        if !force && state.last_event.elapsed() < EVENT_INTERVAL {
+            return;
+        }
+        if self.changed.is_empty()
+            && self.completed == state.progress.completed
+            && self.downloaded_bytes == state.progress.downloaded_bytes
+            && self.message == state.progress.message
+        {
+            return;
+        }
+        self.completed = state.progress.completed;
+        self.downloaded_bytes = state.progress.downloaded_bytes;
+        self.message.clone_from(&state.progress.message);
+        let changed_rows = std::mem::take(&mut self.changed)
+            .into_iter()
+            .map(|index| (index, state.results[index].clone()))
+            .collect();
+        state.send_update(self.callback, None, changed_rows);
+    }
 }
 
 impl State {
@@ -111,31 +145,6 @@ impl State {
                 BTreeMap::new(),
             );
         }
-    }
-
-    fn emit_download_progress(
-        &mut self,
-        callback: &UpdateCallback,
-        updates: &mut DownloadUpdates,
-        downloaded_bytes: u64,
-    ) {
-        if self.last_event.elapsed() < EVENT_INTERVAL
-            || (updates.changed.is_empty()
-                && updates.completed == self.progress.completed
-                && updates.downloaded_bytes == downloaded_bytes
-                && updates.message == self.progress.message)
-        {
-            return;
-        }
-        self.progress.downloaded_bytes = downloaded_bytes;
-        updates.completed = self.progress.completed;
-        updates.downloaded_bytes = downloaded_bytes;
-        updates.message.clone_from(&self.progress.message);
-        let changed_rows = std::mem::take(&mut updates.changed)
-            .into_iter()
-            .map(|index| (index, self.results[index].clone()))
-            .collect();
-        self.send_update(callback, None, changed_rows);
     }
 
     fn send_update(
@@ -313,11 +322,6 @@ async fn run_candidates(
         progress: ScanProgress {
             total: ips.len(),
             discovered_by_region: config.regions.iter().map(|r| (r.clone(), 0)).collect(),
-            network_path: if scope == ScanScope::Regional {
-                crate::network::capture(ips[0])
-            } else {
-                None
-            },
             ..Default::default()
         },
         results: ips.iter().map(|ip| IpResult::new(*ip)).collect(),
@@ -365,6 +369,13 @@ async fn run_candidates(
             cancelled: false,
         });
     }
+    if scope == ScanScope::Regional {
+        state.progress.network_path = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(state.cancel(&config, scope, &callback)),
+            path = crate::network::capture_async(ips[0]) => path,
+        };
+    }
     state.stage(
         "connecting",
         ips.len(),
@@ -386,10 +397,7 @@ async fn run_candidates(
                     .acquire()
                     .await
                     .expect("route limiter stays open");
-                tokio::task::spawn_blocking(move || crate::network::capture(ip))
-                    .await
-                    .ok()
-                    .flatten()
+                crate::network::capture_async(ip).await
             } else {
                 None
             };
@@ -507,6 +515,7 @@ async fn run_candidates(
         .stability_attempts
         .expect("validated stability count");
     state.begin_stability_batch(1, &stability_candidates, attempts, &callback);
+    let mut progress_updates = ProgressUpdates::new(&state, &callback);
     let (updates, mut stability_updates) = tokio::sync::mpsc::unbounded_channel();
     let mut pending = stability_candidates.iter().copied();
     let mut stability_workers = tokio::task::JoinSet::new();
@@ -536,12 +545,17 @@ async fn run_candidates(
                 return Ok(state.cancel(&config, scope, &callback));
             }
             Some((index, snapshot)) = stability_updates.recv() => {
-                apply_stability_snapshot(&mut state, index, snapshot);
-                state.emit(&callback, false);
+                if apply_stability_snapshot(&mut state, index, snapshot) {
+                    progress_updates.changed.insert(index);
+                    progress_updates.emit(&mut state, false);
+                }
             }
             result = stability_workers.join_next() => {
                 if let Some(Ok((index, snapshot))) = result {
-                    apply_stability_snapshot(&mut state, index, snapshot);
+                    if apply_stability_snapshot(&mut state, index, snapshot) {
+                        progress_updates.changed.insert(index);
+                        progress_updates.emit(&mut state, false);
+                    }
                 }
                 if let Some(index) = pending.next() {
                     spawn_stability_worker(&mut stability_workers, index, SocketAddr::new(IpAddr::V4(ips[index]), port), &config, cancellation.clone(), updates.clone());
@@ -705,12 +719,7 @@ async fn run_downloads(
 ) -> bool {
     let total_budget = config.download_budget_bytes();
     let mut used = 0_u64;
-    let mut updates = DownloadUpdates {
-        changed: BTreeSet::new(),
-        completed: state.progress.completed,
-        downloaded_bytes: state.progress.downloaded_bytes,
-        message: state.progress.message.clone(),
-    };
+    let mut updates = ProgressUpdates::new(state, callback);
     while let Some(slot) = schedule.next(total_budget, used) {
         if cancellation.is_cancelled() {
             state.progress.downloaded_bytes = used;
@@ -725,7 +734,7 @@ async fn run_downloads(
                 );
                 state.progress.completed += config.download_rounds;
                 updates.changed.insert(index);
-                state.emit_download_progress(callback, &mut updates, used);
+                updates.emit(state, false);
                 continue;
             }
         };
@@ -745,15 +754,20 @@ async fn run_downloads(
             state.results[index].download_samples_mbps.len() + 1,
             config.download_rounds
         );
-        state.emit_download_progress(callback, &mut updates, used);
+        updates.emit(state, false);
 
         if scope == ScanScope::DownloadOnly && state.results[index].download_samples_mbps.is_empty()
         {
             let ip = ips[index];
-            state.results[index].network_path = tokio::select! {
+            let path = tokio::select! {
+                biased;
                 _ = cancellation.cancelled() => return false,
-                path = tokio::task::spawn_blocking(move || crate::network::capture(ip)) => path.ok().flatten(),
+                path = crate::network::capture_async(ip) => path,
             };
+            if index == 0 {
+                state.progress.network_path.clone_from(&path);
+            }
+            state.results[index].network_path = path;
         }
 
         // Poll the byte counter while streaming so progress and cancellation stay
@@ -773,7 +787,8 @@ async fn run_downloads(
                 }
                 result = &mut download => break result,
                 _ = ticker.tick() => {
-                    state.emit_download_progress(callback, &mut updates, used + counter.load(std::sync::atomic::Ordering::Relaxed));
+                    state.progress.downloaded_bytes = used + counter.load(std::sync::atomic::Ordering::Relaxed);
+                    updates.emit(state, false);
                 }
             }
         };
@@ -790,10 +805,12 @@ async fn run_downloads(
             }
             Ok(sample) => {
                 if !record_download(
-                    &mut state.results[index],
+                    state,
+                    index,
                     sample,
                     config,
                     cancellation,
+                    &mut updates,
                     || trace_probe(config, target, ips[index]),
                 )
                 .await
@@ -808,7 +825,7 @@ async fn run_downloads(
         }
         state.progress.completed += 1;
         updates.changed.insert(index);
-        state.emit_download_progress(callback, &mut updates, used);
+        updates.emit(state, false);
     }
 
     !cancellation.is_cancelled()
@@ -818,9 +835,9 @@ fn apply_stability_snapshot(
     state: &mut State,
     index: usize,
     snapshot: crate::stability::TcpStability,
-) {
+) -> bool {
     if state.progress.stage != "stabilizing" {
-        return;
+        return false;
     }
     if state
         .progress
@@ -828,7 +845,7 @@ fn apply_stability_snapshot(
         .as_ref()
         .is_some_and(|batch| !batch.candidate_ips.contains(&state.results[index].ip))
     {
-        return;
+        return false;
     }
     let previous = state.results[index].tcp_stability.as_ref();
     let previous_attempted = previous.map_or(0, |stats| stats.attempted);
@@ -838,7 +855,7 @@ fn apply_stability_snapshot(
                 || (stats.early_rejection.is_some() && snapshot.early_rejection.is_none())
         })
     {
-        return;
+        return false;
     }
     state.progress.completed += snapshot.attempted - previous_attempted;
     let prefix = state
@@ -864,6 +881,7 @@ fn apply_stability_snapshot(
         )
     };
     state.results[index].tcp_stability = Some(snapshot);
+    true
 }
 
 fn drain_stability_updates(
@@ -1111,10 +1129,12 @@ fn record_download_sample(item: &mut IpResult, mbps: f64) {
 }
 
 async fn record_download<F, Fut>(
-    item: &mut IpResult,
+    state: &mut State,
+    index: usize,
     sample: DownloadProbe,
     config: &ScanConfig,
     cancellation: &CancellationToken,
+    updates: &mut ProgressUpdates<'_>,
     probe: F,
 ) -> bool
 where
@@ -1122,6 +1142,7 @@ where
     Fut: std::future::Future<Output = Result<TraceProbe, ProbeError>>,
 {
     // The download has finished even if its additional POP check is cancelled.
+    let item = &mut state.results[index];
     record_download_sample(item, sample.mbps);
     item.measurement_passed = false;
     if let Some(colo) = sample.colo {
@@ -1133,11 +1154,16 @@ where
             ExclusionCode::PopRecheckIncomplete,
             "下载后的 POP 复核未完成",
         );
+        // Publish the observed bytes and sample before waiting on another
+        // request, so checkpoints can preserve it if that request is interrupted.
+        updates.changed.insert(index);
+        updates.emit(state, true);
         let check = tokio::select! {
             biased;
             _ = cancellation.cancelled() => { return false; }
             outcome = probe() => outcome
         };
+        let item = &mut state.results[index];
         item.attempts += 1;
         match check {
             Ok(probe) => {
@@ -1153,6 +1179,7 @@ where
             }
         }
     }
+    let item = &mut state.results[index];
     item.measurement_passed = item.has_complete_measurement(config);
     true
 }
@@ -1215,6 +1242,12 @@ fn parse_trace(body: &str, target: &Url) -> Result<String, ProbeError> {
             colo = Some(value.trim());
         }
         if let Some(value) = line.strip_prefix("h=") {
+            if host.is_some() {
+                return Err(ProbeError::new(
+                    ExclusionCode::HttpsFailure,
+                    "trace 含有重复 h 字段",
+                ));
+            }
             host = Some(value.trim());
         }
     }
@@ -1330,11 +1363,7 @@ async fn measure_download_response(
     counter: Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<DownloadProbe, ProbeError> {
     validate_response(&response, ip)?;
-    if response
-        .headers()
-        .get(header::CONTENT_ENCODING)
-        .is_some_and(|h| h != "identity")
-    {
+    if !has_unencoded_body(response.headers()) {
         return Err(ProbeError::new(
             ExclusionCode::DownloadFailure,
             "下载响应进行了压缩，无法可靠比较原始下载吞吐",
@@ -1389,6 +1418,29 @@ async fn measure_download_response(
     Ok(DownloadProbe { mbps, colo })
 }
 
+fn has_unencoded_body(headers: &header::HeaderMap) -> bool {
+    let content_is_identity = headers
+        .get_all(header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            value.to_str().is_ok_and(|value| {
+                value
+                    .split(',')
+                    .all(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+            })
+        });
+    // The HTTP client removes chunk framing, while other transfer codings may
+    // still be present in the body returned to the measurement code.
+    let mut transfer_codings = headers.get_all(header::TRANSFER_ENCODING).iter();
+    let transfer_is_unencoded = transfer_codings.next().is_none_or(|value| {
+        value
+            .to_str()
+            .is_ok_and(|value| value.trim().eq_ignore_ascii_case("chunked"))
+            && transfer_codings.next().is_none()
+    });
+    content_is_identity && transfer_is_unencoded
+}
+
 fn bounded_download_url(target: &Url, allowance: u64) -> (Url, u64) {
     let mut url = target.clone();
     let mut requested_bytes = allowance;
@@ -1417,10 +1469,14 @@ fn bounded_download_url(target: &Url, allowance: u64) -> (Url, u64) {
 }
 
 fn ray_colo(headers: &header::HeaderMap) -> Option<String> {
-    let value = headers.get("cf-ray")?.to_str().ok()?;
-    let suffix = value.rsplit('-').next()?;
-    (suffix.len() == 3 && suffix.bytes().all(|b| b.is_ascii_uppercase()))
-        .then(|| suffix.to_string())
+    let mut values = headers.get_all("cf-ray").iter();
+    let (id, suffix) = values.next()?.to_str().ok()?.split_once('-')?;
+    (values.next().is_none()
+        && !id.is_empty()
+        && id.bytes().all(|b| b.is_ascii_hexdigit())
+        && suffix.len() == 3
+        && suffix.bytes().all(|b| b.is_ascii_uppercase()))
+    .then(|| suffix.to_string())
 }
 
 fn record_observed_colo(item: &mut IpResult, colo: &str) {
@@ -2497,24 +2553,44 @@ mod tests {
         for prior_rounds in 0..config.download_rounds {
             let mut row = measured("192.0.2.1", "HK", 70.0, 10.0);
             row.download_samples_mbps.truncate(prior_rounds);
+            let mut state = verification_state(vec![row]);
+            let published = Arc::new(std::sync::Mutex::new(None::<EngineUpdate>));
+            let observed = published.clone();
+            let callback: UpdateCallback = Arc::new(move |update| {
+                *observed.lock().unwrap() = Some(update);
+            });
+            let mut updates = ProgressUpdates::new(&state, &callback);
             let cancellation = CancellationToken::new();
             assert!(
                 !record_download(
-                    &mut row,
+                    &mut state,
+                    0,
                     DownloadProbe {
                         mbps: 30.0,
                         colo: None
                     },
                     &config,
                     &cancellation,
+                    &mut updates,
                     || async {
+                        {
+                            let event = published.lock().unwrap();
+                            let update =
+                                event.as_ref().expect("sample published before POP recheck");
+                            let sample = &update.changed_rows[&0];
+                            assert_eq!(sample.download_samples_mbps.last(), Some(&30.0));
+                            assert_eq!(
+                                sample.exclusion_code,
+                                Some(ExclusionCode::PopRecheckIncomplete)
+                            );
+                            assert!(!sample.measurement_passed);
+                        }
                         cancellation.cancel();
                         std::future::pending().await
                     },
                 )
                 .await
             );
-            let state = verification_state(vec![row]);
             let outcome = state.cancel(
                 &config,
                 ScanScope::Regional,
@@ -2553,15 +2629,20 @@ mod tests {
         for response in [Ok("HKG"), Ok("NRT"), Err("TLS 验证失败")] {
             let mut row = measured("192.0.2.1", "HK", 70.0, 10.0);
             row.download_samples_mbps.truncate(1);
+            let mut state = verification_state(vec![row]);
+            let callback: UpdateCallback = Arc::new(|_| {});
+            let mut updates = ProgressUpdates::new(&state, &callback);
             assert!(
                 record_download(
-                    &mut row,
+                    &mut state,
+                    0,
                     DownloadProbe {
                         mbps: 30.0,
                         colo: None
                     },
                     &config,
                     &CancellationToken::new(),
+                    &mut updates,
                     || std::future::ready(
                         response
                             .map(|colo| TraceProbe {
@@ -2576,11 +2657,12 @@ mod tests {
                 )
                 .await
             );
+            let row = &mut state.results[0];
             assert_eq!(row.attempts, 6);
             assert_eq!(row.success_count, if response.is_ok() { 6 } else { 5 });
             assert_eq!(row.download_samples_mbps, vec![10.0, 30.0]);
             assert_eq!(row.download_mbps, 20.0);
-            rank_results(std::slice::from_mut(&mut row), &config, true);
+            rank_results(std::slice::from_mut(row), &config, true);
             let passed = response == Ok("HKG");
             assert_eq!(row.measurement_passed, passed);
             assert_eq!(row.eligible, passed);
@@ -2600,16 +2682,21 @@ mod tests {
         let config = ScanConfig::default();
         let mut row = measured("192.0.2.1", "HK", 70.0, 10.0);
         row.download_samples_mbps.truncate(1);
+        let mut state = verification_state(vec![row]);
+        let callback: UpdateCallback = Arc::new(|_| {});
+        let mut updates = ProgressUpdates::new(&state, &callback);
         let calls = std::cell::Cell::new(0);
         assert!(
             record_download(
-                &mut row,
+                &mut state,
+                0,
                 DownloadProbe {
                     mbps: 30.0,
                     colo: Some("HKG".into())
                 },
                 &config,
                 &CancellationToken::new(),
+                &mut updates,
                 || {
                     calls.set(calls.get() + 1);
                     std::future::ready(Err(ProbeError::new(
@@ -2620,6 +2707,7 @@ mod tests {
             )
             .await
         );
+        let row = &state.results[0];
         assert_eq!(calls.get(), 0);
         assert_eq!(row.attempts, 5);
         assert_eq!(row.success_count, 5);
@@ -3214,6 +3302,11 @@ mod tests {
         // loc is the client location, never the edge POP's region.
         assert!(parse_trace("h=speed.cloudflare.com\nloc=JP\n", &target).is_err());
         assert!(parse_trace("h=other.example\ncolo=NRT\n", &target).is_err());
+        assert!(parse_trace(
+            "h=other.example\nh=speed.cloudflare.com\ncolo=NRT\n",
+            &target
+        )
+        .is_err());
         assert!(parse_trace("h=speed.cloudflare.com\ncolo=NRT\ncolo=HKG", &target).is_err());
         assert!(parse_trace("<html>colo=NRT</html>", &target).is_err());
         assert_eq!(
@@ -3714,6 +3807,7 @@ mod tests {
             captured.lock().unwrap().push(update);
         });
         state.begin_stability_batch(2, &[1], 100, &callback);
+        let mut progress_updates = ProgressUpdates::new(&state, &callback);
         {
             let emitted = emitted.lock().unwrap();
             let first = emitted.last().unwrap();
@@ -3751,12 +3845,21 @@ mod tests {
             state.progress.completed, 0,
             "previous batch must not enter this batch's counters"
         );
-        apply_stability_snapshot(
+        assert!(apply_stability_snapshot(
             &mut state,
             1,
             crate::stability::summarize(100, 230.0, vec![Some(10.0); 5]),
-        );
+        ));
         assert_eq!(state.progress.completed, 5);
+        progress_updates.changed.insert(1);
+        progress_updates.emit(&mut state, true);
+        {
+            let emitted = emitted.lock().unwrap();
+            let update = emitted.last().unwrap();
+            assert!(update.results.is_none());
+            assert_eq!(update.progress.completed, 5);
+            assert_eq!(update.changed_rows.keys().copied().collect::<Vec<_>>(), [1]);
+        }
         state.stage("downloading", 2, "下载复测".into(), &callback);
         assert!(state.progress.stability_batch.is_none());
         assert!(emitted
@@ -3999,8 +4102,32 @@ mod tests {
         let mut headers = header::HeaderMap::new();
         headers.insert("cf-ray", "abcdef-NRT".parse().unwrap());
         assert_eq!(ray_colo(&headers).as_deref(), Some("NRT"));
-        headers.insert("cf-ray", "not-a-pop".parse().unwrap());
+        headers.append("cf-ray", "123abc-HKG".parse().unwrap());
         assert_eq!(ray_colo(&headers), None);
+        for value in ["HKG", "-HKG", "not-a-POP", "abcdef-HKG, 123abc-NRT"] {
+            headers.insert("cf-ray", value.parse().unwrap());
+            assert_eq!(ray_colo(&headers), None);
+        }
+    }
+
+    #[test]
+    fn download_checks_all_content_and_transfer_encoding_values() {
+        let mut headers = header::HeaderMap::new();
+        assert!(has_unencoded_body(&headers));
+        headers.insert(header::CONTENT_ENCODING, "Identity".parse().unwrap());
+        assert!(has_unencoded_body(&headers));
+        headers.append(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        assert!(!has_unencoded_body(&headers));
+        headers.insert(header::CONTENT_ENCODING, "identity, br".parse().unwrap());
+        assert!(!has_unencoded_body(&headers));
+        headers.remove(header::CONTENT_ENCODING);
+        headers.insert(header::TRANSFER_ENCODING, "Chunked".parse().unwrap());
+        assert!(has_unencoded_body(&headers));
+        headers.insert(header::TRANSFER_ENCODING, "gzip, chunked".parse().unwrap());
+        assert!(!has_unencoded_body(&headers));
+        headers.insert(header::TRANSFER_ENCODING, "gzip".parse().unwrap());
+        headers.append(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+        assert!(!has_unencoded_body(&headers));
     }
 
     #[tokio::test]

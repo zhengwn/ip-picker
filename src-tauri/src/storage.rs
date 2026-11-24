@@ -614,16 +614,6 @@ fn restore_checkpoint(path: &Path, saved: &mut SavedState) -> Result<Option<Hist
     Ok(Some(kind))
 }
 
-fn preserve_legacy_budget(config: Option<&mut serde_json::Value>) {
-    if let Some(config) = config.and_then(serde_json::Value::as_object_mut) {
-        // Before this switch existed, every recorded scan was budget-limited.
-        // Keep that history truthful while active settings use the new default.
-        config
-            .entry("downloadBudgetEnabled")
-            .or_insert(serde_json::Value::Bool(true));
-    }
-}
-
 /// Recover only after preserving the original bytes in a unique sibling file.
 /// A failed backup must stop startup: continuing with defaults would let a
 /// later save or window close overwrite the only copy of the user's data.
@@ -687,56 +677,8 @@ pub fn load(path: &Path) -> Result<SavedState, String> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SavedState::default()),
         Err(error) => return Err(format!("无法读取本地设置：{error}")),
     };
-    let mut json: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|e| format!("本地设置格式错误：{e}"))?;
-    preserve_legacy_budget(json.pointer_mut("/lastRun/config"));
-    preserve_legacy_budget(json.pointer_mut("/favoriteTest/run/config"));
-    if let Some(entries) = json
-        .pointer_mut("/favorites/entries")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for entry in entries {
-            preserve_legacy_budget(entry.get_mut("config"));
-        }
-    }
-    if let Some(config) = json
-        .get_mut("lastRun")
-        .and_then(|run| run.get_mut("config"))
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        // Do not fabricate a 200 ms gate for a scan that predates this setting.
-        config.entry("maxTcpMs").or_insert(serde_json::Value::Null);
-        config
-            .entry("stabilityAttempts")
-            .or_insert(serde_json::Value::Null);
-        config
-            .entry("stabilityLatencyMetric")
-            .or_insert(serde_json::Value::String("max".into()));
-        config
-            .entry("tcpLatencyScreening")
-            .or_insert(serde_json::Value::Bool(true));
-        // Old scans may allow more than one failed connection and interleaved
-        // stability/download batches. Do not apply the new two-failure rule to
-        // their saved measurements.
-        config
-            .entry("stabilityFirst")
-            .or_insert(serde_json::Value::Bool(false));
-        // Old scans used a fixed per-region cap. Preserve that fact while
-        // active settings without a recorded mode use the new adaptive default.
-        config
-            .entry("precisionMode")
-            .or_insert(serde_json::Value::String("limited".into()));
-        config
-            .entry("candidatePoolSize")
-            .or_insert(serde_json::Value::Null);
-        // A missing cap in a historical adaptive scan meant unlimited refill.
-        // Do not relabel that old queue as a capped scan.
-        config
-            .entry("regionalCandidateLimit")
-            .or_insert(serde_json::Value::Null);
-    }
     let mut saved: SavedState =
-        serde_json::from_value(json).map_err(|e| format!("本地设置格式错误：{e}"))?;
+        serde_json::from_slice(&bytes).map_err(|e| format!("本地设置格式错误：{e}"))?;
     let history_warning = load_history(path, &mut saved);
     restore_favorite_sources(path, &mut saved);
     saved.favorites.share_candidate_lists();
@@ -2841,6 +2783,67 @@ mod tests {
         assert!(loaded.favorites.entries[0].config.download_budget_enabled);
         assert!(!loaded.favorites.entries[1].config.download_budget_enabled);
         assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn legacy_policies_follow_historical_runs_into_archives_and_pinned_baselines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut run = legacy_run();
+        let ip = run.results[0].ip.clone();
+        run.id = "archived-run".into();
+        let archived_id = Uuid::new_v4();
+        let mut archive = serde_json::json!({ "kind": "scan", "run": run });
+        let fields = archive["run"]["config"].as_object_mut().unwrap();
+        for field in [
+            "maxTcpMs",
+            "stabilityAttempts",
+            "stabilityLatencyMetric",
+            "tcpLatencyScreening",
+            "stabilityFirst",
+            "precisionMode",
+            "candidatePoolSize",
+            "regionalCandidateLimit",
+            "downloadBudgetEnabled",
+        ] {
+            fields.remove(field);
+        }
+        write_atomic(
+            &history_path(&path, archived_id),
+            &serde_json::to_vec(&archive).unwrap(),
+        )
+        .unwrap();
+        let mut inline = archive.clone();
+        inline["run"]["id"] = "inline-run".into();
+        let mut baseline = archive;
+        baseline["run"]["results"] = serde_json::json!([run.results[0]]);
+        let json = serde_json::json!({
+            "scanHistory": [inline],
+            "scanHistoryFiles": [archived_id],
+            "historyBaselines": { ip.as_str(): baseline },
+        });
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let saved = load(&path).unwrap();
+        assert!(saved.config.stability_first);
+        assert!(!saved.config.download_budget_enabled);
+        assert_eq!(saved.scan_history.len(), 2);
+        for entry in saved
+            .scan_history
+            .iter()
+            .chain(saved.history_baselines.values())
+        {
+            let config = &entry.run.config;
+            assert!(config.download_budget_enabled);
+            assert!(config.tcp_latency_screening);
+            assert!(!config.stability_first);
+            assert_eq!(config.stability_latency_metric, "max");
+            assert_eq!(config.precision_mode, "limited");
+            assert_eq!(config.max_tcp_ms, None);
+            assert_eq!(config.stability_attempts, None);
+            assert_eq!(config.candidate_pool_size, None);
+            assert_eq!(config.regional_candidate_limit, None);
+        }
     }
 
     #[test]

@@ -8,7 +8,10 @@ use std::{
     net::SocketAddr,
     time::{Duration, Instant},
 };
-use tokio::{net::TcpStream, time::MissedTickBehavior};
+use tokio::{
+    net::TcpStream,
+    time::{sleep_until, Instant as TokioInstant},
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -394,20 +397,24 @@ async fn probe_tcp_inner<F: FnMut(&TcpStability) + Send>(
     {
         return initial;
     }
-    let mut cadence = tokio::time::interval(interval);
-    cadence.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut next_start = TokioInstant::now();
     let mut failure_details = Vec::new();
     let mut early_rejection = None;
     for _ in 0..attempts {
         tokio::select! {
             biased;
             _ = cancellation.cancelled() => break,
-            _ = cadence.tick() => {}
+            _ = sleep_until(next_start) => {}
         }
         let outcome = tokio::select! {
             biased;
             _ = cancellation.cancelled() => break,
-            connected = measure_tcp_connect(addr, timeout) => connected
+            connected = async {
+                // Space attempts from the actual start time even if the
+                // runtime resumed the prior timer later than scheduled.
+                next_start = TokioInstant::now() + interval;
+                measure_tcp_connect(addr, timeout).await
+            } => connected
         };
         let sample = match outcome {
             Ok(ms) => Some(ms),

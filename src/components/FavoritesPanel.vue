@@ -20,6 +20,7 @@ const tcpDisplayMetric = defineModel<TcpDisplayMetric>('tcpDisplayMetric', { def
 const emit = defineEmits<{
   change: [library: FavoriteLibrary]
   notify: [text: string, error?: boolean]
+  'test-starting': [starting: boolean]
   'test-started': [start: FavoriteTestStart]
   'stop-test': []
   'compare-history': [ip: string]
@@ -218,6 +219,7 @@ async function startTest(target: { folderId?: string; favoriteId?: string; ip?: 
   if (testDisabled.value) return false
   const updating = !!target.ip && !!existingManualEntry.value
   starting.value = true
+  emit('test-starting', true)
   testError.value = ''
   error.value = ''
   try {
@@ -252,7 +254,10 @@ async function startTest(target: { folderId?: string; favoriteId?: string; ip?: 
     if (inDialog) error.value = favoriteError(cause)
     else testError.value = favoriteError(cause)
     return false
-  } finally { starting.value = false }
+  } finally {
+    starting.value = false
+    emit('test-starting', false)
+  }
 }
 
 async function copyIp(ip: string) {

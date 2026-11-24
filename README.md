@@ -11,6 +11,8 @@
 - **macOS（Apple Silicon）** 打开 `*-macOS-AppleSilicon.dmg`，将 IP Picker 拖入「应用程序」。
 - **Windows（x64）** 运行 `*-Windows-x64-setup.exe`，按安装向导操作。
 
+macOS 界面使用系统 WebKit。在 Big Sur 或 Monterey 上，请通过「软件更新」安装 Safari 16.2 或更新版本，以支持界面对话框和样式。 [Apple 的 Safari 16.2 更新说明](https://support.apple.com/zh-cn/102799)
+
 升级前先退出旧版本。 [本地数据与备份](#本地数据与备份) · [从源码启动](docs/development.md#开发环境)
 
 <details>

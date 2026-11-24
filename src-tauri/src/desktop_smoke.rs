@@ -135,6 +135,10 @@ pub(crate) async fn run_prepared_scan(
         "performance-10000" => 10000,
         _ => 1,
     };
+    if phase == "exercise" {
+        results[0].tcp_stability = Some(stability::summarize(100, 230.0, vec![Some(412.0)]));
+        progress.completed = 1;
+    }
     if candidate_count > 1 {
         progress.stage = "downloading".into();
         results.extend((1..candidate_count as u32).map(|index| {
@@ -172,6 +176,20 @@ pub(crate) async fn run_prepared_scan(
             }
         }
     } else {
+        if phase == "exercise" {
+            tokio::select! {
+                _ = cancellation.cancelled() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(175)) => {
+                    results[0] = result;
+                    progress.completed = 2;
+                    callback(EngineUpdate {
+                        progress: progress.clone(),
+                        results: None,
+                        changed_rows: BTreeMap::from([(0, results[0].clone())]),
+                    });
+                }
+            }
+        }
         cancellation.cancelled().await;
     }
     results[0].exclude(ExclusionCode::Cancelled, "测试已停止，已保留样本");

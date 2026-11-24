@@ -32,7 +32,11 @@ try {
       favoriteIds: [],
       run: {
         id: 'previous-favorite-test', status: 'completed', startedAt: oldTime, finishedAt: oldTime,
-        config: { ...config, stabilityAttempts: 110, downloadBudgetEnabled: false },
+        config: {
+          ...config, stabilityAttempts: 110, stabilityLatencyMetric: 'p95', stabilityFirst: true,
+          tcpLatencyScreening: false, downloadBudgetEnabled: false,
+          maxTcpMs: 230, regionalCandidateLimit: 20, precisionMode: 'adaptive', candidatePoolSize: 20,
+        },
         progress: {
           stage: 'completed', completed: 1, total: 1, downloadedBytes: 0, discoveredByRegion: { HK: 1 }, message: '收藏复测完成',
           networkPath: { sampleIp: '127.0.0.1', interfaceName: 'en8', interfaceKind: 'wired', tunnelInterface: false, capturedAt: oldTime },

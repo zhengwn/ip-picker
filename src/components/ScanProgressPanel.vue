@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { ArrowRight, Check, ChevronDown, LoaderCircle } from '@lucide/vue'
 import { regionName, type ScanRun } from '../types'
 import { completedTcpMetricValue, observedFailurePercent, precisionPolicyLabel, regionalPrecisionLimit, regionCandidatePool, stabilityMetricLabel, stabilityVerdict, stageProgressText, summarizePrecisionQueue, summarizeStabilityBatch, type StabilityBatchCandidate } from '../ui-state'
@@ -25,6 +25,12 @@ const downloadedMiB = computed(() => (props.run.progress.downloadedBytes / 1024 
 const regionalPools = computed(() => props.run.config.regions.map(code => ({ code, identified: props.run.progress.discoveredByRegion[code] ?? 0, pool: regionCandidatePool(props.run, code) })))
 const batchCaption = computed(() => batch.value ? `本批稳定性已处理 ${batch.value.settled.length} / ${batch.value.candidates.length} 个 IP（${batch.value.percent}%）` : '正在准备本批候选')
 const batchNumber = computed(() => props.run.progress.precisionBatch?.number ?? batch.value?.number)
+const settledDetails = ref<HTMLDetailsElement | null>(null)
+const waitingDetails = ref<HTMLDetailsElement | null>(null)
+const settledOpen = ref(false)
+const waitingOpen = ref(false)
+watch(settledDetails, element => { if (!element) settledOpen.value = false })
+watch(waitingDetails, element => { if (!element) waitingOpen.value = false })
 const stagePercent = computed(() => stabilizing.value ? batch.value?.percent ?? null : phase.value.percent)
 const stageCaption = computed(() => stabilizing.value ? batchCaption.value : phase.value.caption)
 const currentScope = computed(() => props.run.retestIp ? `指定 IP · ${props.run.retestIp}` : discovering.value ? '发现阶段 · 连通性与 POP 识别各执行一次' : stabilityFirst.value ? '分区精测 · 稳定性全测 → 各区前 10 名服务校验 → 下载测速' : batchNumber.value ? `分区精测 · 第 ${batchNumber.value} 批（${regionalLimit.value == null ? '未找到足够结果会继续补位' : '仅在各区入围名单内补位'}）` : '分区精测 · 按批验证、检查稳定性并下载复测')
@@ -96,10 +102,10 @@ function settledLatency(candidate: StabilityBatchCandidate) { return candidate.r
               <p class="muted">耗时 &gt; {{ run.config.maxTcpMs }} ms 的样本 {{ candidate.stability?.overLimitCount ?? 0 }} 次（仅统计）</p>
             </article>
           </div>
-          <details v-if="batch.settled.length" class="scan-batch-details">
+          <details v-if="batch.settled.length" ref="settledDetails" class="scan-batch-details" @toggle="settledOpen = settledDetails?.open ?? false">
             <summary><span>已处理 {{ batch.settled.length }} 个 IP · 查看稳定性结论</span><ChevronDown :size="12" aria-hidden="true" /></summary>
-            <p class="scan-detail-description">测满 {{ batch.requestedPerIp }} 次后才生成最终延迟统计。提前淘汰时保留已完成的探测。{{ stabilityFirst ? '稳定性达标后仍需进入本区前 10 名，再完成服务校验与下载复测。' : '稳定性通过仍需下载复测。' }}</p>
-            <ul>
+            <p v-if="settledOpen" class="scan-detail-description">测满 {{ batch.requestedPerIp }} 次后才生成最终延迟统计。提前淘汰时保留已完成的探测。{{ stabilityFirst ? '稳定性达标后仍需进入本区前 10 名，再完成服务校验与下载复测。' : '稳定性通过仍需下载复测。' }}</p>
+            <ul v-if="settledOpen">
               <li v-for="candidate in batch.settled" :key="candidate.ip">
                 <div class="scan-completed-identity"><span class="mono">{{ candidate.ip }}</span><span class="muted">{{ location(candidate) }}</span></div>
                 <template v-if="candidate.state === 'rejected'">
@@ -114,7 +120,7 @@ function settledLatency(candidate: StabilityBatchCandidate) { return candidate.r
               </li>
             </ul>
           </details>
-          <details v-if="batch.waiting.length" class="scan-batch-details"><summary><span>{{ batch.waiting.length }} 个候选等待开始</span><ChevronDown :size="12" aria-hidden="true" /></summary><ul><li v-for="candidate in batch.waiting" :key="candidate.ip"><span class="mono">{{ candidate.ip }}</span><span class="muted">{{ location(candidate) }}</span></li></ul></details>
+          <details v-if="batch.waiting.length" ref="waitingDetails" class="scan-batch-details" @toggle="waitingOpen = waitingDetails?.open ?? false"><summary><span>{{ batch.waiting.length }} 个候选等待开始</span><ChevronDown :size="12" aria-hidden="true" /></summary><ul v-if="waitingOpen"><li v-for="candidate in batch.waiting" :key="candidate.ip"><span class="mono">{{ candidate.ip }}</span><span class="muted">{{ location(candidate) }}</span></li></ul></details>
         </template>
         <p v-else-if="stabilizing" class="scan-detail-description">正在准备本批候选；收到批次清单后，会逐个显示正在探测的 IP。</p>
         <div class="scan-rules">

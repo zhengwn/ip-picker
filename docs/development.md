@@ -61,10 +61,12 @@ npm run tauri -- build
 ## Windows x64 安装包发布
 
 1. 在发布提交中同步更新 `package.json`、`package-lock.json`、`src-tauri/Cargo.toml`、`src-tauri/Cargo.lock` 中的应用版本，以及 `src-tauri/tauri.conf.json` 的版本。将对应的 `v<版本号>` tag 推送到 GitHub。
-2. 在仓库的 Actions 中打开 **Build Windows installer**，选择包含该工作流的分支（通常是 `main`），点击 **Run workflow**，在 `tag` 中填入发布 tag，例如 `v0.1.2`。工作流会检出该 tag 并检查它是否与该提交的 Tauri 应用版本一致。
+2. 在仓库的 Actions 中打开 **Build Windows installer**，选择包含该工作流的分支（通常是 `main`），点击 **Run workflow**，在 `tag` 中填入发布 tag，例如 `v0.1.2`。工作流会检出该 tag 并核对 Tauri、npm 和 Cargo 的应用版本，构建时使用锁定的依赖。
 3. 运行成功后，下载名为 `ip-picker-<tag>-windows-x64` 的 Actions artifact。内含 `IP-Picker-<版本号>-Windows-x64-setup.exe` 和对应的 `.sha256` 文件。准备发布时，将这两个文件上传到同一 tag 的 GitHub Release 的 Assets。
 
 工作流会在 Windows runner 上安装应用，核对可执行文件的版本和 x64 架构，并验证窗口打开、关闭和卸载。Windows 实机上的窗口交互和实际网络测速需另行验证。仓库的打包配置尚未设置 macOS Developer ID 签名和公证，也未配置 Windows 代码签名。 [Build Windows installer 工作流](../.github/workflows/windows-installer.yml)
+
+验证尚未发布的改动时，选择提交所在的分支并留空 `tag`。工作流会构建启动时该分支的提交，并以提交 SHA 命名 artifact。
 
 ## 代码结构
 

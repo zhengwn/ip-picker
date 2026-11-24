@@ -42,6 +42,19 @@ function mount(context, component, props) {
   return app.state
 }
 
+test('stability failure rate matches the native threshold at floating-point boundaries', context => {
+  const result = candidate('192.0.2.1', {
+    regionCode: 'HK', colo: 'HKG', attempts: 1, successCount: 1, exclusionCode: 'stabilityFailureRate',
+    tcpStability: { requested: 12, attempted: 12, succeeded: 11, failed: 1, completed: true, probesMs: [...Array(11).fill(20), null] },
+  })
+  const run = finishedRun([result])
+  run.config.stabilityAttempts = 12
+  run.config.maxStabilityFailurePercent = 8.333333333333332
+  const results = mount(context, AllResultsPanel, { run, savedIps: new Set(), favoriteDisabled: false })
+  assert.equal(results.visibleRows.value[0].tcpFailurePercent, 100 / 12)
+  assert.equal(results.visibleRows.value[0].status, 'rejected')
+})
+
 test('quick boundary results can be shown under the completed download default and retested alone', async context => {
   const samples = Array(10).fill(25)
   const nearThreshold = candidate('104.16.0.1', {
@@ -154,6 +167,32 @@ test('late command snapshots cannot roll back live scan or favorite observations
   app.onFavoriteTestStarted({ favorites, job: { favoriteIds: ['home-entry'], run: loadingRun } })
   assert.equal(app.favoriteTest.value.run.results[0].tcpMs, 50)
   assert.equal(app.favoriteTest.value.run.progress.downloadedBytes, 80)
+})
+
+test('a new favorite retest survives a clock rollback and a late event from the replaced run', async context => {
+  const previous = { run: { ...finishedRun([]), id: 'previous-job' }, favoriteIds: [] }
+  const started = { run: { ...previous.run, id: 'new-job', startedAt: '2025-12-31T23:59:00Z', status: 'running' }, favoriteIds: [] }
+  const completed = { ...started, run: { ...started.run, status: 'completed' } }
+  const favorites = { folders: [], entries: [], revision: 1 }
+  setWindowFixture({ async onCloseRequested() { return () => {} } })
+  setInvokeHandler(async command => {
+    if (command === 'load_state') return { config: defaultConfig(), favoriteTest: previous }
+    if (command === 'get_favorites') return favorites
+    return null
+  })
+  const app = mount(context, App)
+  await setImmediate()
+  assert.equal(app.favoriteTest.value.run.id, previous.run.id)
+
+  app.favoriteStarting.value = true
+  emitFixtureEvent('favorite-test-update', structuredClone(started))
+  assert.equal(app.favoriteTest.value.run.id, started.run.id)
+  emitFixtureEvent('favorite-test-update', structuredClone(completed))
+  app.onFavoriteTestStarted({ favorites, job: started })
+  app.favoriteStarting.value = false
+  emitFixtureEvent('favorite-test-update', structuredClone(previous))
+  assert.equal(app.favoriteTest.value.run.id, completed.run.id)
+  assert.equal(app.favoriteTest.value.run.status, 'completed')
 })
 
 for (const favorite of [false, true]) {

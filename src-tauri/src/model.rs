@@ -998,10 +998,10 @@ pub struct ScanRun {
     pub error: Option<String>,
 }
 
-fn deserialize_recorded_scan_config<'de, D: Deserializer<'de>>(
+pub(crate) fn deserialize_recorded_scan_config<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<ScanConfig, D::Error> {
-    let raw = serde_json::Value::deserialize(deserializer)?;
+    let mut raw = serde_json::Value::deserialize(deserializer)?;
     let source_was_recorded = raw
         .get("source")
         .and_then(serde_json::Value::as_str)
@@ -1010,6 +1010,23 @@ fn deserialize_recorded_scan_config<'de, D: Deserializer<'de>>(
             .get("customIps")
             .and_then(serde_json::Value::as_str)
             .is_some();
+    if let Some(fields) = raw.as_object_mut() {
+        // Keep the policy in effect when each archived measurement was made.
+        // Active settings still deserialize with the current ScanConfig defaults.
+        for (name, value) in [
+            ("maxTcpMs", serde_json::Value::Null),
+            ("stabilityAttempts", serde_json::Value::Null),
+            ("stabilityLatencyMetric", "max".into()),
+            ("tcpLatencyScreening", true.into()),
+            ("stabilityFirst", false.into()),
+            ("precisionMode", "limited".into()),
+            ("candidatePoolSize", serde_json::Value::Null),
+            ("regionalCandidateLimit", serde_json::Value::Null),
+            ("downloadBudgetEnabled", true.into()),
+        ] {
+            fields.entry(name).or_insert(value);
+        }
+    }
     let mut config: ScanConfig = serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
     config.candidate_source_unrecorded |= !source_was_recorded;
     Ok(config)
